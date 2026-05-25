@@ -16,11 +16,11 @@ Initial release.
 
 Designed for long autonomous sessions where the agent itself decides when to summarize. Survives mid-loop rewinds (the next assistant turn within the same `prompt()` call sees the reduced context) and produces structurally valid Anthropic chains by injecting a synthetic `tool_use` to pair with the rewind's `tool_result`.
 
+User-visible specifics worth knowing on day one:
+
+- Anchor names are kebab-case (lowercase alphanumeric segments separated by single hyphens; max 40 chars). Re-anchoring with a name already on the active branch moves the prior label to the new leaf rather than duplicating it; the same move-on-collision applies to `rewind`'s `labelEnd`.
+- `rewind` requires a `summaryFocus` of ≥20 chars after trim; the rejection message lists what the focus should preserve so the agent can self-correct without user intervention.
+- The `branch_summary` boilerplate strip in `list` hints is sentinel-anchored — a user-authored doc whose first H2 happens to be `## Goal` is preserved untouched.
+- If the `AgentSession.prototype` patch isn't installed (typically only after a pi internals shape change), `list` and `rewind` surface a `⚠ reflection bootstrap missing` warning. The hint suggests `/reload` first (lighter — re-runs the prototype patch on the current process) and `Restart pi` as the heavier-handed alternative.
+
 <!-- USER-EDITABLE SECTION END -->
-
-
-### 🚀 Features
-
-- *(navigate-tree)* Initial extension: anchor / rewind / list actions
-- *(navigate-tree)* In-loop context refresh via `agent.prepareNextTurn`, so rewinds free context for subsequent turns within the same `prompt()` call
-- *(navigate-tree)* Synthetic-tool_call injection so Anthropic accepts the chain after a rewind

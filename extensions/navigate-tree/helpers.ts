@@ -8,8 +8,53 @@
  * No pi runtime imports — these are pure functions over plain JS values.
  */
 
+// ---------------------------------------------------------------------------
+// Exported boundary constants below (MAX_NAME_LENGTH, MAX_BOILERPLATE_LEAD_IN).
+//
+// Stability: these are internal tunables. Exported only so the test suite
+// can pin boundary cases by constant rather than literal. Re-tuning is
+// NOT a semver-breaking change for this package — production callers
+// should rely on the registered `navigate_tree` tool surface, not import
+// these constants directly.
+// ---------------------------------------------------------------------------
+
+// Hard cap on label-name length. 40 chars accommodates descriptive names
+// (e.g. 'parser-edge-case-investigation', 31 chars) while keeping list
+// output column-friendly under common terminal widths and preventing a
+// runaway label string from poisoning the JSONL on disk.
 export const MAX_NAME_LENGTH = 40;
-export const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+/**
+ * Kebab-case anchor name: lowercase alphanumeric segments separated by
+ * single hyphens. No leading / trailing / double hyphens (the `isValidName`
+ * test suite enforces these rejections). Mirrors the pattern documented in
+ * the tool description and README — if this regex relaxes, both surfaces
+ * need the same update.
+ */
+const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+// Maximum lead-in distance for pi's branch-summary boilerplate marker.
+// Pi's standard prelude ("The user explored a different conversation
+// branch...") fits in the first ~150 chars; 200 is a generous upper bound.
+// A "## Goal" found later than this is treated as in-content prose, not
+// the boilerplate marker, and the strip is a no-op.
+export const MAX_BOILERPLATE_LEAD_IN = 200;
+
+// Sentinel that pi's branch-summary prelude always starts with. Gating
+// the strip on this prefix makes the helper a no-op for any non-
+// boilerplate text that happens to contain `## Goal` early (e.g. a
+// user-authored markdown doc whose first H2 is "Goal"). Verified
+// against pi 0.75.5's `dist/core/compaction/branch-summarization.js`;
+// if pi reworks the prelude wording, the strip falls back to a no-op
+// (`findLabelHint` shows the unmodified prelude). Verify when bumping
+// the peer-dep floor.
+const BRANCH_SUMMARY_SENTINEL =
+  "The user explored a different conversation branch";
+
+// Pi 0.75.5's branch-summary boilerplate places `## Goal` after the prelude
+// (verified against `dist/core/compaction/branch-summarization.js`). Used to
+// anchor the strip cut-point in `stripBranchSummaryBoilerplate` — a single
+// constant so the indexOf probe and the slice-length advance can't drift.
+const GOAL_HEADER = "## Goal";
 
 /** Validate a kebab-case name suitable for use as a navigate-tree label. */
 export function isValidName(s: unknown): s is string {
@@ -29,7 +74,9 @@ export function toOneLine(text: string, maxLen: number): string | null {
   return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
 }
 
-/** Format token count as a percentage with one decimal, or as `Nk` if no window. */
+/**
+ * Format token count as a percentage with one decimal, or as `Nk` if no window.
+ */
 export function formatPct1(tokens: number, contextWindow: number): string {
   if (contextWindow <= 0) return `${(tokens / 1000).toFixed(1)}k`;
   return `${((tokens / contextWindow) * 100).toFixed(1)}%`;
@@ -59,9 +106,10 @@ export function formatContextDelta(
  * different conversation branch...") so the hint shows the actual content.
  */
 export function stripBranchSummaryBoilerplate(text: string): string {
-  const goalIdx = text.indexOf("## Goal");
-  if (goalIdx > 0 && goalIdx < 200) {
-    return text.slice(goalIdx + "## Goal".length);
+  if (!text.startsWith(BRANCH_SUMMARY_SENTINEL)) return text;
+  const goalIdx = text.indexOf(GOAL_HEADER);
+  if (goalIdx > 0 && goalIdx < MAX_BOILERPLATE_LEAD_IN) {
+    return text.slice(goalIdx + GOAL_HEADER.length);
   }
   return text;
 }

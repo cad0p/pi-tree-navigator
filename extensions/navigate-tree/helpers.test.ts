@@ -1,24 +1,21 @@
 /**
  * Tests for navigate-tree pure helpers.
  *
- * Run with: bun test
- *
- * Uses node:test + node:assert/strict so the file is also runnable directly
- * via `node --test extensions/navigate-tree/helpers.test.ts` on Node 22.6+
- * (built-in TypeScript stripping). Tested against bun 1.3.13 and Node 24.
+ * Bun test runner (project-pinned to bun). Run with: bun test
  *
  * The pi extension loader treats `./index.ts` as the entry point and ignores
  * sibling files — so this test file is not loaded as a separate extension.
  */
 
+import { describe, it } from "bun:test";
 import * as assert from "node:assert/strict";
-import { describe, it } from "node:test";
 import {
   extractTextContent,
   formatContextDelta,
   formatPct1,
   formatWindow,
   isValidName,
+  MAX_BOILERPLATE_LEAD_IN,
   MAX_NAME_LENGTH,
   stripBranchSummaryBoilerplate,
   toOneLine,
@@ -43,6 +40,19 @@ describe("isValidName", () => {
     assert.equal(isValidName("Impl-Start"), false);
     assert.equal(isValidName("snake_case"), false);
     assert.equal(isValidName("with space"), false);
+  });
+  it("rejects trailing hyphen", () => {
+    assert.equal(isValidName("a-"), false);
+  });
+  it("rejects double hyphen", () => {
+    assert.equal(isValidName("a--b"), false);
+  });
+  it("rejects all-hyphen / hyphen-only", () => {
+    assert.equal(isValidName("---"), false);
+    assert.equal(isValidName("-"), false);
+  });
+  it("rejects digit-then-trailing-hyphen", () => {
+    assert.equal(isValidName("0-"), false);
   });
   it("enforces max length", () => {
     assert.equal(isValidName("a".repeat(MAX_NAME_LENGTH)), true);
@@ -80,6 +90,29 @@ describe("formatPct1", () => {
     assert.equal(formatPct1(19_000, 0), "19.0k");
     assert.equal(formatPct1(123, 0), "0.1k");
     assert.equal(formatPct1(560_000, -1), "560.0k");
+  });
+  it("renders 100.0% when tokens === window exactly", () => {
+    // Boundary: at the window, percent is exactly 100.0% (not clamped).
+    assert.equal(formatPct1(1_000_000, 1_000_000), "100.0%");
+  });
+  it("renders > 100.0% when tokens overflow the window", () => {
+    // Pinning behavior, not a bug guard: a token estimate over the
+    // window can happen if the synthetic-assistant baseline lags the
+    // actual chain. The column should keep formatting; downstream
+    // formatters (formatContextDelta, list output) inherit this.
+    assert.equal(formatPct1(1_500_000, 1_000_000), "150.0%");
+  });
+  it("rounds tiny fractions down to 0.0%", () => {
+    // 50 / 1_000_000 = 0.005% → toFixed(1) yields "0.0%". Pinning the
+    // round-down behavior so a future toFixed(2) refactor surfaces here.
+    assert.equal(formatPct1(50, 1_000_000), "0.0%");
+  });
+  it("renders negative tokens with a leading minus", () => {
+    // Negative tokens shouldn't reach this helper in production (token
+    // counters are unsigned), but if a caller bug feeds a negative the
+    // helper must not crash; pin the actual JS toFixed output.
+    assert.equal(formatPct1(-1, 1_000_000), "-0.0%");
+    assert.equal(formatPct1(-50_000, 1_000_000), "-5.0%");
   });
 });
 
@@ -119,14 +152,56 @@ describe("stripBranchSummaryBoilerplate", () => {
   it("returns text unchanged when no early ## Goal", () => {
     assert.equal(stripBranchSummaryBoilerplate("just text"), "just text");
   });
-  it("does not strip when ## Goal appears far into the text", () => {
+  it("does not strip without sentinel even with late ## Goal", () => {
+    // Negative pin: missing sentinel short-circuits the strip even when a
+    // "## Goal" appears later in the text. Distinct from the lead-in
+    // boundary check (which is exercised in the MAX_BOILERPLATE_LEAD_IN ± 1
+    // pair below).
     const long = `${"x".repeat(300)}## Goal\nlate`;
     assert.equal(stripBranchSummaryBoilerplate(long), long);
+  });
+  it("does not strip when ## Goal appears past MAX_BOILERPLATE_LEAD_IN even with sentinel", () => {
+    // Lead-in boundary check WITH the sentinel: prelude prefix matches but
+    // the ## Goal is too late, so the strip is short-circuited by the
+    // distance check, not the sentinel guard. Pairs with the boundary
+    // tests below (MAX_BOILERPLATE_LEAD_IN - 1 strips, exact boundary
+    // does not) to fully cover the cap.
+    const sentinel = "The user explored a different conversation branch";
+    const padding = "x".repeat(MAX_BOILERPLATE_LEAD_IN + 50);
+    const text = `${sentinel}${padding}## Goal\nlate`;
+    assert.equal(stripBranchSummaryBoilerplate(text), text);
   });
   it("does not strip when ## Goal is at index 0", () => {
     // Boilerplate always has prose before ## Goal, so a leading ## Goal isn't
     // the boilerplate pattern — preserve it.
     assert.equal(stripBranchSummaryBoilerplate("## Goal\nfoo"), "## Goal\nfoo");
+  });
+  it("does not strip when text lacks the pi boilerplate sentinel", () => {
+    // A user-authored doc whose first H2 is "Goal" must survive untouched
+    // — the strip is gated on pi's actual prelude prefix.
+    const userDoc =
+      "Some quick notes on the parser refactor.\n\n## Goal\nMake it faster.";
+    assert.equal(stripBranchSummaryBoilerplate(userDoc), userDoc);
+  });
+  it("strips when ## Goal is at the boundary - 1 (just inside MAX_BOILERPLATE_LEAD_IN)", () => {
+    // The boundary check is `goalIdx < MAX_BOILERPLATE_LEAD_IN`. Pad so
+    // '## Goal' lands at exactly `MAX_BOILERPLATE_LEAD_IN - 1`: the
+    // strict-less-than check passes and the strip runs.
+    const sentinel = "The user explored a different conversation branch";
+    const goalIdx = MAX_BOILERPLATE_LEAD_IN - 1;
+    const padding = "x".repeat(goalIdx - sentinel.length);
+    const text = `${sentinel}${padding}## Goal\nbody`;
+    assert.equal(text.indexOf("## Goal"), goalIdx);
+    assert.equal(stripBranchSummaryBoilerplate(text), "\nbody");
+  });
+  it("does not strip when ## Goal is at MAX_BOILERPLATE_LEAD_IN (boundary)", () => {
+    // Boundary case: at exactly MAX_BOILERPLATE_LEAD_IN, the
+    // strict-less-than check fails and the text is preserved as-is.
+    const sentinel = "The user explored a different conversation branch";
+    const padding = "x".repeat(MAX_BOILERPLATE_LEAD_IN - sentinel.length);
+    const text = `${sentinel}${padding}## Goal\nbody`;
+    assert.equal(text.indexOf("## Goal"), MAX_BOILERPLATE_LEAD_IN);
+    assert.equal(stripBranchSummaryBoilerplate(text), text);
   });
 });
 
@@ -161,5 +236,36 @@ describe("extractTextContent", () => {
       { type: "text", text: "kept" },
     ];
     assert.equal(extractTextContent(blocks), "kept");
+  });
+  it("ignores tool_result, image, and redactedThinking blocks", () => {
+    // Pi emits these block types alongside text on real chains. The helper
+    // is field-shape-based (`type === 'text'` and `text` is a string), so
+    // these all fall through; pin the realistic mix to lock that behavior.
+    const blocks = [
+      {
+        type: "toolResult",
+        id: "x",
+        output: [{ type: "text", text: "ignored" }],
+      },
+      { type: "image", source: { type: "base64", data: "…" } },
+      { type: "redactedThinking", data: "…" },
+      { type: "text", text: "kept" },
+    ];
+    assert.equal(extractTextContent(blocks), "kept");
+  });
+  it("returns empty string for empty array", () => {
+    assert.equal(extractTextContent([]), "");
+  });
+  it("preserves empty-string text blocks (joined with surrounding space)", () => {
+    // Pinning a slightly-surprising actual behavior: ['', 'kept'].join(' ')
+    // === ' kept'. If a future refactor filters empty-string blocks the
+    // join shape changes; surface it here.
+    assert.equal(
+      extractTextContent([
+        { type: "text", text: "" },
+        { type: "text", text: "kept" },
+      ]),
+      " kept",
+    );
   });
 });
