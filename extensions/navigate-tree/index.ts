@@ -852,13 +852,31 @@ export default function (
       // only one call site. The catch makes a best-effort attempt to retry
       // the labelEnd write (idempotent in pi's setLabel contract) and
       // surfaces salvage detail in the re-thrown error.
+      // Mirror anchor's move-on-collision: if `labelEnd` already labels
+      // another entry on the active branch, write the new label first
+      // (so a mid-collision crash leaves both labels briefly, never
+      // zero — `findLabeledEntry` walks leaf→root and returns the
+      // leaf-side match, so navigation stays correct during the
+      // overlap), then clear the prior. Without this move, two anchors
+      // with the same name coexist on the active branch — the namespace
+      // asymmetry vs `anchor` lets duplicate anchors survive a chained
+      // rewind. The lookup happens BEFORE entering the try (a throw from
+      // findLabeledEntry shouldn't trip the synthetic-injection salvage
+      // path) but inside the salvage scope so that if the second
+      // setLabel (the prior-clear) throws, the existing best-effort
+      // labelEnd retry still fires for the new write.
+      const fullLabelEnd = LABEL_PREFIX + p.labelEnd;
+      const priorLabelEnd = findLabeledEntry(sm, fullLabelEnd);
       let tokensAtNewLeaf = 0;
       let originalErr: unknown;
       let salvageDetail = "";
       let failedStep: "setLabel" | "estimate" | null = null;
       try {
         failedStep = "setLabel";
-        pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
+        pi.setLabel(summaryId, fullLabelEnd);
+        if (priorLabelEnd && priorLabelEnd !== summaryId) {
+          pi.setLabel(priorLabelEnd, undefined);
+        }
 
         // Compute afterTokens NOW — before we append the synthetic. This
         // captures the chain size at the new leaf (branch_summary) using
@@ -879,7 +897,7 @@ export default function (
         // diagnostic that hides the real (estimate) failure cause.
         if (failedStep === "setLabel") {
           try {
-            pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
+            pi.setLabel(summaryId, fullLabelEnd);
           } catch (retryErr) {
             salvageDetail = `labelEnd retry failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
@@ -953,7 +971,7 @@ export default function (
             type: "text",
             text:
               `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
-              `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '## Next Steps' are still pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
+              `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
               (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
           },
         ],

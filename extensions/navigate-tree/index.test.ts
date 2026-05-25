@@ -517,8 +517,8 @@ describe("dispatch: list action", () => {
       rewindSentinel,
       "list and rewind warnings must use site-specific phrasing",
     );
-    // Both share the recovery hint with `/reload` mentioned (CORR4-6:
-    // `/reload` is the lighter-weight recovery; `Restart pi` is the
+    // Both share the recovery hint with `/reload` mentioned
+    // (`/reload` is the lighter-weight recovery; `Restart pi` is the
     // heavier alternative). A regression that drops `/reload` from
     // either constant surfaces here.
     assert.match(
@@ -1120,6 +1120,16 @@ describe("dispatch: rewind happy path", () => {
     // global-storage-keyed.)
     const bEntry = sm.getEntry(sumB);
     assert.ok(bEntry, "b-summary entry still present in storage");
+    // Pin label retention explicitly: the b-summary keeps its 'anchor:b'
+    // label across the second rewind. Nothing in the rewind path clears
+    // labelStart's label (it's only labelEnd that gets the new write +
+    // move-on-collision), so the prior label survives. A regression that
+    // accidentally cleared labelStart on rewind would surface here.
+    assert.equal(
+      sm.getLabel(sumB),
+      "anchor:b",
+      "the b-summary's anchor:b label must survive the second rewind",
+    );
     // Active leaf is the synthetic for the second rewind.
     const leafId = sm.getLeafId();
     assert.ok(leafId, "expected a leaf after second rewind");
@@ -1131,6 +1141,81 @@ describe("dispatch: rewind happy path", () => {
       )[0];
       assert.equal(c0.id, "tc-2");
     }
+  });
+
+  it("labelEnd collides with an existing anchor: rewind moves the anchor to the new summary (mirrors anchor's move-on-collision)", async () => {
+    // Namespace symmetry: anchor.name and rewind.labelEnd both write into
+    // the `anchor:` namespace, so a `rewind` whose labelEnd already labels
+    // another entry on the *post-move active branch* must move the label
+    // to the new summary — mirroring `anchor`'s write-before-clear
+    // move-on-collision. Without the move, two entries on the same active
+    // branch would both carry `anchor:b`, breaking `findLabeledEntry`'s
+    // uniqueness invariant.
+    //
+    // Setup ordering matters: the prior `anchor:b` must be on the
+    // ancestral side of `labelStart` (= tA), so that branchWithSummary
+    // leaves it on the *active* branch (between root and the new
+    // summary), NOT on the abandoned one. We anchor 'b' on the FIRST
+    // turn and 'a' on the SECOND turn:
+    //   root → tB(anchor:b) → tA(anchor:a) → t3 → leaf
+    // Then rewind a→b collapses [tA-child … leaf] into summaryId, leaving
+    //   root → tB(anchor:b) → tA(anchor:a) → summaryId(anchor:b)
+    // — anchor:b lives on both tB and summaryId on the active branch.
+    // The move-on-collision clears tB's label.
+    const { sm, pi, tool, ctx } = setup();
+    const tB = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(tB.assistantId, "anchor:b");
+    const tA = appendTurn(sm, "u2", "a2", 200);
+    pi.pi.setLabel(tA.assistantId, "anchor:a");
+    appendTurn(sm, "u3", "a3", 300);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    // Sanity: pre-move, anchor:b resolves to tB.
+    assert.equal(
+      __testHooks.findLabeledEntry(sm, "anchor:b"),
+      tB.assistantId,
+      "pre-move sanity: anchor:b lives on tB",
+    );
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "a",
+        labelEnd: "b",
+        summaryFocus: "Preserve the user's instruction and continue the work.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const summaryId = result.details.summaryId as string;
+
+    // The new summary carries 'anchor:b'.
+    assert.equal(
+      sm.getLabel(summaryId),
+      "anchor:b",
+      "new branch_summary must carry the labelEnd anchor",
+    );
+    // The prior 'b'-labeled entry lost its label — cleared by the
+    // move-on-collision branch in rewind. (Only its label was cleared;
+    // the entry itself is still in storage.)
+    assert.notEqual(
+      sm.getLabel(tB.assistantId),
+      "anchor:b",
+      "prior 'anchor:b' entry must be cleared after the move",
+    );
+    // findLabeledEntry resolves 'anchor:b' uniquely to the new summary.
+    // (Walks leaf→root and the active branch now passes through summaryId
+    // with the label cleared on tB — only the new write remains.)
+    assert.equal(
+      __testHooks.findLabeledEntry(sm, "anchor:b"),
+      summaryId,
+      "findLabeledEntry must resolve 'anchor:b' to the moved summary",
+    );
   });
 
   it("summaryFocus.length === MAX_SYNTHETIC_FOCUS_LENGTH (1024) is stored verbatim with no truncation marker", async () => {
@@ -2059,6 +2144,20 @@ describe("dispatch: rewind salvage path", () => {
         leaf.message.content as Array<{ type: string; id?: string }>
       )[0];
       assert.equal(c0.id, "tc-rewind");
+      // Pin the degenerate token count promised by the test name. When
+      // the estimate step throws, the salvage path can't compute
+      // `tokensAtNewLeaf`, so the synthetic must be built with
+      // `totalTokens=0` (mirroring the setLabel-throws sibling test at
+      // line ~1981). A regression that re-uses the pre-throw zero-init
+      // value silently (or worse, leaves it `undefined`) would surface
+      // here.
+      const usage = (leaf.message as { usage?: { totalTokens?: number } })
+        .usage;
+      assert.equal(
+        usage?.totalTokens,
+        0,
+        "salvage synthetic must use totalTokens=0 after estimate throw",
+      );
     }
     // labelEnd write succeeded BEFORE the estimate threw — so a chained
     // rewind could still find it. Pin: walking the active branch finds
