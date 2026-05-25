@@ -683,10 +683,11 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       // Chained-rewind-no-turns guard: bail if the only message between
       // leaf and target matches our synthetic shape (single navigate_tree
       // toolCall block + stopReason "toolUse" + zero usage), meaning the
-      // agent didn't append a real turn between rewinds. Filter out
-      // label-type entries (they carry no semantic content); the
-      // synthetic-shape predicate avoids false-positives on real
-      // navigate_tree calls (which have nonzero usage from the model).
+      // agent didn't append a real turn between rewinds. Keep only message
+      // entries — label / compaction / branch_summary / etc. carry no
+      // rewindable semantic content for this guard. The synthetic-shape
+      // predicate avoids false-positives on real navigate_tree calls
+      // (which have nonzero usage from the model).
       const messageEntries = entries.filter((e) => e.type === "message");
       if (messageEntries.length === 1) {
         const lone = messageEntries[0];
