@@ -1,18 +1,14 @@
 /**
  * Tests for navigate-tree pure helpers.
  *
- * Run with: bun test
- *
- * Uses node:test + node:assert/strict so the file is also runnable directly
- * via `node --test extensions/navigate-tree/helpers.test.ts` on Node 22.6+
- * (built-in TypeScript stripping). Tested against bun 1.3.13 and Node 24.
+ * Bun test runner (project-pinned to bun). Run with: bun test
  *
  * The pi extension loader treats `./index.ts` as the entry point and ignores
  * sibling files — so this test file is not loaded as a separate extension.
  */
 
+import { describe, it } from "bun:test";
 import * as assert from "node:assert/strict";
-import { describe, it } from "node:test";
 import {
   extractTextContent,
   formatContextDelta,

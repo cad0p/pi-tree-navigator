@@ -435,7 +435,15 @@ function toolError(
   };
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (
+  pi: ExtensionAPI,
+  opts?: { summarize?: typeof generateBranchSummary },
+) {
+  // DI seam: tests inject a stub `summarize` to avoid hitting the real
+  // model. Production callers (pi's extension loader) pass no second
+  // argument, so this falls back to the real `generateBranchSummary`
+  // import.
+  const summarize = opts?.summarize ?? generateBranchSummary;
   patchAgentSessionPrototype();
 
   pi.registerTool({
@@ -650,7 +658,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const result = await generateBranchSummary(entries, {
+      const result = await summarize(entries, {
         model: ctx.model,
         apiKey: auth.apiKey ?? "",
         headers: auth.headers,
@@ -781,3 +789,30 @@ export default function (pi: ExtensionAPI) {
     },
   });
 }
+
+/**
+ * Non-stable testing-only hooks. The `__` prefix marks this as a private
+ * surface — not part of the package's public API. Intended for hermetic
+ * tests that need to undo the AgentSession.prototype patch and clear the
+ * captured-session list between cases.
+ */
+export const __testHooks = {
+  /**
+   * Restore the original `AgentSession.prototype.prompt` (stashed by
+   * `patchAgentSessionPrototype` under the `ORIG_PROMPT_KEY` symbol) and
+   * drain the captured-session refs. Idempotent: a no-op if the patch was
+   * never installed or has already been reset.
+   */
+  resetPrototype(): void {
+    const proto = AgentSession.prototype as unknown as Record<
+      PropertyKey,
+      unknown
+    >;
+    const orig = proto[ORIG_PROMPT_KEY];
+    if (typeof orig === "function") {
+      proto.prompt = orig;
+      delete proto[ORIG_PROMPT_KEY];
+    }
+    sessionInstances.length = 0;
+  },
+};
