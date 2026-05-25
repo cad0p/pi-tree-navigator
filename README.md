@@ -90,7 +90,7 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 ## Limitations
 
-- **Brittle to pi version bumps.** The fix uses five independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Restart pi or run \`/reload\` to recover.`, and you'd see context corruption return on the next prompt.
+- **Brittle to pi version bumps.** The fix uses five independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 
