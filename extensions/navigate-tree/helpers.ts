@@ -13,7 +13,7 @@
 // output column-friendly under common terminal widths and preventing a
 // runaway label string from poisoning the JSONL on disk.
 export const MAX_NAME_LENGTH = 40;
-export const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+export const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 // Maximum lead-in distance for pi's branch-summary boilerplate marker.
 // Pi's standard prelude ("The user explored a different conversation
@@ -21,6 +21,15 @@ export const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 // A "## Goal" found later than this is treated as in-content prose, not
 // the boilerplate marker, and the strip is a no-op.
 const MAX_BOILERPLATE_LEAD_IN = 200;
+
+// Sentinel that pi's branch-summary prelude always starts with. Gating the
+// strip on this prefix makes the helper a no-op for any non-boilerplate
+// text that happens to contain `## Goal` early (e.g. a user-authored
+// markdown doc whose first H2 is "Goal"). If pi's wording later changes,
+// the strip falls back to no-op and `findLabelHint` shows the unmodified
+// prelude — still useful, just less concise.
+const BRANCH_SUMMARY_SENTINEL =
+  "The user explored a different conversation branch";
 
 /** Validate a kebab-case name suitable for use as a navigate-tree label. */
 export function isValidName(s: unknown): s is string {
@@ -70,6 +79,7 @@ export function formatContextDelta(
  * different conversation branch...") so the hint shows the actual content.
  */
 export function stripBranchSummaryBoilerplate(text: string): string {
+  if (!text.startsWith(BRANCH_SUMMARY_SENTINEL)) return text;
   const goalIdx = text.indexOf("## Goal");
   if (goalIdx > 0 && goalIdx < MAX_BOILERPLATE_LEAD_IN) {
     return text.slice(goalIdx + "## Goal".length);

@@ -44,6 +44,19 @@ describe("isValidName", () => {
     assert.equal(isValidName("snake_case"), false);
     assert.equal(isValidName("with space"), false);
   });
+  it("rejects trailing hyphen", () => {
+    assert.equal(isValidName("a-"), false);
+  });
+  it("rejects double hyphen", () => {
+    assert.equal(isValidName("a--b"), false);
+  });
+  it("rejects all-hyphen / hyphen-only", () => {
+    assert.equal(isValidName("---"), false);
+    assert.equal(isValidName("-"), false);
+  });
+  it("rejects digit-then-trailing-hyphen", () => {
+    assert.equal(isValidName("0-"), false);
+  });
   it("enforces max length", () => {
     assert.equal(isValidName("a".repeat(MAX_NAME_LENGTH)), true);
     assert.equal(isValidName("a".repeat(MAX_NAME_LENGTH + 1)), false);
@@ -127,6 +140,13 @@ describe("stripBranchSummaryBoilerplate", () => {
     // Boilerplate always has prose before ## Goal, so a leading ## Goal isn't
     // the boilerplate pattern — preserve it.
     assert.equal(stripBranchSummaryBoilerplate("## Goal\nfoo"), "## Goal\nfoo");
+  });
+  it("does not strip when text lacks the pi boilerplate sentinel", () => {
+    // A user-authored doc whose first H2 is "Goal" must survive untouched
+    // — the strip is gated on pi's actual prelude prefix.
+    const userDoc =
+      "Some quick notes on the parser refactor.\n\n## Goal\nMake it faster.";
+    assert.equal(stripBranchSummaryBoilerplate(userDoc), userDoc);
   });
 });
 

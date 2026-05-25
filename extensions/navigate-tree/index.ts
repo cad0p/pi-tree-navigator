@@ -447,7 +447,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.\n\n" +
       "Operations (set the `action` parameter):\n" +
-      "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start').\n" +
+      "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).\n" +
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
       "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
       "`summaryFocus` is REQUIRED on rewind. The schema marks it optional because the dispatched action determines which fields are required — the runtime guard rejects rewinds without a `summaryFocus` of ≥20 chars after trim. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
@@ -499,14 +499,17 @@ export default function (pi: ExtensionAPI) {
             const tokensAt = estimateAtEntry(allEntries, e.id, byId);
             const pct = formatPct1(tokensAt, cw).padStart(LIST_PCT_COL_WIDTH);
             const hint = findLabelHint(sm, e.id, LIST_HINT_MAX_LENGTH);
-            const hintPart = hint ? `  “${hint}”` : "";
+            const hintPart = hint ? `  (after: “${hint}”)` : "";
             lines.push(
               `  ${pct}  ${name.padEnd(LIST_LABEL_COL_WIDTH)}${hintPart}`,
             );
           }
         }
 
-        const header = `[list] · ${lines.length} label${lines.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionOk ? "" : " · ⚠ reflection bootstrap missing"}`;
+        const reflectionWarning = reflectionOk
+          ? ""
+          : " · ⚠ reflection bootstrap missing — anchors still work; rewinds will collapse the tree on disk but the next assistant turn may snapshot pre-rewind context. Restart pi to recover.";
+        const header = `[list] · ${lines.length} label${lines.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
         const body = lines.length
           ? `Active labels (root → leaf):\n${lines.join("\n")}`
           : "No labels on the active branch.";
@@ -532,12 +535,23 @@ export default function (pi: ExtensionAPI) {
         if (!leafId) {
           return toolError("No session entries yet — nothing to anchor.");
         }
-        pi.setLabel(leafId, LABEL_PREFIX + p.name);
+        // Move-on-collision semantics: if the anchor name already exists on
+        // the active branch (on a different entry), clear the prior label
+        // before writing the new one. This makes the loop pattern "anchor at
+        // the start of every iteration with name='iter-start'" produce a
+        // single live anchor at the most recent leaf, rather than
+        // accumulating dead duplicates that confuse `list` and `rewind`.
+        const fullLabel = LABEL_PREFIX + p.name;
+        const prior = findLabeledEntry(sm, fullLabel);
+        if (prior && prior !== leafId) {
+          pi.setLabel(prior, undefined);
+        }
+        pi.setLabel(leafId, fullLabel);
         const cw = ctx.model?.contextWindow ?? 0;
         const tokensHere = estimateActiveBranchTokens(sm);
         const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
         const positionLine = `${formatPct1(tokensHere, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}`;
-        const hintLine = labelHint ? ` (at: “${labelHint}”)` : "";
+        const hintLine = labelHint ? ` (after: “${labelHint}”)` : "";
         return {
           content: [
             {
@@ -552,6 +566,7 @@ export default function (pi: ExtensionAPI) {
             entryId: leafId,
             contextTokens: tokensHere,
             labelHint,
+            movedFromPriorEntry: prior && prior !== leafId ? prior : null,
           },
         };
       }
@@ -571,8 +586,9 @@ export default function (pi: ExtensionAPI) {
         !p.summaryFocus ||
         p.summaryFocus.trim().length < MIN_SUMMARY_FOCUS_LENGTH
       ) {
+        const focusLen = p.summaryFocus?.trim().length ?? 0;
         return toolError(
-          `rewind requires a non-trivial \`summaryFocus\`. The user's most recent instruction (which triggered this rewind) lives on the chain that's about to be collapsed — if summaryFocus doesn't preserve it, the post-rewind turn won't know what's left to do.\n\n` +
+          `\`summaryFocus\` must be ≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim (got ${focusLen}). The user's most recent instruction (which triggered this rewind) lives on the chain that's about to be collapsed — if summaryFocus doesn't preserve it, the post-rewind turn won't know what's left to do.\n\n` +
             `Include in summaryFocus:\n` +
             `  1. the user's most recent instruction verbatim,\n` +
             `  2. which parts have already been done in the work being collapsed,\n` +
@@ -744,7 +760,7 @@ export default function (pi: ExtensionAPI) {
               `A branch_summary recording the work just collapsed has been appended to your context. Items under '## Done' are complete. Items under '## Next Steps' are still pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
               (refreshed
                 ? ""
-                : `\n\n⚠ Reflection failed — next prompt() may still snapshot stale messages.`),
+                : `\n\n⚠ Reflection failed — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Restart pi to recover.`),
           },
         ],
         details: {
