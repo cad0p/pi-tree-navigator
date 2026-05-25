@@ -310,31 +310,12 @@ function installPrepareNextTurn(session: AgentSession): void {
     if (typeof prior === "function") {
       priorResult = await prior(...args);
     }
-    // Chain composition: the prior wrapper's `context` (if any) is the
-    // base; this extension owns only `messages`. Other fields the prior
-    // returned in `context` (systemPrompt, tools, or future shape
-    // additions) survive verbatim. `model` and `thinkingLevel` are also
-    // propagated. Without this, a co-installed extension that mutates
-    // systemPrompt or tools via prepareNextTurn would be silently
-    // overwritten on every turn.
-    //
-    // Pi's loop wholesale-replaces context (`currentContext = ctx ??
-    // currentContext`), not field-merges. If a prior wrapper returned a
-    // partial `context` (e.g. only `systemPrompt`, no `tools`), the
-    // returned context here would have `tools: undefined` and the next
-    // API call would lose the agent's tool surface. Defensively fill
-    // any missing fields from `agent.state` so the merged context is
-    // always complete.
-    //
-    // Merge order matters: the spread runs FIRST so any fields the prior
-    // wrapper returned survive verbatim, then the explicit fallbacks
-    // overlay only `systemPrompt` and `tools` (filling them from
-    // `agent.state` whenever the prior left them as `undefined` — whether
-    // the key was absent or present-but-undefined). `messages` is owned
-    // by this wrapper and always overwrites. The reverse order (defaults
-    // first, spread after) silently re-introduced `undefined` from priors
-    // that explicitly returned `tools: undefined`, since the trailing
-    // spread overwrites the fallback.
+    // Pi's loop replaces context wholesale (`currentContext = ctx ??
+    // currentContext`), not field-merges — a prior wrapper that returns
+    // a partial context (e.g. only systemPrompt) would silently drop
+    // tools. Spread the prior first so its fields survive, then fall
+    // back to `agent.state` for any field the prior left undefined.
+    // `messages` is owned by this wrapper.
     const priorContext = priorResult?.context;
     return {
       context: {
