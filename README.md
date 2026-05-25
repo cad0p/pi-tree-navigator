@@ -102,12 +102,12 @@ The synthetic assistant we inject after each rewind shows up in `usage.totalToke
 
 ```bash
 bun install
-bun test          # 25 tests over the pure helpers
+bun test          # ~110 tests covering helpers + dispatch + reflection bootstrap
 bunx biome check extensions/
 bunx tsc --noEmit
 ```
 
-Tests (`extensions/navigate-tree/helpers.test.ts`) cover the pure helpers in `extensions/navigate-tree/helpers.ts`. The reflection-heavy code in `extensions/navigate-tree/index.ts` is exercised end-to-end via real pi sessions.
+Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against pi 0.75.x is recommended for any pi version bump (the reflection bootstrap depends on internal field shapes).
 
 ## License
 

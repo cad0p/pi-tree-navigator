@@ -492,6 +492,7 @@ export default function (
       "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).\n" +
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
       "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
+      "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it.\n\n" +
       "`summaryFocus` is REQUIRED on rewind. The schema marks it optional because the dispatched action determines which fields are required — the runtime guard rejects rewinds without a `summaryFocus` of ≥20 chars after trim. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
@@ -503,15 +504,37 @@ export default function (
     // The runtime guards in `execute` provide the conditional-required
     // behavior the schema can't express.
     parameters: Type.Object({
-      action: Type.Union([
-        Type.Literal("anchor"),
-        Type.Literal("rewind"),
-        Type.Literal("list"),
-      ]),
-      name: Type.Optional(Type.String()),
-      labelStart: Type.Optional(Type.String()),
-      labelEnd: Type.Optional(Type.String()),
-      summaryFocus: Type.Optional(Type.String()),
+      action: Type.Union(
+        [Type.Literal("anchor"), Type.Literal("rewind"), Type.Literal("list")],
+        {
+          description:
+            "Which operation to perform. 'anchor' labels the current point, 'rewind' collapses work between an anchor and the current leaf into a branch_summary, 'list' shows every anchor on the active branch.",
+        },
+      ),
+      name: Type.Optional(
+        Type.String({
+          description:
+            "Required when action='anchor'. Kebab-case label (max 40 chars) for the milestone. If a label with this name already exists on the active branch, it is moved to the new leaf.",
+        }),
+      ),
+      labelStart: Type.Optional(
+        Type.String({
+          description:
+            "Required when action='rewind'. Existing anchor name to start the collapse from — work between this anchor and the current leaf is summarized.",
+        }),
+      ),
+      labelEnd: Type.Optional(
+        Type.String({
+          description:
+            "Required when action='rewind'. Kebab-case name for the resulting branch_summary entry. Becomes addressable as a future labelStart.",
+        }),
+      ),
+      summaryFocus: Type.Optional(
+        Type.String({
+          description:
+            "Required when action='rewind'. ≥20 chars after trim. Should encode (1) the user's most recent instruction verbatim, (2) what was done in the collapsed segment, (3) what's left to do as a next action.",
+        }),
+      ),
     }),
     execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
       const sm = ctx.sessionManager as SessionManager;
@@ -865,11 +888,17 @@ export default function (
 }
 
 /**
- * Non-stable testing-only hooks. The `__` prefix marks this as a private
- * surface — not part of the package's public API. Intended for hermetic
- * tests that need to undo the AgentSession.prototype patch, clear the
- * captured-session list between cases, and reach the module-internal
- * helpers without re-implementing them.
+ * Non-stable testing-only hooks. **Do NOT import in production code.**
+ *
+ * The `__` prefix and individual member names are subject to change in any
+ * release without a semver-major bump. Intended exclusively for hermetic
+ * tests within this package; the hooks reach into module-internal state
+ * (the `AgentSession.prototype` patch, the `seenSessions` WeakSet, the
+ * `sessionInstances` array, the `prepareNextTurn` marker symbol) and are
+ * not designed for external consumption.
+ *
+ * If you found this via `node_modules` archaeology, you're holding it
+ * wrong — use the registered tool surface (`navigate_tree`) instead.
  */
 export const __testHooks = {
   /**

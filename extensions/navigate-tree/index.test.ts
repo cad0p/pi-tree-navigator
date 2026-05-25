@@ -244,7 +244,7 @@ function makeFakeSession(sm: SessionManager): FakeAgentSession {
 // Schema shape (Kiro compatibility)
 // =============================================================================
 
-describe("schema shape \u2014 Kiro compatibility (LD-4)", () => {
+describe("schema shape \u2014 Kiro compatibility", () => {
   it("registers a tool with a flat object root and `action` required", () => {
     // The Kiro/CodeWhisperer adapter forwards inputSchema.json verbatim and
     // 400s on non-`type: "object"` roots (anyOf/oneOf/discriminated unions).
@@ -310,10 +310,10 @@ describe("production-default summarize resolution", () => {
 });
 
 // =============================================================================
-// buildSyntheticAssistant shape (LD-1)
+// buildSyntheticAssistant shape
 // =============================================================================
 
-describe("buildSyntheticAssistant shape (LD-1)", () => {
+describe("buildSyntheticAssistant shape", () => {
   it("builds an assistant message with toolUse stop reason and zero cost", () => {
     // The synthetic must (a) carry a tool_call id matching the in-flight call,
     // (b) survive Kiro's normalizeMessages filter (stopReason must not be
@@ -949,10 +949,10 @@ describe("dispatch: rewind happy path", () => {
 });
 
 // =============================================================================
-// installPrepareNextTurn (LD-2)
+// installPrepareNextTurn
 // =============================================================================
 
-describe("installPrepareNextTurn (LD-2)", () => {
+describe("installPrepareNextTurn", () => {
   it("basic: returns a context whose messages match buildSessionContext()", async () => {
     const sm = SessionManager.inMemory("/tmp");
     sm.appendMessage({
@@ -1011,10 +1011,10 @@ describe("installPrepareNextTurn (LD-2)", () => {
 });
 
 // =============================================================================
-// refreshAgentMessages (LD-3)
+// refreshAgentMessages
 // =============================================================================
 
-describe("refreshAgentMessages (LD-3)", () => {
+describe("refreshAgentMessages", () => {
   it("returns false when no session was captured", () => {
     const sm = SessionManager.inMemory("/tmp");
     assert.equal(__testHooks.refreshAgentMessages(sm), false);
