@@ -243,6 +243,41 @@ function makeFakeSession(sm: SessionManager): FakeAgentSession {
   };
 }
 
+/**
+ * Build the canonical rewindable fixture: an anchored first assistant turn
+ * plus N follow-up turns (default 1), optionally with a captured
+ * AgentSession so the reflection bootstrap finds it.
+ *
+ * Companion to `rewindFixture()` (which additionally drives the rewind);
+ * use this helper when the test needs to control the rewind invocation
+ * directly (custom args, throw-arming between setup and execute, etc.).
+ */
+function setupRewindable(
+  sm: SessionManager,
+  pi: FakePi,
+  opts: {
+    capture?: boolean;
+    turnsAfter?: number;
+    labelStartName?: string;
+    tokenCounts?: number[];
+  } = {},
+): { fake?: FakeAgentSession } {
+  const labelStartName = opts.labelStartName ?? "start";
+  const turnsAfter = opts.turnsAfter ?? 1;
+  const tokenCounts = opts.tokenCounts ?? [100, 200, 300, 400, 500];
+  const t1 = appendTurn(sm, "u1", "a1", tokenCounts[0]);
+  pi.pi.setLabel(t1.assistantId, `anchor:${labelStartName}`);
+  for (let i = 0; i < turnsAfter; i++) {
+    appendTurn(sm, `u${i + 2}`, `a${i + 2}`, tokenCounts[i + 1] ?? 100);
+  }
+  if (opts.capture) {
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    return { fake };
+  }
+  return {};
+}
+
 // =============================================================================
 // Schema shape (Kiro compatibility)
 // =============================================================================
@@ -574,9 +609,7 @@ describe("dispatch: list action", () => {
     // contain the rewind-specific constant verbatim, NOT the list one.
     {
       const { sm, pi, tool, ctx } = setup();
-      const t1 = appendTurn(sm, "u1", "a1", 100);
-      pi.pi.setLabel(t1.assistantId, "anchor:start");
-      appendTurn(sm, "u2", "a2", 200);
+      setupRewindable(sm, pi);
       const result = await tool.execute(
         "tc-rewind",
         {
@@ -1083,9 +1116,7 @@ describe("dispatch: rewind happy path", () => {
 
   it("bootstrap-missing path: warns in response and reports refreshed=false", async () => {
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     // No captureSession call \u2014 reflection finds no owning session.
 
     const result = await tool.execute(
@@ -1263,12 +1294,7 @@ describe("dispatch: rewind happy path", () => {
     // strict-greater-than comparison so a regression to `>=` (which
     // would chop the last char + append the marker) surfaces.
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
-
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
+    setupRewindable(sm, pi, { capture: true });
 
     const focus = "x".repeat(MAX_SYNTHETIC_FOCUS_LENGTH);
     const result = await tool.execute(
@@ -1320,12 +1346,7 @@ describe("dispatch: rewind happy path", () => {
     // truncation branch. Pin the marker shape so a regression that
     // drops the suffix (or moves the cap) surfaces.
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
-
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
+    setupRewindable(sm, pi, { capture: true });
 
     const focus = "x".repeat(MAX_SYNTHETIC_FOCUS_LENGTH + 1);
     const result = await tool.execute(
@@ -1391,12 +1412,8 @@ describe("dispatch: rewind happy path", () => {
     }) as typeof fakeSummarize;
 
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
-
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
 
     const fullFocus = "y".repeat(1500);
     const result = await tool.execute(
@@ -1856,9 +1873,7 @@ describe("dispatch: adversarial inputs", () => {
 
   it("rewind without auth fails fast with a clear error", async () => {
     const { sm, pi, tool, ctx } = setup({ authError: "no api key" });
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     const result = await tool.execute(
       "tc-1",
       {
@@ -1877,9 +1892,7 @@ describe("dispatch: adversarial inputs", () => {
 
   it("rewind without a configured model fails with a clear error", async () => {
     const { sm, pi, tool, ctx } = setup({ noModel: true });
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     const result = await tool.execute(
       "tc-1",
       {
@@ -1943,14 +1956,12 @@ function throwOnNextAppendMessage(sm: SessionManager, err: Error): () => void {
 describe("dispatch: rewind salvage path", () => {
   it("setLabel(labelEnd) throws \u2192 synthetic still appended; original error wraps salvage detail", async () => {
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
-    appendTurn(sm, "u3", "a3", 300);
-
-    // Capture so refresh path runs.
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
+    const { fake } = setupRewindable(sm, pi, {
+      capture: true,
+      turnsAfter: 2,
+      tokenCounts: [100, 200, 300],
+    });
+    if (!fake) throw new Error("capture: true must return fake");
 
     // We patch AFTER the anchor write above, so the patch counter starts
     // at 0. The first patched call is the rewind's labelEnd write; the
@@ -2029,9 +2040,7 @@ describe("dispatch: rewind salvage path", () => {
 
   it("setLabel throws then retry succeeds \u2192 no salvage detail in re-thrown error", async () => {
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
 
     // Throw on call #1 (original labelEnd write). The salvage retry runs
     // as call #2 and succeeds, so no salvage detail in the wrapped error.
@@ -2110,9 +2119,7 @@ describe("dispatch: rewind salvage path", () => {
 
   it("estimateActiveBranchTokens throws \u2192 synthetic still appended with degenerate token count", async () => {
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
 
     // Make buildSessionContext throw \u2014 estimateActiveBranchTokens calls it.
     // Throw only AFTER the branchWithSummary has succeeded by counting calls.
@@ -2223,9 +2230,7 @@ describe("dispatch: rewind salvage path", () => {
     // it throws there's nothing more we can do. Pin: the throw escapes
     // verbatim (no double-handling, no swallowing).
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
 
     // Arm appendMessage to throw on the next call \u2014 the synthetic append
     // is the only appendMessage from inside the tool's rewind path
@@ -2270,13 +2275,11 @@ describe("dispatch: rewind salvage path", () => {
     // branch. Without the in-try lookup, an upstream throw from
     // findLabeledEntry would orphan the tool_result.
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
-    appendTurn(sm, "u3", "a3", 300);
-
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
+    setupRewindable(sm, pi, {
+      capture: true,
+      turnsAfter: 2,
+      tokenCounts: [100, 200, 300],
+    });
 
     // Trip `getBranch` ONLY after a `branch_summary` entry exists on
     // the active branch — i.e. after `sm.branchWithSummary` ran. The
@@ -2601,9 +2604,7 @@ describe("dispatch: rewind error branches", () => {
         aborted: true,
       })) as never,
     });
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     const result = await tool.execute(
       "tc-1",
       {
@@ -2630,9 +2631,7 @@ describe("dispatch: rewind error branches", () => {
         error: "rate limited",
       })) as never,
     });
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     const result = await tool.execute(
       "tc-1",
       {
@@ -2658,9 +2657,7 @@ describe("dispatch: rewind error branches", () => {
         aborted: false,
       })) as never,
     });
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     const result = await tool.execute(
       "tc-1",
       {
@@ -3219,9 +3216,7 @@ describe("dispatch: rewind beforeTokens fallback", () => {
     // parentId; otherwise falls back to estimateActiveBranchTokens.
     // Smoke-level pin: a sensible non-zero contextBefore lands in details.
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    setupRewindable(sm, pi);
     // Append a trailing user message so the leaf isn't an assistant.
     sm.appendMessage({
       role: "user",
