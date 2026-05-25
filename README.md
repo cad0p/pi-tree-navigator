@@ -32,7 +32,7 @@ pi install git:github.com/cad0p/pi-tree-navigator
 ### Requirements
 
 - **pi 0.74+** with at least one model provider configured.
-- The reflection bootstrap depends on three internal pi/agent fields being plain (not `#`-private): `AgentSession.prototype.prompt`, `agent.state.messages`, and `agent.prepareNextTurn`. Verified against pi 0.75.x.
+- The reflection bootstrap depends on five plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. Verified against pi 0.75.x.
 
 ## What you get
 
@@ -61,7 +61,7 @@ agent: navigate_tree(action="rewind", labelStart="impl-start", labelEnd="impl-en
                                    and the open issue with edge case X")
   → [rewind 'impl-start' → 'impl-end'] · context 30.4% → 4.1% of 1.0M
   → A branch_summary recording the work just collapsed has been appended
-    to your context. Items under '## Done' are complete. ...
+    to your context. Items under '### Done' are complete. ...
 
 agent: ...continues with the freed context, the next API call is back at ~4%...
 ```
@@ -82,11 +82,11 @@ Why this is more involved than just calling pi's `branchWithSummary`:
 
 ### Synthetic assistant token bias
 
-The synthetic assistant we inject after each rewind shows up in `usage.totalTokens` as ~50 input tokens (the wrapper around its empty content). It's a one-time cost per rewind, not per subsequent turn — the `branch_summary` entry already absorbs the abandoned content. Mention if you're benchmarking exact token deltas; ignore otherwise.
+The synthetic assistant we inject after each rewind carries the **post-rewind chain estimate** in `usage.totalTokens` (so `estimateContextTokens` reads a sensible baseline immediately after the move). The synthetic itself adds a ~50-token toolCall block re-emitted on every subsequent turn until the next rewind — that overhead is **not** reflected in any `usage.*` field, so future `estimateContextTokens` calls understate the chain by ~50 tokens until the next assistant turn writes a fresh usage block. Negligible at typical anchor cadence; mention if you're benchmarking exact token deltas, ignore otherwise.
 
 ## Limitations
 
-- **Brittle to pi version bumps.** The fix uses three independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the call landed on disk but the next assistant turn may snapshot pre-bootstrap context. Restart pi to recover.`, and you'd see context corruption return on the next prompt.
+- **Brittle to pi version bumps.** The fix uses five independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Restart pi or run \`/reload\` to recover.`, and you'd see context corruption return on the next prompt.
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 

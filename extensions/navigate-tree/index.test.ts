@@ -498,15 +498,41 @@ describe("dispatch: list action", () => {
     assert.equal(result.details.reflectionOk, true);
   });
 
-  it("list and rewind warnings cite the same REFLECTION_BOOTSTRAP_WARNING constant verbatim (SSOT)", async () => {
-    // The source claims `REFLECTION_BOOTSTRAP_WARNING` is the single
-    // source of truth for both the list-site and rewind-site warning.
-    // Pin literal containment of the constant at both sites so a future
-    // drift (e.g. dropping the recovery hint at one site) surfaces here.
-    const sentinel = __testHooks.REFLECTION_BOOTSTRAP_WARNING;
-    assert.ok(sentinel.length > 0, "warning constant must be non-empty");
+  it("list and rewind warnings cite their site-specific REFLECTION_BOOTSTRAP_WARNING constants verbatim", async () => {
+    // Two SSOT constants — one per emission site — because the prose
+    // differs (`list` is read-only; `rewind` wrote to disk). Pin literal
+    // containment of the matching constant at each site so a future
+    // drift (e.g. dropping the /reload recovery hint at one site, or
+    // accidentally swapping the constants between sites) surfaces here.
+    const listSentinel = __testHooks.REFLECTION_BOOTSTRAP_WARNING_LIST;
+    const rewindSentinel = __testHooks.REFLECTION_BOOTSTRAP_WARNING_REWIND;
+    assert.ok(listSentinel.length > 0, "list-warning must be non-empty");
+    assert.ok(rewindSentinel.length > 0, "rewind-warning must be non-empty");
+    // The two are distinct — distinct prose for distinct call shapes.
+    // (If they ever converge again, this asserts that fact deliberately.)
+    assert.notEqual(
+      listSentinel,
+      rewindSentinel,
+      "list and rewind warnings must use site-specific phrasing",
+    );
+    // Both share the recovery hint with `/reload` mentioned (CORR4-6:
+    // `/reload` is the lighter-weight recovery; `Restart pi` is the
+    // heavier alternative). A regression that drops `/reload` from
+    // either constant surfaces here.
+    assert.match(
+      listSentinel,
+      /\/reload/,
+      "list-warning must mention /reload as a recovery option",
+    );
+    assert.match(
+      rewindSentinel,
+      /\/reload/,
+      "rewind-warning must mention /reload as a recovery option",
+    );
 
-    // List site: no captured session — reflection finds nothing.
+    // List site: no captured session — reflection finds nothing. The
+    // list-specific constant must appear verbatim; the rewind-specific
+    // constant must NOT (they're cross-site distinct).
     {
       const { tool, ctx } = setup();
       const result = await tool.execute(
@@ -517,13 +543,17 @@ describe("dispatch: list action", () => {
         ctx,
       );
       assert.ok(
-        result.content[0].text.includes(sentinel),
-        "list output must include REFLECTION_BOOTSTRAP_WARNING verbatim",
+        result.content[0].text.includes(listSentinel),
+        "list output must include REFLECTION_BOOTSTRAP_WARNING_LIST verbatim",
+      );
+      assert.ok(
+        !result.content[0].text.includes(rewindSentinel),
+        "list output must NOT include the rewind-specific phrasing",
       );
     }
 
-    // Rewind site: same conditions — the reflection-failed footer should
-    // contain the constant verbatim.
+    // Rewind site: same conditions — the bootstrap-missing footer must
+    // contain the rewind-specific constant verbatim, NOT the list one.
     {
       const { sm, pi, tool, ctx } = setup();
       const t1 = appendTurn(sm, "u1", "a1", 100);
@@ -542,8 +572,12 @@ describe("dispatch: list action", () => {
         ctx,
       );
       assert.ok(
-        result.content[0].text.includes(sentinel),
-        "rewind output must include REFLECTION_BOOTSTRAP_WARNING verbatim",
+        result.content[0].text.includes(rewindSentinel),
+        "rewind output must include REFLECTION_BOOTSTRAP_WARNING_REWIND verbatim",
+      );
+      assert.ok(
+        !result.content[0].text.includes(listSentinel),
+        "rewind output must NOT include the list-specific phrasing",
       );
     }
   });
@@ -1006,7 +1040,7 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(sm.getLabel(summaryId), "anchor:end");
   });
 
-  it("reflection-failed path: warns in response and reports refreshed=false", async () => {
+  it("bootstrap-missing path: warns in response and reports refreshed=false", async () => {
     const { sm, pi, tool, ctx } = setup();
     const t1 = appendTurn(sm, "u1", "a1", 100);
     pi.pi.setLabel(t1.assistantId, "anchor:start");

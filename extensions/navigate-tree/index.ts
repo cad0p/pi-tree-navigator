@@ -119,10 +119,12 @@ export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // the summarizer always sees the original; we only need a trimmed copy in
 // the synthetic's args because pi's `convertToLlm` re-emits the synthetic's
 // toolCall block (including its arguments) on every subsequent turn until
-// another rewind. Without a cap, a 100KB focus inflates every later turn's
-// input by 100KB indefinitely. 1KB is generous — well above empirically
-// useful focus length, and the agent already saw the full focus string when
-// it issued the rewind.
+// another rewind. Without a cap, a 100K-char focus inflates every later
+// turn's input by ~100K chars indefinitely. 1024 chars (UTF-16 code units,
+// per `String.prototype.slice`; for non-ASCII focus the byte cost may be
+// 2–4× higher under UTF-8) is generous — well above empirically useful
+// focus length, and the agent already saw the full focus string when it
+// issued the rewind.
 const MAX_SYNTHETIC_FOCUS_LENGTH = 1024;
 // Hint length cap for the per-row hint shown in `list` output. 50 chars
 // fits one terminal column without wrapping in typical 80-column TUIs.
@@ -142,16 +144,26 @@ const LIST_LABEL_COL_WIDTH = 28;
 const PNT_MARKER = Symbol.for("navigate-tree.pnt-installed");
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
-// Single source of truth for the reflection-bootstrap-missing warning.
-// Used by both `list` (header suffix) and `rewind` (response footer) so the
-// agent reading either site sees the same condition described the same way.
-// "bootstrap missing" is more accurate than the prior "Reflection failed"
-// phrasing — the rewind/list call itself didn't fail, the
-// AgentSession.prototype patch that those paths depend on for in-loop
-// context refresh wasn't installed (typically because the patch ran in a
-// previous module load and a /reload didn't reinstall it on this session).
-const REFLECTION_BOOTSTRAP_WARNING =
-  "⚠ reflection bootstrap missing — the call landed on disk but the next assistant turn may snapshot pre-bootstrap context. Restart pi to recover.";
+// Single source of truth for the reflection-bootstrap-missing warning,
+// split per emission site so the prose matches what each call actually did.
+// Used by `list` (header suffix, read-only) and `rewind` (response footer,
+// write). Both share the "bootstrap missing" framing — more accurate than
+// the prior "Reflection failed" phrasing because the rewind/list call
+// itself didn't fail, the AgentSession.prototype patch that those paths
+// depend on for in-loop context refresh wasn't installed (typically
+// because the patch ran in a previous module load and a /reload didn't
+// reinstall it on this session).
+//
+// `list` is read-only — nothing landed on disk — so its phrasing only warns
+// about the next assistant turn's context view. `rewind` did write to disk,
+// so its phrasing leads with that fact. Both end with the recovery hint
+// "Restart pi or run `/reload` to recover." — `/reload` re-runs
+// `patchAgentSessionPrototype` and is sufficient on its own; `Restart pi`
+// is the heavier-handed alternative for cases where /reload itself failed.
+const REFLECTION_BOOTSTRAP_WARNING_LIST =
+  "⚠ reflection bootstrap missing — anchors and rewinds still work, but the next assistant turn may snapshot pre-bootstrap context. Restart pi or run `/reload` to recover.";
+const REFLECTION_BOOTSTRAP_WARNING_REWIND =
+  "⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Restart pi or run `/reload` to recover.";
 
 // ---------------------------------------------------------------------------
 // Typed views over pi internals.
@@ -519,7 +531,7 @@ export default function (
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
       "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
       "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it.\n\n" +
-      "`summaryFocus` is REQUIRED on rewind. The schema marks it optional because the dispatched action determines which fields are required — the runtime guard rejects rewinds without a `summaryFocus` of ≥20 chars after trim. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
+      "`summaryFocus` is required when `action='rewind'` (≥20 chars after trim). Calls without it are rejected. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
@@ -599,7 +611,7 @@ export default function (
 
         const reflectionWarning = reflectionOk
           ? ""
-          : ` · ${REFLECTION_BOOTSTRAP_WARNING}`;
+          : ` · ${REFLECTION_BOOTSTRAP_WARNING_LIST}`;
         const header = `[list] · ${lines.length} label${lines.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
         const body = lines.length
           ? `Active labels (root → leaf):\n${lines.join("\n")}`
@@ -939,7 +951,7 @@ export default function (
             text:
               `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
               `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '## Next Steps' are still pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
-              (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING}`),
+              (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
           },
         ],
         details: {
@@ -1011,9 +1023,12 @@ export const __testHooks = {
     return sessionInstances.length;
   },
   /**
-   * The reflection-bootstrap-missing warning string. Exported so tests can
-   * pin the single-source-of-truth claim (the constant is used by both
-   * `list` and `rewind`; tests assert literal containment to catch drift).
+   * The reflection-bootstrap-missing warning strings, split per site.
+   * Exported so tests can pin the per-site verbatim wording (the `list`
+   * site is read-only and uses the read-only phrasing; the `rewind` site
+   * writes to disk and uses the write phrasing). Tests assert literal
+   * containment at each site to catch drift.
    */
-  REFLECTION_BOOTSTRAP_WARNING,
+  REFLECTION_BOOTSTRAP_WARNING_LIST,
+  REFLECTION_BOOTSTRAP_WARNING_REWIND,
 };
