@@ -66,7 +66,9 @@
  *     `agent.prepareNextTurn` — to ES `#` private fields, this breaks
  *     fundamentally.
  *   • If pi renames or restructures any of these fields, this breaks.
- *   • Patches the AgentSession prototype globally.
+ *   • Patches `AgentSession.prototype.prompt` globally on import; not
+ *     reversible without a process restart; affects every session in the
+ *     pi process, including sessions that never call `navigate_tree`.
  *
  * Verified against pi 0.75.5.
  */
@@ -94,6 +96,19 @@ import {
 } from "./helpers.ts";
 
 const LABEL_PREFIX = "anchor:";
+
+// ---------------------------------------------------------------------------
+// Exported boundary constants below (MAX_SESSION_REFS, MAX_HINT_WALK_DEPTH,
+// MIN_SUMMARY_FOCUS_LENGTH, MAX_SYNTHETIC_FOCUS_LENGTH).
+//
+// Stability: these are internal tunables. Exported only so the test suite
+// can pin boundary cases by constant rather than literal. Re-tuning is
+// NOT a semver-breaking change for this package — production callers
+// should rely on the registered `navigate_tree` tool surface, not import
+// these constants directly. The `__testHooks` JSDoc carries the same
+// caveat for module-internal helpers.
+// ---------------------------------------------------------------------------
+
 // Cap on captured AgentSession refs across /new + /resume + /reload cycles.
 // Worst case is ~one ref per long-lived session before reaping dead WeakRefs;
 // 16 leaves headroom for the deepest session-fanout pattern observed (a few
@@ -531,7 +546,7 @@ export default function (
       "Operations (set the `action` parameter):\n" +
       "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).\n" +
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
-      "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
+      "  • action='list': show all named anchors on the active branch in chronological order, with cumulative context % at each anchor.\n\n" +
       "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it. Pi labels written via `/label anchor:foo` (manually or by other extensions) are also addressable here. Avoid the `anchor:` prefix in manually-set labels.\n\n" +
       "`summaryFocus` is required when `action='rewind'` (≥20 chars after trim). Calls without it are rejected. It's passed to pi's `generateBranchSummary` as `customInstructions`, biasing the summarizer LLM toward the agent's specified focus while it rewrites the collapsed work into pi's structured summary format. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:

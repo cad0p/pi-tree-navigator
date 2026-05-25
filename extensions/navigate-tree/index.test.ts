@@ -910,7 +910,10 @@ describe("dispatch: rewind validation guards", () => {
   it("summaryFocus exactly 20 chars after trim passes the guard", async () => {
     // Boundary: summaryFocus.trim().length >= MIN_SUMMARY_FOCUS_LENGTH (the
     // >= boundary). The call still errors at the next guard (no labelStart
-    // on chain), but it moves past the focus-length check.
+    // on chain), but it moves past the focus-length check. Pad with leading
+    // and trailing whitespace so the trim path is actually exercised at
+    // the boundary — a regression that drops the .trim() call would let
+    // the focus through with whitespace counted, masking the failure.
     const { sm, tool, ctx } = setup();
     appendTurn(sm, "u", "a");
     const result = await tool.execute(
@@ -919,7 +922,7 @@ describe("dispatch: rewind validation guards", () => {
         action: "rewind",
         labelStart: "missing",
         labelEnd: "after",
-        summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
+        summaryFocus: `  ${"x".repeat(MIN_SUMMARY_FOCUS_LENGTH)}  `,
       },
       undefined,
       undefined,
@@ -2940,6 +2943,23 @@ describe("installPrepareNextTurn cross-extension preservation", () => {
     }
     assert.ok(thrown instanceof Error);
     if (thrown instanceof Error) assert.equal(thrown.message, "foreign boom");
+  });
+
+  it("returns without throwing when agent is missing", () => {
+    // Pin the `if (!agent) return` early-exit in installPrepareNextTurn:
+    // a session-shaped object that lacks an `agent` field must not throw
+    // when the patch's wrapper runs `installPrepareNextTurn(this)`. This
+    // protects against pi internals shape changes that drop the field
+    // or rename it — the bootstrap degrades to no-op rather than
+    // crashing the prompt patch (which would prevent any session from
+    // calling prompt() at all).
+    const sm = SessionManager.inMemory("/tmp");
+    const fakeMissingAgent = { sessionManager: sm };
+    assert.doesNotThrow(() => {
+      __testHooks.installPrepareNextTurn(
+        fakeMissingAgent as unknown as AgentSession,
+      );
+    });
   });
 });
 

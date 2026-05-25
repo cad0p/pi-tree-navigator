@@ -8,11 +8,28 @@
  * No pi runtime imports — these are pure functions over plain JS values.
  */
 
+// ---------------------------------------------------------------------------
+// Exported boundary constants below (MAX_NAME_LENGTH, MAX_BOILERPLATE_LEAD_IN).
+//
+// Stability: these are internal tunables. Exported only so the test suite
+// can pin boundary cases by constant rather than literal. Re-tuning is
+// NOT a semver-breaking change for this package — production callers
+// should rely on the registered `navigate_tree` tool surface, not import
+// these constants directly.
+// ---------------------------------------------------------------------------
+
 // Hard cap on label-name length. 40 chars accommodates descriptive names
 // (e.g. 'parser-edge-case-investigation', 31 chars) while keeping list
 // output column-friendly under common terminal widths and preventing a
 // runaway label string from poisoning the JSONL on disk.
 export const MAX_NAME_LENGTH = 40;
+/**
+ * Kebab-case anchor name: lowercase alphanumeric segments separated by
+ * single hyphens. No leading / trailing / double hyphens (the `isValidName`
+ * test suite enforces these rejections). Mirrors the pattern documented in
+ * the tool description and README — if this regex relaxes, both surfaces
+ * need the same update.
+ */
 const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 // Maximum lead-in distance for pi's branch-summary boilerplate marker.
