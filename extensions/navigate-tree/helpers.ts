@@ -8,8 +8,19 @@
  * No pi runtime imports — these are pure functions over plain JS values.
  */
 
+// Hard cap on label-name length. 40 chars accommodates descriptive names
+// (e.g. 'parser-edge-case-investigation', 31 chars) while keeping list
+// output column-friendly under common terminal widths and preventing a
+// runaway label string from poisoning the JSONL on disk.
 export const MAX_NAME_LENGTH = 40;
 export const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+// Maximum lead-in distance for pi's branch-summary boilerplate marker.
+// Pi's standard prelude ("The user explored a different conversation
+// branch...") fits in the first ~150 chars; 200 is a generous upper bound.
+// A "## Goal" found later than this is treated as in-content prose, not
+// the boilerplate marker, and the strip is a no-op.
+const MAX_BOILERPLATE_LEAD_IN = 200;
 
 /** Validate a kebab-case name suitable for use as a navigate-tree label. */
 export function isValidName(s: unknown): s is string {
@@ -60,7 +71,7 @@ export function formatContextDelta(
  */
 export function stripBranchSummaryBoilerplate(text: string): string {
   const goalIdx = text.indexOf("## Goal");
-  if (goalIdx > 0 && goalIdx < 200) {
+  if (goalIdx > 0 && goalIdx < MAX_BOILERPLATE_LEAD_IN) {
     return text.slice(goalIdx + "## Goal".length);
   }
   return text;

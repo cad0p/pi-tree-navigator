@@ -92,11 +92,45 @@ import {
 } from "./helpers.ts";
 
 const LABEL_PREFIX = "anchor:";
+// Cap on captured AgentSession refs across /new + /resume + /reload cycles.
+// Worst case is ~one ref per long-lived session before reaping dead WeakRefs;
+// 16 leaves headroom for the deepest session-fanout pattern observed (a few
+// /resume cycles on top of a couple of /new cycles) without prematurely
+// reaping a still-live session. Bump if the reaper fires while a session
+// is still live.
 const MAX_SESSION_REFS = 16;
+// Hard ceiling on parentId chain walks in `findLabelHint`. The hint is a UX
+// preview only — we don't need to walk all the way to the root for a 50-char
+// snippet. 50 entries is far enough that we'll find a meaningful text-bearing
+// entry even after a tool-call-heavy stretch (assistant tool_calls produce
+// content-less text), and short enough that a malformed graph can't pin the
+// CPU.
 const MAX_HINT_WALK_DEPTH = 50;
+// Floor on `summaryFocus` length (after trim) for `rewind`. The user's most
+// recent instruction lives on the chain about to be collapsed; if the focus
+// is shorter than this, it almost always elides that instruction (a terse
+// "finish parser fix" is 17 chars and conveys nothing the next turn can
+// act on). 20 is the empirical threshold below which the post-rewind turn
+// reliably loses continuity — raising it forces more useful focus text
+// without inviting verbosity.
 const MIN_SUMMARY_FOCUS_LENGTH = 20;
+// Hint length cap for the per-row hint shown in `list` output. 50 chars
+// fits one terminal column without wrapping in typical 80-column TUIs.
+const LIST_HINT_MAX_LENGTH = 50;
+// Hint length cap for the hint shown in the `anchor` response. The anchor
+// response is a single block of prose (not a column-aligned table) so it
+// can afford a longer hint than `list`'s per-row preview.
+const ANCHOR_HINT_MAX_LENGTH = 60;
+// padStart width for the percentage column in `list` output. The longest
+// percent label is "100.0%" = 6 chars; "99.9%" = 5 chars covers the
+// realistic worst case and keeps the column tight.
+const LIST_PCT_COL_WIDTH = 5;
+// padEnd width for the anchor-name column in `list` output. MAX_NAME_LENGTH
+// is 40, but the typical kebab-case name is 8–20 chars; 28 keeps the
+// hint column visible without truncating common names.
+const LIST_LABEL_COL_WIDTH = 28;
 const PNT_MARKER = Symbol.for("navigate-tree.pnt-installed");
-const ORIG_PROMPT_KEY = "__navTreeOrigPrompt";
+const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
 // ---------------------------------------------------------------------------
 // Typed views over pi internals.
@@ -153,7 +187,10 @@ function captureSession(session: AgentSession): void {
 }
 
 function patchAgentSessionPrototype(): void {
-  const proto = AgentSession.prototype as unknown as Record<string, unknown>;
+  const proto = AgentSession.prototype as unknown as Record<
+    PropertyKey,
+    unknown
+  >;
   // Stash the truly-original prompt the FIRST time we patch. On subsequent
   // /reloads the value is already there — we don't overwrite, we just read it
   // back so the new wrapper still calls the original (not a previous wrapper).
@@ -291,7 +328,7 @@ function estimateAtEntry(
 function findLabelHint(
   sm: SessionManager,
   fromId: string,
-  maxLen = 60,
+  maxLen: number,
 ): string | null {
   let cur: string | null | undefined = fromId;
   let depth = 0;
@@ -413,6 +450,13 @@ export default function (pi: ExtensionAPI) {
       "`summaryFocus` is REQUIRED on rewind. The schema marks it optional because the dispatched action determines which fields are required — the runtime guard rejects rewinds without a `summaryFocus` of ≥20 chars after trim. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
+    // The schema is intentionally a flat `Type.Object` with everything-but-
+    // `action` optional, with action-conditional required-ness enforced at
+    // runtime in `execute`. Discriminated unions / property-level required-
+    // when-action shapes break the Kiro/CodeWhisperer adapter, which forwards
+    // `inputSchema.json` verbatim and 400s on non-`type: "object"` roots.
+    // The runtime guards in `execute` provide the conditional-required
+    // behavior the schema can't express.
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("anchor"),
@@ -450,10 +494,12 @@ export default function (pi: ExtensionAPI) {
           if (lbl && lbl.startsWith(LABEL_PREFIX)) {
             const name = lbl.slice(LABEL_PREFIX.length);
             const tokensAt = estimateAtEntry(allEntries, e.id, byId);
-            const pct = formatPct1(tokensAt, cw).padStart(5);
-            const hint = findLabelHint(sm, e.id, 50);
+            const pct = formatPct1(tokensAt, cw).padStart(LIST_PCT_COL_WIDTH);
+            const hint = findLabelHint(sm, e.id, LIST_HINT_MAX_LENGTH);
             const hintPart = hint ? `  “${hint}”` : "";
-            lines.push(`  ${pct}  ${name.padEnd(28)}${hintPart}`);
+            lines.push(
+              `  ${pct}  ${name.padEnd(LIST_LABEL_COL_WIDTH)}${hintPart}`,
+            );
           }
         }
 
@@ -486,7 +532,7 @@ export default function (pi: ExtensionAPI) {
         pi.setLabel(leafId, LABEL_PREFIX + p.name);
         const cw = ctx.model?.contextWindow ?? 0;
         const tokensHere = estimateActiveBranchTokens(sm);
-        const labelHint = findLabelHint(sm, leafId);
+        const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
         const positionLine = `${formatPct1(tokensHere, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}`;
         const hintLine = labelHint ? ` (at: “${labelHint}”)` : "";
         return {
