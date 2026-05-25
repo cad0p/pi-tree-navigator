@@ -606,15 +606,11 @@ describe("dispatch: list action", () => {
 // =============================================================================
 
 describe("dispatch: anchor action", () => {
+  // The `isValidName` predicate is exhaustively pinned in helpers.test.ts;
+  // here we just verify the predicate's verdict propagates into the dispatch
+  // error path. Two rows: a representative invalid shape + the boundary case.
   const invalidNames: Array<[string, unknown]> = [
-    ["empty string", ""],
-    ["undefined", undefined],
     ["uppercase", "Impl-Start"],
-    ["snake_case", "snake_case"],
-    ["space", "with space"],
-    ["leading hyphen", "-leading"],
-    ["trailing hyphen", "trailing-"],
-    ["double hyphen", "a--b"],
     ["over max length", "a".repeat(MAX_NAME_LENGTH + 1)],
   ];
   for (const [label, value] of invalidNames) {
