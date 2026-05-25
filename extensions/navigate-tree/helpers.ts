@@ -28,6 +28,14 @@ const MAX_BOILERPLATE_LEAD_IN = 200;
 // markdown doc whose first H2 is "Goal"). If pi's wording later changes,
 // the strip falls back to no-op and `findLabelHint` shows the unmodified
 // prelude — still useful, just less concise.
+//
+// Pi 0.75.5's branch_summary prelude begins with this exact text, derived
+// from `branch-summarization.js` in @earendil-works/pi-coding-agent. If pi
+// reworks the prelude wording (e.g. "navigated" instead of "explored"),
+// the strip degrades to a no-op (graceful) — but `findLabelHint` will then
+// show the unmodified prelude in `list` output. Verify against pi's
+// `dist/core/compaction/branch-summarization.js` when bumping the
+// peer-dep floor and update if the leading copy has changed.
 const BRANCH_SUMMARY_SENTINEL =
   "The user explored a different conversation branch";
 
@@ -49,7 +57,16 @@ export function toOneLine(text: string, maxLen: number): string | null {
   return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
 }
 
-/** Format token count as a percentage with one decimal, or as `Nk` if no window. */
+/**
+ * Format token count as a percentage with one decimal, or as `Nk` if no window.
+ *
+ * Negative-input contract: a negative `tokens` value produces a negative
+ * formatted string ("-0.0%", "-5.0%") rather than being clamped to 0 —
+ * negative tokens shouldn't reach this helper in production (token counters
+ * are unsigned), but if a caller bug feeds one in, the helper renders the
+ * sign and stays non-throwing. Tests pin the JS `toFixed` behavior so a
+ * future precision change surfaces immediately.
+ */
 export function formatPct1(tokens: number, contextWindow: number): string {
   if (contextWindow <= 0) return `${(tokens / 1000).toFixed(1)}k`;
   return `${((tokens / contextWindow) * 100).toFixed(1)}%`;
@@ -91,6 +108,11 @@ export function stripBranchSummaryBoilerplate(text: string): string {
  * Extract a string from a message-like content field. Handles both the
  * legacy string shape and the modern array-of-blocks shape, joining all
  * text blocks with spaces.
+ *
+ * Note: empty-text blocks survive the `type === "text"` filter and are
+ * joined with the separator, producing leading / trailing / double spaces
+ * in the output (e.g. `[{text: ""}, {text: "kept"}]` → `" kept"`). Callers
+ * that render the result should run it through `toOneLine()` or `.trim()`.
  */
 export function extractTextContent(content: unknown): string {
   if (typeof content === "string") return content;

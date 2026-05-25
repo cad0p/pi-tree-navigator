@@ -132,6 +132,17 @@ const LIST_LABEL_COL_WIDTH = 28;
 const PNT_MARKER = Symbol.for("navigate-tree.pnt-installed");
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
+// Single source of truth for the reflection-bootstrap-missing warning.
+// Used by both `list` (header suffix) and `rewind` (response footer) so the
+// agent reading either site sees the same condition described the same way.
+// "bootstrap missing" is more accurate than the prior "Reflection failed"
+// phrasing — the rewind/list call itself didn't fail, the
+// AgentSession.prototype patch that those paths depend on for in-loop
+// context refresh wasn't installed (typically because the patch ran in a
+// previous module load and a /reload didn't reinstall it on this session).
+const REFLECTION_BOOTSTRAP_WARNING =
+  "⚠ reflection bootstrap missing — the call landed on disk but the next assistant turn may snapshot pre-bootstrap context. Restart pi to recover.";
+
 // ---------------------------------------------------------------------------
 // Typed views over pi internals.
 //
@@ -539,7 +550,7 @@ export default function (
 
         const reflectionWarning = reflectionOk
           ? ""
-          : " · ⚠ reflection bootstrap missing — anchors still work; rewinds will collapse the tree on disk but the next assistant turn may snapshot pre-rewind context. Restart pi to recover.";
+          : ` · ${REFLECTION_BOOTSTRAP_WARNING}`;
         const header = `[list] · ${lines.length} label${lines.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
         const body = lines.length
           ? `Active labels (root → leaf):\n${lines.join("\n")}`
@@ -831,9 +842,7 @@ export default function (
             text:
               `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
               `A branch_summary recording the work just collapsed has been appended to your context. Items under '## Done' are complete. Items under '## Next Steps' are still pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
-              (refreshed
-                ? ""
-                : `\n\n⚠ Reflection failed — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Restart pi to recover.`),
+              (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING}`),
           },
         ],
         details: {

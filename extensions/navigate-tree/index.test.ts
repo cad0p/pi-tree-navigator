@@ -698,7 +698,7 @@ describe("dispatch: rewind happy path", () => {
       ctx,
     );
     assert.equal(result.isError, undefined);
-    assert.match(result.content[0].text, /Reflection failed/);
+    assert.match(result.content[0].text, /reflection bootstrap missing/);
     assert.equal(result.details.agentMessagesRefreshed, false);
   });
 
