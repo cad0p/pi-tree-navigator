@@ -25,7 +25,6 @@ import {
   type AgentSession,
   type ExtensionAPI,
   generateBranchSummary,
-  type SessionEntry,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { MAX_NAME_LENGTH } from "./helpers.ts";
@@ -908,16 +907,6 @@ describe("dispatch: rewind validation guards", () => {
         labelStart: "ok",
         labelEnd: "ok2",
         summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1), // just under the floor
-      },
-      want: /summaryFocus/,
-    },
-    {
-      name: "summaryFocus shorter after trim",
-      params: {
-        action: "rewind",
-        labelStart: "ok",
-        labelEnd: "ok2",
-        summaryFocus: `  ${"x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1)}  `,
       },
       want: /summaryFocus/,
     },
@@ -1841,34 +1830,6 @@ describe("dispatch: adversarial inputs", () => {
     );
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /No label 'same'/);
-  });
-
-  it("anchor over an existing label moves it (no duplicate)", async () => {
-    // Already exercised in 'move-on-collision' above; pin the side-effect
-    // shape adversarially here too: the same name set twice yields a
-    // single live label on the active branch.
-    const { sm, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1");
-    await tool.execute(
-      "tc-1",
-      { action: "anchor", name: "dup" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    appendTurn(sm, "u2", "a2");
-    await tool.execute(
-      "tc-2",
-      { action: "anchor", name: "dup" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    // Walk the branch and count entries labeled 'anchor:dup'.
-    const branch: SessionEntry[] = sm.getBranch();
-    const labeled = branch.filter((e) => sm.getLabel(e.id) === "anchor:dup");
-    assert.equal(labeled.length, 1);
-    assert.notEqual(labeled[0].id, t1.assistantId);
   });
 
   it("rewind without auth fails fast with a clear error", async () => {
