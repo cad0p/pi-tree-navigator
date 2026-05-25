@@ -837,70 +837,15 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
         modifiedFiles: result.modifiedFiles ?? [],
       });
 
-      // Once `branchWithSummary` succeeds, the active leaf has moved to the
-      // new branch_summary. Pi will append the real tool_result after this
-      // execute returns; that tool_result needs a matching tool_use on the
-      // kept chain. Three load-bearing facts converge here — trim any of
-      // them and the chain breaks:
-      //   1. the synthetic's tool_call id MUST equal this in-flight
-      //      `toolCallId`, so pi's appended tool_result pairs with it;
-      //   2. the synthetic's `stopReason: "toolUse"` survives Kiro's
-      //      `normalizeMessages` filter (which strips only `error` /
-      //      `aborted`) — see `buildSyntheticAssistant` JSDoc;
-      //   3. our `prepareNextTurn` rebuilds context from
-      //      `sm.buildSessionContext()`, whose result includes the synthetic
-      //      and the tool_result in the correct positions for the next turn.
-      //
-      // Atomicity: every code path where `branchWithSummary` succeeded MUST
-      // append a synthetic with the matching `toolCallId`. If labelling,
-      // token-math, or refresh throws after the move, salvage by appending a
-      // minimal synthetic before the throw escapes — otherwise pi writes its
-      // own tool_result whose tool_use_id has no match on the new branch and
-      // Anthropic 400s the next API call.
-      // Structure: the only operations that need salvage are
-      // `pi.setLabel(labelEnd)` and `estimateActiveBranchTokens` — both run
-      // BEFORE the synthetic append, so a throw from either leaves the
-      // chain invalid until the synthetic lands. Move the synthetic append
-      // OUTSIDE the try so it executes exactly once regardless of which
-      // earlier step threw — no idempotence guard needed because there's
-      // only one call site. The catch makes a best-effort attempt to retry
-      // the labelEnd write (idempotent in pi's setLabel contract) and
-      // surfaces salvage detail in the re-thrown error.
-      // Mirror anchor's move-on-collision: if `labelEnd` already labels
-      // another entry on the active branch, write the new label first
-      // (so a mid-collision crash leaves both labels briefly, never
-      // zero — `findLabeledEntry` walks leaf→root and returns the
-      // leaf-side match, so navigation stays correct during the
-      // overlap), then clear the prior. Without this move, two anchors
-      // with the same name coexist on the active branch — the namespace
-      // asymmetry vs `anchor` lets duplicate anchors survive a chained
-      // rewind. The lookup happens INSIDE the salvage try so that if
-      // findLabeledEntry throws (e.g. a malformed branch traversal), the
-      // synthetic still appends and pi's appended tool_result pairs with
-      // it. We don't retry the lookup itself — a lookup-throw means we
-      // don't know whether the prior labelEnd existed, so the safest
-      // recovery is to re-throw with the original error after the
-      // synthetic lands.
-      //
-      // The two `setLabel` calls are tagged distinctly (`setLabelEnd`
-      // for the new write, `clearPrior` for the move-on-collision
-      // clear) because they fail in different intermediate states and
-      // need different retry targets:
-      //   - `setLabelEnd` failure: the new label never wrote. Retry the
-      //     same `pi.setLabel(summaryId, fullLabelEnd)` (idempotent
-      //     under re-application).
-      //   - `clearPrior` failure: the new label DID write, but the
-      //     prior entry's label was never cleared, leaving two entries
-      //     with `anchor:<labelEnd>` on the active branch (visible in
-      //     `list` output, silently violating the move-on-collision
-      //     invariant). Retry `pi.setLabel(priorLabelEnd, undefined)`
-      //     (also idempotent: clearing an already-cleared label is a
-      //     no-op).
-      // Without this split, a `clearPrior` failure would re-run the
-      // already-succeeded `setLabelEnd` write, succeed silently, and
-      // leave the duplicate-label state with no salvage diagnostic —
-      // the agent gets the original error verbatim and `list` shows
-      // duplicate anchors with no signal that the prior-clear failed.
+      // Chain-validity invariants once `branchWithSummary` succeeds: a
+      // synthetic must land on every path with toolCallId === this
+      // in-flight call (so pi's appended tool_result pairs), and
+      // stopReason: "toolUse" (survives Kiro's normalizeMessages filter
+      // — see `buildSyntheticAssistant` JSDoc). The synthetic append
+      // sits OUTSIDE the try so it runs exactly once regardless of
+      // which earlier step threw. labelEnd write moves before clear,
+      // mirroring `anchor`'s move-on-collision so duplicate anchors
+      // can't survive a chained rewind.
       const fullLabelEnd = LABEL_PREFIX + p.labelEnd;
       let priorLabelEnd: ReturnType<typeof findLabeledEntry> = null;
       let tokensAtNewLeaf = 0;
@@ -930,29 +875,13 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
         failedStep = null;
       } catch (err) {
         originalErr = err;
-        // Best-effort retry per failed step. `pi.setLabel` is idempotent
-        // under re-application (re-applying the same label, or clearing
-        // an already-cleared label, is a no-op), so retrying the
-        // specific step that failed is safe. Wrap each retry in its own
-        // try so a second failure can't recurse.
-        //
-        // Why per-step retry (not a single "retry whatever setLabel
-        // step ran last"):
-        //   - `setLabelEnd` failure: the new labelEnd never wrote;
-        //     retry the same `pi.setLabel(summaryId, fullLabelEnd)`.
-        //   - `clearPrior` failure: the new labelEnd DID write; retry
-        //     the prior-clear `pi.setLabel(priorLabelEnd, undefined)`.
-        //     Conflating these would re-run the already-succeeded
-        //     labelEnd write on a `clearPrior` failure, succeed
-        //     silently, and leave the duplicate-label state with no
-        //     salvage diagnostic.
-        //   - `lookup` threw: we don't know whether the prior labelEnd
-        //     existed, so no retry is safe.
-        //   - `estimate` threw: both setLabel calls already succeeded;
-        //     a redundant labelEnd retry would either succeed silently
-        //     (wasted work) or, if the second call hits a new
-        //     transient, fabricate a misleading "retry failed"
-        //     diagnostic that hides the real (estimate) failure cause.
+        // Best-effort retry of the specific failed step (pi.setLabel is
+        // idempotent under re-application). Per-step recovery shape:
+        //   - setLabelEnd: retry pi.setLabel(summaryId, fullLabelEnd).
+        //   - clearPrior:  retry pi.setLabel(priorLabelEnd, undefined).
+        //   - lookup / estimate: no retry — either prior state unknown
+        //     or both labels already wrote; redundant retry would mask
+        //     the real cause.
         if (failedStep === "setLabelEnd") {
           try {
             pi.setLabel(summaryId, fullLabelEnd);
