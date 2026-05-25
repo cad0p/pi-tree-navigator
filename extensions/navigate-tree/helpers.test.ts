@@ -90,6 +90,31 @@ describe("formatPct1", () => {
     assert.equal(formatPct1(123, 0), "0.1k");
     assert.equal(formatPct1(560_000, -1), "560.0k");
   });
+  it("renders 100.0% when tokens === window exactly", () => {
+    // Boundary: at exactly the context window, the percent column should
+    // read 100.0% — wider than the LIST_PCT_COL_WIDTH=5 padStart, so the
+    // column will widen rather than truncate.
+    assert.equal(formatPct1(1_000_000, 1_000_000), "100.0%");
+  });
+  it("renders > 100.0% when tokens overflow the window", () => {
+    // Pinning behavior, not a bug guard: a token estimate over the
+    // window can happen if the synthetic-assistant baseline lags the
+    // actual chain. The column should keep formatting; downstream
+    // formatters (formatContextDelta, list output) inherit this.
+    assert.equal(formatPct1(1_500_000, 1_000_000), "150.0%");
+  });
+  it("rounds tiny fractions down to 0.0%", () => {
+    // 50 / 1_000_000 = 0.005% → toFixed(1) yields "0.0%". Pinning the
+    // round-down behavior so a future toFixed(2) refactor surfaces here.
+    assert.equal(formatPct1(50, 1_000_000), "0.0%");
+  });
+  it("renders negative tokens with a leading minus", () => {
+    // Negative tokens shouldn't reach this helper in production (token
+    // counters are unsigned), but if a caller bug feeds a negative the
+    // helper must not crash; pin the actual JS toFixed output.
+    assert.equal(formatPct1(-1, 1_000_000), "-0.0%");
+    assert.equal(formatPct1(-50_000, 1_000_000), "-5.0%");
+  });
 });
 
 describe("formatWindow", () => {
@@ -144,6 +169,24 @@ describe("stripBranchSummaryBoilerplate", () => {
       "Some quick notes on the parser refactor.\n\n## Goal\nMake it faster.";
     assert.equal(stripBranchSummaryBoilerplate(userDoc), userDoc);
   });
+  it("strips when ## Goal is at index 199 (just inside the boundary)", () => {
+    // Sentinel is 49 chars; pad to put '## Goal' at index 199 exactly.
+    // The boundary check is `goalIdx < 200`, so 199 should still strip.
+    const sentinel = "The user explored a different conversation branch";
+    const padding = "x".repeat(199 - sentinel.length);
+    const text = `${sentinel}${padding}## Goal\nbody`;
+    assert.equal(text.indexOf("## Goal"), 199);
+    assert.equal(stripBranchSummaryBoilerplate(text), "\nbody");
+  });
+  it("does not strip when ## Goal is at index 200 (boundary)", () => {
+    // Boundary case: at exactly 200, the strict-less-than check fails and
+    // the text is preserved as-is.
+    const sentinel = "The user explored a different conversation branch";
+    const padding = "x".repeat(200 - sentinel.length);
+    const text = `${sentinel}${padding}## Goal\nbody`;
+    assert.equal(text.indexOf("## Goal"), 200);
+    assert.equal(stripBranchSummaryBoilerplate(text), text);
+  });
 });
 
 describe("extractTextContent", () => {
@@ -177,5 +220,36 @@ describe("extractTextContent", () => {
       { type: "text", text: "kept" },
     ];
     assert.equal(extractTextContent(blocks), "kept");
+  });
+  it("ignores tool_result, image, and redactedThinking blocks", () => {
+    // Pi emits these block types alongside text on real chains. The helper
+    // is field-shape-based (`type === 'text'` and `text` is a string), so
+    // these all fall through; pin the realistic mix to lock that behavior.
+    const blocks = [
+      {
+        type: "toolResult",
+        id: "x",
+        output: [{ type: "text", text: "ignored" }],
+      },
+      { type: "image", source: { type: "base64", data: "…" } },
+      { type: "redactedThinking", data: "…" },
+      { type: "text", text: "kept" },
+    ];
+    assert.equal(extractTextContent(blocks), "kept");
+  });
+  it("returns empty string for empty array", () => {
+    assert.equal(extractTextContent([]), "");
+  });
+  it("preserves empty-string text blocks (joined with surrounding space)", () => {
+    // Pinning a slightly-surprising actual behavior: ['', 'kept'].join(' ')
+    // === ' kept'. If a future refactor filters empty-string blocks the
+    // join shape changes; surface it here.
+    assert.equal(
+      extractTextContent([
+        { type: "text", text: "" },
+        { type: "text", text: "kept" },
+      ]),
+      " kept",
+    );
   });
 });
