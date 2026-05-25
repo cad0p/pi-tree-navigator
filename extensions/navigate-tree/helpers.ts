@@ -13,7 +13,7 @@
 // output column-friendly under common terminal widths and preventing a
 // runaway label string from poisoning the JSONL on disk.
 export const MAX_NAME_LENGTH = 40;
-export const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 // Maximum lead-in distance for pi's branch-summary boilerplate marker.
 // Pi's standard prelude ("The user explored a different conversation

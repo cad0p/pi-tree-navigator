@@ -52,7 +52,7 @@ A typical autonomous-loop pattern:
 
 ```
 agent: navigate_tree(action="anchor", name="impl-start")
-  → [anchor 'impl-start'] set at 1.9% of 1.0M (after user: "implement the parser")
+  → [anchor 'impl-start'] set at 1.9% of 1.0M (after: “implement the parser”)
 
 agent: ...does work, runs tools, accumulates context to 30%...
 
@@ -82,11 +82,11 @@ Why this is more involved than just calling pi's `branchWithSummary`:
 
 ### Synthetic assistant token bias
 
-The synthetic assistant we inject after each rewind shows up in `usage.totalTokens` as ~30–50 input tokens (the wrapper around its empty content). It's a one-time cost per rewind, not per subsequent turn — the `branch_summary` entry already absorbs the abandoned content. Mention if you're benchmarking exact token deltas; ignore otherwise.
+The synthetic assistant we inject after each rewind shows up in `usage.totalTokens` as ~50 input tokens (the wrapper around its empty content). It's a one-time cost per rewind, not per subsequent turn — the `branch_summary` entry already absorbs the abandoned content. Mention if you're benchmarking exact token deltas; ignore otherwise.
 
 ## Limitations
 
-- **Brittle to pi version bumps.** The fix uses three independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ Reflection failed`, and you'd see context corruption return on the next prompt.
+- **Brittle to pi version bumps.** The fix uses three independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the call landed on disk but the next assistant turn may snapshot pre-bootstrap context. Restart pi to recover.`, and you'd see context corruption return on the next prompt.
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 
@@ -102,7 +102,7 @@ The synthetic assistant we inject after each rewind shows up in `usage.totalToke
 
 ```bash
 bun install
-bun test          # ~110 tests covering helpers + dispatch + reflection bootstrap
+bun test          # 111 tests covering helpers (helpers.test.ts) + dispatch / reflection bootstrap / salvage path (index.test.ts)
 bunx biome check extensions/
 bunx tsc --noEmit
 ```

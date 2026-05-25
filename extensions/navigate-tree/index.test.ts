@@ -277,7 +277,7 @@ describe("schema shape \u2014 Kiro compatibility", () => {
 });
 
 // =============================================================================
-// production-default `summarize` resolution (COV2-3)
+// production-default `summarize` resolution
 // =============================================================================
 
 describe("production-default summarize resolution", () => {
@@ -397,7 +397,7 @@ describe("dispatch: list action", () => {
     assert.ok(firstIdx >= 0 && secondIdx > firstIdx);
   });
 
-  it("pins the per-row line shape: percentage column then label column (COV2-9)", async () => {
+  it("pins the per-row line shape: percentage column then label column", async () => {
     // Pin the actual rendered shape so a formatting refactor that swaps
     // column order or drops the percentage prefix surfaces here. The
     // regex matches one or more leading spaces, a `\d+\.\d%` percent,
@@ -564,7 +564,7 @@ describe("dispatch: anchor action", () => {
     assert.ok(clearCall, "expected a clear of the prior label");
   });
 
-  it("re-anchor on the same leaf with the same name is idempotent: no spurious clear (COV2-8)", async () => {
+  it("re-anchor on the same leaf with the same name is idempotent: no spurious clear", async () => {
     // When `prior === leafId` (re-anchor at the same leaf, same name, no
     // intervening turns), the dispatch skips the prior-clear and just
     // re-sets the same label. Pin: zero `setLabel(<current leaf>,
@@ -586,10 +586,11 @@ describe("dispatch: anchor action", () => {
       undefined,
       ctx,
     );
-    // Snapshot the post-call leaf and assert no clear targeted IT (the
-    // prompt's COV2-8 contract). The legitimate clear that moves the
-    // label off the original message entry is allowed; what's banned is
-    // a clear of the entry we just wrote the new label onto.
+    // Snapshot the post-call leaf and assert no clear targeted IT
+    // (the idempotence-on-same-leaf contract). The legitimate clear
+    // that moves the label off the original message entry is allowed;
+    // what's banned is a clear of the entry we just wrote the new
+    // label onto.
     const finalLeafId = sm.getLeafId();
     assert.ok(finalLeafId);
     const spuriousClears = pi.setLabelCalls.filter(
@@ -602,7 +603,7 @@ describe("dispatch: anchor action", () => {
     );
   });
 
-  it("falls through with a misleading rewind error on unknown `action` (COV2-7)", async () => {
+  it("falls through with a misleading rewind error on unknown `action`", async () => {
     // The schema declares `action` as a Union(anchor|rewind|list), but the
     // runtime dispatch is three `if` checks with no explicit default —
     // an unknown action falls through to the rewind validation block.
@@ -824,7 +825,7 @@ describe("dispatch: rewind happy path", () => {
     );
   });
 
-  it("pins the synthetic-token bias contract: usage.totalTokens === pre-synthetic chain estimate (CORR2-10)", async () => {
+  it("pins the synthetic-token bias contract: usage.totalTokens === pre-synthetic chain estimate", async () => {
     // The synthetic's totalTokens is set to the chain size *before* the
     // synthetic itself is appended — a deliberate ~50-token understatement
     // documented in buildSyntheticAssistant's JSDoc. Pin the contract so a
@@ -1106,7 +1107,7 @@ describe("captureSession reaping", () => {
     assert.equal(afterRepeats, afterFirst);
   });
 
-  it("resetPrototype clears seenSessions so a re-captured identity isn't deduped (COV2-11)", () => {
+  it("resetPrototype clears seenSessions so a re-captured identity isn't deduped", () => {
     // Pre-reset: capturing the same identity twice dedupes (afterRepeat
     // === afterFirst). Post-reset: the SAME identity captures freshly,
     // proving the WeakSet was rebound. WeakSet has no .clear() so this
@@ -1441,7 +1442,7 @@ describe("dispatch: rewind salvage path", () => {
     assert.ok(thrown, "rewind should re-throw the original error");
     const msg = thrown instanceof Error ? thrown.message : String(thrown);
     assert.match(msg, /setLabel boom #1/);
-    // Salvage detail (CORR2-3 + SB2-9) wraps the original: the retry
+    // Salvage detail wraps the original: the retry
     // (#2) ALSO threw, so the salvage-failure clause is appended.
     assert.match(msg, /salvage:.*labelEnd retry failed/);
     assert.equal(calls, 2, "setLabel was called twice (original + retry)");
@@ -1619,7 +1620,7 @@ describe("dispatch: rewind salvage path", () => {
 });
 
 // =============================================================================
-// rewind error branches (COV2-2)
+// rewind error branches
 // =============================================================================
 
 describe("dispatch: rewind error branches", () => {
@@ -1741,7 +1742,7 @@ describe("dispatch: rewind error branches", () => {
     );
   });
 
-  it("chained-rewind no-turns: synthetic-only intervening trips the boundary guard (CORR2-6)", async () => {
+  it("chained-rewind no-turns: synthetic-only intervening trips the boundary guard", async () => {
     const { sm, pi, tool, ctx } = setup();
     const tA = appendTurn(sm, "u1", "a1", 100);
     pi.pi.setLabel(tA.assistantId, "anchor:a");
@@ -1790,7 +1791,7 @@ describe("dispatch: rewind error branches", () => {
 });
 
 // =============================================================================
-// installPrepareNextTurn cross-extension preservation (COV2-5)
+// installPrepareNextTurn cross-extension preservation
 // =============================================================================
 
 describe("installPrepareNextTurn cross-extension preservation", () => {
@@ -1824,7 +1825,7 @@ describe("installPrepareNextTurn cross-extension preservation", () => {
     assert.equal(r.thinkingLevel, "high");
   });
 
-  it("prior wrapper's context.systemPrompt + tools propagate through the chain (CORR2-4)", async () => {
+  it("prior wrapper's context.systemPrompt + tools propagate through the chain", async () => {
     // A foreign prepareNextTurn that returns a context with a custom
     // systemPrompt and tools. Our wrapper should preserve those fields and
     // override only `messages`.
@@ -1860,7 +1861,7 @@ describe("installPrepareNextTurn cross-extension preservation", () => {
 });
 
 // =============================================================================
-// non-assistant oldLeafEntry fallback (COV2-6)
+// non-assistant oldLeafEntry fallback
 // =============================================================================
 
 describe("dispatch: rewind beforeTokens fallback", () => {

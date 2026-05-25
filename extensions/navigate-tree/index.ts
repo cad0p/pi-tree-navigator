@@ -179,9 +179,9 @@ type PntResult = {
   model?: unknown;
   thinkingLevel?: unknown;
 };
-// pi 0.75.5 invokes `agent.prepareNextTurn(signal)` from `Agent.createLoopConfig`
-// (agent.js:292) — a single AbortSignal argument. This differs from the
-// documented `AgentLoopConfig.prepareNextTurn(context: PrepareNextTurnContext)`
+// pi 0.75.5 invokes `agent.prepareNextTurn(signal)` from
+// `Agent.createLoopConfig` — a single AbortSignal argument. This differs
+// from the documented `AgentLoopConfig.prepareNextTurn(context: PrepareNextTurnContext)`
 // shape, which `Agent` is bridging. We accept whatever pi passes and forward
 // it verbatim to the prior wrapper so we don't fight a future signature
 // alignment. Verified against pi-coding-agent 0.75.5; revisit if the call
