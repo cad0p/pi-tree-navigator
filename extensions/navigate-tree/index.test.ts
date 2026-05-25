@@ -534,9 +534,9 @@ describe("dispatch: list action", () => {
       "list and rewind warnings must use site-specific phrasing",
     );
     // Both share the recovery hint with `/reload` mentioned
-    // (`/reload` is the lighter-weight recovery; `Restart pi` is the
-    // heavier alternative). A regression that drops `/reload` from
-    // either constant surfaces here.
+    // (`/reload` is the lighter-weight recovery and is named first;
+    // restarting pi is the heavier alternative). A regression that
+    // drops `/reload` from either constant surfaces here.
     assert.match(
       listSentinel,
       /\/reload/,

@@ -102,6 +102,8 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 - **`anchor:` is a reserved label prefix.** Any label written via pi's `/label` command or by another extension that begins with `anchor:` will be picked up by `list` and addressable by `rewind`'s `labelStart` / `labelEnd`. Avoid the prefix in manually-set labels.
 
+- **Disk-fault during `rewind` (rare).** Pi's `branchWithSummary` advances the in-memory leaf before persisting the new entry to disk. If pi's session-write fails mid-call (full disk, FS error on a persisted session), the in-memory leaf has already moved past the original assistant turn but the synthetic-assistant injection in this extension never runs — pi's tool-result then lands without a matching tool_use, surfacing as the same `context_length_exceeded` 400 the synthetic exists to prevent. Production risk: low (in-memory tests don't reach this case; pi's session-write is robust on POSIX disk). Tracked for an additional salvage layer wrapping `branchWithSummary` itself in v0.2.0.
+
 ## Development
 
 ```bash

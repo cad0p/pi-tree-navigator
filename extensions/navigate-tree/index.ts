@@ -174,13 +174,15 @@ const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 // `list` is read-only — nothing landed on disk — so its phrasing only warns
 // about the next assistant turn's context view. `rewind` did write to disk,
 // so its phrasing leads with that fact. Both end with the recovery hint
-// "Restart pi or run `/reload` to recover." — `/reload` re-runs
-// `patchAgentSessionPrototype` and is sufficient on its own; `Restart pi`
-// is the heavier-handed alternative for cases where /reload itself failed.
+// "Run `/reload` (or restart pi) to recover." — `/reload` re-runs
+// `patchAgentSessionPrototype` and is the lighter-weight recovery (sufficient
+// on its own); restarting pi is the heavier-handed alternative for cases
+// where /reload itself failed. The CHANGELOG narrates the same lighter-first
+// ordering, so this constant prose and the release-note prose stay aligned.
 const REFLECTION_BOOTSTRAP_WARNING_LIST =
-  "⚠ reflection bootstrap missing — anchors and rewinds still work, but the next assistant turn may snapshot pre-bootstrap context. Restart pi or run `/reload` to recover.";
+  "⚠ reflection bootstrap missing — anchors and rewinds still work, but the next assistant turn may snapshot pre-bootstrap context. Run `/reload` (or restart pi) to recover.";
 const REFLECTION_BOOTSTRAP_WARNING_REWIND =
-  "⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Restart pi or run `/reload` to recover.";
+  "⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run `/reload` (or restart pi) to recover.";
 
 // ---------------------------------------------------------------------------
 // Typed views over pi internals.
@@ -580,7 +582,7 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       ),
       labelEnd: Type.Optional(
         Type.String({
-          description: `Required when action='rewind'. Kebab-case name (max ${MAX_NAME_LENGTH} chars) for the resulting branch_summary entry. Becomes addressable as a future labelStart.`,
+          description: `Required when action='rewind'. Kebab-case name (max ${MAX_NAME_LENGTH} chars) for the resulting branch_summary entry. If a label with this name already exists on the active branch, it is moved to the new entry (mirrors anchor's move-on-collision). Becomes addressable as a future labelStart.`,
         }),
       ),
       summaryFocus: Type.Optional(
