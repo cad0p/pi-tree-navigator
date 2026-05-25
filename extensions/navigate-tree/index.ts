@@ -124,24 +124,9 @@ const LIST_LABEL_COL_WIDTH = 28;
 const PNT_MARKER = Symbol.for("navigate-tree.pnt-installed");
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
-// Single source of truth for the reflection-bootstrap-missing warning,
-// split per emission site so the prose matches what each call actually did.
-// Used by `list` (header suffix, read-only) and `rewind` (response footer,
-// write). Both share the "bootstrap missing" framing — more accurate than
-// the prior "Reflection failed" phrasing because the rewind/list call
-// itself didn't fail, the AgentSession.prototype patch that those paths
-// depend on for in-loop context refresh wasn't installed (typically
-// because the patch ran in a previous module load and a /reload didn't
-// reinstall it on this session).
-//
-// `list` is read-only — nothing landed on disk — so its phrasing only warns
-// about the next assistant turn's context view. `rewind` did write to disk,
-// so its phrasing leads with that fact. Both end with the recovery hint
-// "Run `/reload` (or restart pi) to recover." — `/reload` re-runs
-// `patchAgentSessionPrototype` and is the lighter-weight recovery (sufficient
-// on its own); restarting pi is the heavier-handed alternative for cases
-// where /reload itself failed. The CHANGELOG narrates the same lighter-first
-// ordering, so this constant prose and the release-note prose stay aligned.
+// Two warnings: list-site (read-only path; warns about the next turn's
+// context view) and rewind-site (wrote to disk; leads with that). Both
+// suggest /reload first, then restart pi, in that order.
 const REFLECTION_BOOTSTRAP_WARNING_LIST =
   "⚠ reflection bootstrap missing — anchors and rewinds still work, but the next assistant turn may snapshot pre-bootstrap context. Run `/reload` (or restart pi) to recover.";
 const REFLECTION_BOOTSTRAP_WARNING_REWIND =
