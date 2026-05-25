@@ -39,6 +39,12 @@ export const MAX_BOILERPLATE_LEAD_IN = 200;
 const BRANCH_SUMMARY_SENTINEL =
   "The user explored a different conversation branch";
 
+// Pi 0.75.5's branch-summary boilerplate places `## Goal` after the prelude
+// (verified against `dist/core/compaction/branch-summarization.js`). Used to
+// anchor the strip cut-point in `stripBranchSummaryBoilerplate` — a single
+// constant so the indexOf probe and the slice-length advance can't drift.
+const GOAL_HEADER = "## Goal";
+
 /** Validate a kebab-case name suitable for use as a navigate-tree label. */
 export function isValidName(s: unknown): s is string {
   return (
@@ -97,9 +103,9 @@ export function formatContextDelta(
  */
 export function stripBranchSummaryBoilerplate(text: string): string {
   if (!text.startsWith(BRANCH_SUMMARY_SENTINEL)) return text;
-  const goalIdx = text.indexOf("## Goal");
+  const goalIdx = text.indexOf(GOAL_HEADER);
   if (goalIdx > 0 && goalIdx < MAX_BOILERPLATE_LEAD_IN) {
-    return text.slice(goalIdx + "## Goal".length);
+    return text.slice(goalIdx + GOAL_HEADER.length);
   }
   return text;
 }

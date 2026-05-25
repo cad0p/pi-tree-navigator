@@ -33,6 +33,7 @@ import navigateTree, {
   __testHooks,
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
+  MAX_SYNTHETIC_FOCUS_LENGTH,
   MIN_SUMMARY_FOCUS_LENGTH,
 } from "./index.ts";
 
@@ -1231,7 +1232,7 @@ describe("dispatch: rewind happy path", () => {
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
 
-    const focus = "x".repeat(1024);
+    const focus = "x".repeat(MAX_SYNTHETIC_FOCUS_LENGTH);
     const result = await tool.execute(
       "tc-rewind",
       {
@@ -1261,7 +1262,7 @@ describe("dispatch: rewind happy path", () => {
       assert.equal(c0.type, "toolCall");
       assert.equal(
         c0.arguments?.summaryFocus?.length,
-        1024,
+        MAX_SYNTHETIC_FOCUS_LENGTH,
         "focus at the cap boundary must be stored at full length",
       );
       assert.equal(
@@ -1288,7 +1289,7 @@ describe("dispatch: rewind happy path", () => {
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
 
-    const focus = "x".repeat(1025);
+    const focus = "x".repeat(MAX_SYNTHETIC_FOCUS_LENGTH + 1);
     const result = await tool.execute(
       "tc-rewind",
       {
@@ -1315,10 +1316,11 @@ describe("dispatch: rewind happy path", () => {
         }>
       )[0];
       const stored = c0.arguments?.summaryFocus ?? "";
-      // Stored = 1024 chars of x + the literal marker suffix.
+      // Stored = MAX_SYNTHETIC_FOCUS_LENGTH chars of x + the literal
+      // marker suffix.
       assert.equal(
         stored,
-        `${"x".repeat(1024)}\u2026 [truncated]`,
+        `${"x".repeat(MAX_SYNTHETIC_FOCUS_LENGTH)}\u2026 [truncated]`,
         "over-cap focus must be sliced at MAX_SYNTHETIC_FOCUS_LENGTH and carry the marker",
       );
       assert.match(
@@ -1404,7 +1406,7 @@ describe("dispatch: rewind happy path", () => {
       const stored = c0.arguments?.summaryFocus ?? "";
       assert.equal(
         stored,
-        `${"y".repeat(1024)}\u2026 [truncated]`,
+        `${"y".repeat(MAX_SYNTHETIC_FOCUS_LENGTH)}\u2026 [truncated]`,
         "synthetic must store the truncated form",
       );
     }

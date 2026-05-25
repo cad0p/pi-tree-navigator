@@ -128,7 +128,7 @@ export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // 2–4× higher under UTF-8) is generous — well above empirically useful
 // focus length, and the agent already saw the full focus string when it
 // issued the rewind.
-const MAX_SYNTHETIC_FOCUS_LENGTH = 1024;
+export const MAX_SYNTHETIC_FOCUS_LENGTH = 1024;
 // Hint length cap for the per-row hint shown in `list` output. 50 chars
 // fits one terminal column without wrapping in typical 80-column TUIs.
 const LIST_HINT_MAX_LENGTH = 50;
@@ -534,7 +534,7 @@ export default function (
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
       "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
       "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it.\n\n" +
-      "`summaryFocus` is required when `action='rewind'` (≥20 chars after trim). Calls without it are rejected. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
+      "`summaryFocus` is required when `action='rewind'` (≥20 chars after trim). Calls without it are rejected. It's passed to pi's `generateBranchSummary` as `customInstructions`, biasing the summarizer LLM toward the agent's specified focus while it rewrites the collapsed work into pi's structured summary format. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
