@@ -114,6 +114,16 @@ const MAX_HINT_WALK_DEPTH = 50;
 // reliably loses continuity — raising it forces more useful focus text
 // without inviting verbosity.
 export const MIN_SUMMARY_FOCUS_LENGTH = 20;
+// Cap on the `summaryFocus` length stored in the synthetic assistant's
+// arguments. The full focus is passed live to `generateBranchSummary`, so
+// the summarizer always sees the original; we only need a trimmed copy in
+// the synthetic's args because pi's `convertToLlm` re-emits the synthetic's
+// toolCall block (including its arguments) on every subsequent turn until
+// another rewind. Without a cap, a 100KB focus inflates every later turn's
+// input by 100KB indefinitely. 1KB is generous — well above empirically
+// useful focus length, and the agent already saw the full focus string when
+// it issued the rewind.
+const MAX_SYNTHETIC_FOCUS_LENGTH = 1024;
 // Hint length cap for the per-row hint shown in `list` output. 50 chars
 // fits one terminal column without wrapping in typical 80-column TUIs.
 const LIST_HINT_MAX_LENGTH = 50;
@@ -276,14 +286,20 @@ function installPrepareNextTurn(session: AgentSession): void {
     // propagated. Without this, a co-installed extension that mutates
     // systemPrompt or tools via prepareNextTurn would be silently
     // overwritten on every turn.
-    const baseContext = priorResult?.context ?? {
-      systemPrompt: agent.state.systemPrompt,
-      messages: [],
-      tools: agent.state.tools,
-    };
+    //
+    // Pi's loop wholesale-replaces context (`currentContext = ctx ??
+    // currentContext`), not field-merges. If a prior wrapper returned a
+    // partial `context` (e.g. only `systemPrompt`, no `tools`), the
+    // returned context here would have `tools: undefined` and the next
+    // API call would lose the agent's tool surface. Defensively fill
+    // any missing fields from `agent.state` so the merged context is
+    // always complete.
+    const priorContext = priorResult?.context;
     return {
       context: {
-        ...baseContext,
+        systemPrompt: priorContext?.systemPrompt ?? agent.state.systemPrompt,
+        tools: priorContext?.tools ?? agent.state.tools,
+        ...priorContext,
         messages: sm.buildSessionContext().messages,
       },
       model: priorResult?.model,
@@ -520,7 +536,7 @@ export default function (
       labelStart: Type.Optional(
         Type.String({
           description:
-            "Required when action='rewind'. Existing anchor name to start the collapse from — work between this anchor and the current leaf is summarized.",
+            "Required when action='rewind'. Kebab-case name (max 40 chars) of an existing anchor on the active branch — work between this anchor and the current leaf is summarized.",
         }),
       ),
       labelEnd: Type.Optional(
@@ -725,17 +741,33 @@ export default function (
       // `entries` may also contain label-type entries inserted by the
       // setLabel call that wrote the prior labelEnd — those don't carry
       // semantic content, so they're filtered out for this check.
+      //
+      // The guard discriminates against THIS extension's synthetic
+      // (not arbitrary navigate_tree calls) by additionally requiring
+      // synthetic-shape: stopReason === "toolUse" and zero input/output
+      // usage. `buildSyntheticAssistant` pins these fields; a real
+      // navigate_tree assistant turn has nonzero usage from the model
+      // call. This avoids false-positives if a real navigate_tree call
+      // ever lands as the lone intervening message.
       const messageEntries = entries.filter((e) => e.type === "message");
       if (messageEntries.length === 1) {
         const lone = messageEntries[0];
         if (lone.type === "message" && lone.message.role === "assistant") {
-          const block = (
-            lone.message.content as Array<{ type?: string; name?: string }>
-          )[0];
+          const msg = lone.message as {
+            content: Array<{ type?: string; name?: string }>;
+            stopReason?: string;
+            usage?: { input?: number; output?: number };
+          };
+          const block = msg.content[0];
+          const isSyntheticShape =
+            msg.stopReason === "toolUse" &&
+            (msg.usage?.input ?? 0) === 0 &&
+            (msg.usage?.output ?? 0) === 0;
           if (
             block &&
             block.type === "toolCall" &&
-            block.name === "navigate_tree"
+            block.name === "navigate_tree" &&
+            isSyntheticShape
           ) {
             return toolError(
               `Already at synthetic boundary — no work to summarize. Append at least one turn between rewinds.`,
@@ -798,25 +830,36 @@ export default function (
       let tokensAtNewLeaf = 0;
       let originalErr: unknown;
       let salvageDetail = "";
+      let failedStep: "setLabel" | "estimate" | null = null;
       try {
+        failedStep = "setLabel";
         pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
 
         // Compute afterTokens NOW — before we append the synthetic. This
         // captures the chain size at the new leaf (branch_summary) using
         // the prior real assistant's usage as the baseline.
+        failedStep = "estimate";
         tokensAtNewLeaf = estimateActiveBranchTokens(sm);
+        failedStep = null;
       } catch (err) {
         originalErr = err;
         // Best-effort labelEnd retry. setLabel is idempotent under
         // re-application; if the first call was the failure point and
         // some transient was the cause, this may succeed. Wrap in its
-        // own try so a second failure can't recurse.
-        try {
-          pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
-        } catch (retryErr) {
-          salvageDetail = `labelEnd retry failed: ${
-            retryErr instanceof Error ? retryErr.message : String(retryErr)
-          }`;
+        // own try so a second failure can't recurse. Only retry when
+        // setLabel was the failing step — if estimate threw, the label
+        // already wrote successfully and a redundant retry would either
+        // succeed silently (wasted work) or, if the second call hits a
+        // new transient, fabricate a misleading "labelEnd retry failed"
+        // diagnostic that hides the real (estimate) failure cause.
+        if (failedStep === "setLabel") {
+          try {
+            pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
+          } catch (retryErr) {
+            salvageDetail = `labelEnd retry failed: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`;
+          }
         }
       }
 
@@ -826,10 +869,25 @@ export default function (
       // The synthetic's matching toolCallId is the only structural
       // requirement for chain validity — pi's appended tool_result pairs
       // with this synthetic regardless of which earlier step threw.
+      //
+      // The full `summaryFocus` is already live in the LLM call to
+      // `generateBranchSummary`; we only need a trimmed copy in the
+      // synthetic's args (which pi will re-emit on every subsequent turn).
+      // Truncate to MAX_SYNTHETIC_FOCUS_LENGTH so a long focus string
+      // doesn't inflate every later turn indefinitely.
+      const syntheticArgs: Record<string, unknown> = {
+        ...(p as unknown as Record<string, unknown>),
+      };
+      if (
+        typeof p.summaryFocus === "string" &&
+        p.summaryFocus.length > MAX_SYNTHETIC_FOCUS_LENGTH
+      ) {
+        syntheticArgs.summaryFocus = `${p.summaryFocus.slice(0, MAX_SYNTHETIC_FOCUS_LENGTH)}… [truncated]`;
+      }
       const syntheticMsg = buildSyntheticAssistant(
         toolCallId,
         "navigate_tree",
-        p as unknown as Record<string, unknown>,
+        syntheticArgs,
         ctx.model as
           | { api?: string; provider?: string; id?: string }
           | undefined,
@@ -847,12 +905,18 @@ export default function (
         // and refresh were best-effort. Re-throw the original error with
         // any salvage detail attached so the failure surfaces to the
         // agent and post-mortem reviewers can tell what was recovered.
+        // Preserve the original via `Error.cause` (ES2022) so callers
+        // doing `instanceof` checks against typed subclasses, or
+        // post-mortem readers walking the cause chain, can recover the
+        // original throw. Older runtimes silently ignore the options
+        // bag, so this is forward-compatible without a feature gate.
         const baseMsg =
           originalErr instanceof Error
             ? originalErr.message
             : String(originalErr);
         throw new Error(
           salvageDetail ? `${baseMsg} (salvage: ${salvageDetail})` : baseMsg,
+          { cause: originalErr },
         );
       }
 
@@ -864,7 +928,7 @@ export default function (
             type: "text",
             text:
               `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
-              `A branch_summary recording the work just collapsed has been appended to your context. Items under '## Done' are complete. Items under '## Next Steps' are still pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
+              `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '## Next Steps' are still pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
               (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING}`),
           },
         ],

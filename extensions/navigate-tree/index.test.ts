@@ -182,7 +182,7 @@ function appendTurn(
 async function fakeSummarize() {
   return {
     summary:
-      "## Goal\nTest the rewind happy path.\n## Done\nAppended turns.\n## Next Steps\nVerify the synthetic.",
+      "## Goal\nTest the rewind happy path.\n## Progress\n### Done\nAppended turns.\n## Next Steps\nVerify the synthetic.",
     readFiles: [] as string[],
     modifiedFiles: [] as string[],
     aborted: false,
@@ -565,42 +565,87 @@ describe("dispatch: anchor action", () => {
   });
 
   it("re-anchor on the same leaf with the same name is idempotent: no spurious clear", async () => {
-    // When `prior === leafId` (re-anchor at the same leaf, same name, no
-    // intervening turns), the dispatch skips the prior-clear and just
-    // re-sets the same label. Pin: zero `setLabel(<current leaf>,
-    // undefined)` calls. A regression that drops the `prior !== leafId`
-    // guard would issue a spurious clear of the very leaf we just labeled.
-    const { sm, pi, tool, ctx } = setup();
-    appendTurn(sm, "u", "a");
-    await tool.execute(
+    // Defensive `prior !== leafId` guard: if we capture `prior` for the
+    // requested label and find it points at the very leaf we're about
+    // to label, skip the prior-clear (otherwise we'd issue setLabel(leaf,
+    // undefined) immediately after setLabel(leaf, fullLabel), wiping the
+    // label we just wrote).
+    //
+    // Production pi's `setLabel` always advances the leaf (it appends
+    // a label-change entry via `appendLabelChange`), so `prior === leafId`
+    // doesn't normally arise. The default `makeFakePi` mirrors that
+    // behavior. To exercise the guard directly, swap in an in-place
+    // setLabel that mutates `labelsById` WITHOUT advancing the leaf —
+    // this models a hypothetical future pi (or extension-runner) where
+    // setLabel is leaf-stable. The guard's correctness should not depend
+    // on which behavior pi exposes.
+    const { sm, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u", "a");
+
+    // In-place pi: setLabel mutates labelsById directly, no leaf advance.
+    const setLabelCalls: Array<[string, string | undefined]> = [];
+    const inPlacePi = {
+      registerTool() {},
+      setLabel(entryId: string, label: string | undefined) {
+        setLabelCalls.push([entryId, label]);
+        // Reach into the SM's internal map to set the label without
+        // appending a new entry. The map is exposed for tests via the
+        // SessionManager surface.
+        const labelsMap = (sm as unknown as { labelsById: Map<string, string> })
+          .labelsById;
+        if (label === undefined) labelsMap.delete(entryId);
+        else labelsMap.set(entryId, label);
+      },
+    } as unknown as ExtensionAPI;
+    // Re-register the tool with the in-place pi.
+    const inPlaceRegistered: CapturedTool[] = [];
+    (
+      inPlacePi as unknown as {
+        registerTool: (t: CapturedTool) => void;
+      }
+    ).registerTool = (t: CapturedTool) => {
+      inPlaceRegistered.push(t);
+    };
+    navigateTree(inPlacePi, { summarize: fakeSummarize as never });
+    const inPlaceTool = inPlaceRegistered[0];
+
+    // First anchor: leaf is the assistant entry t1.assistantId.
+    await inPlaceTool.execute(
       "tc-1",
       { action: "anchor", name: "foo" },
       undefined,
       undefined,
       ctx,
     );
-    await tool.execute(
+    // Verify the label landed on t1.assistantId and the leaf did NOT
+    // advance (the precondition for the guard branch).
+    assert.equal(sm.getLabel(t1.assistantId), "anchor:foo");
+    assert.equal(sm.getLeafId(), t1.assistantId);
+
+    // Second anchor: leaf is STILL t1.assistantId, prior also points
+    // at t1.assistantId — prior === leafId, the guard branch fires.
+    setLabelCalls.length = 0;
+    await inPlaceTool.execute(
       "tc-2",
       { action: "anchor", name: "foo" },
       undefined,
       undefined,
       ctx,
     );
-    // Snapshot the post-call leaf and assert no clear targeted IT
-    // (the idempotence-on-same-leaf contract). The legitimate clear
-    // that moves the label off the original message entry is allowed;
-    // what's banned is a clear of the entry we just wrote the new
-    // label onto.
-    const finalLeafId = sm.getLeafId();
-    assert.ok(finalLeafId);
-    const spuriousClears = pi.setLabelCalls.filter(
-      ([id, lbl]) => id === finalLeafId && lbl === undefined,
-    );
+    // Pin: exactly one setLabel call (the re-set of the same label),
+    // and zero clears. A regression that drops the `prior !== leafId`
+    // guard would issue a setLabel(t1.assistantId, undefined) clearing
+    // the label we just (re-)wrote.
+    assert.equal(setLabelCalls.length, 1, "expected exactly one setLabel");
+    assert.deepEqual(setLabelCalls[0], [t1.assistantId, "anchor:foo"]);
+    const clears = setLabelCalls.filter(([, lbl]) => lbl === undefined);
     assert.equal(
-      spuriousClears.length,
+      clears.length,
       0,
-      "no setLabel(currentLeaf, undefined) should have been issued",
+      "no clear should fire when prior === leafId",
     );
+    // Label still present.
+    assert.equal(sm.getLabel(t1.assistantId), "anchor:foo");
   });
 
   it("falls through with a misleading rewind error on unknown `action`", async () => {
@@ -784,7 +829,7 @@ describe("dispatch: rewind happy path", () => {
     const { result } = await rewindFixture();
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /\[rewind 'start' \u2192 'end'\]/);
-    assert.match(result.content[0].text, /## Done/);
+    assert.match(result.content[0].text, /### Done/);
     assert.match(result.content[0].text, /## Next Steps/);
   });
 
