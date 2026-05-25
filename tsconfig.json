@@ -14,8 +14,5 @@
     "resolveJsonModule": true,
     "types": ["bun"]
   },
-  "include": ["extensions/**/*.ts"],
-  "exclude": [
-    "extensions/**/*.test.ts"
-  ]
+  "include": ["extensions/**/*.ts"]
 }

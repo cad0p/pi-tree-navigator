@@ -1142,7 +1142,7 @@ describe("dispatch: rewind happy path", () => {
     assert.ok(leafId, "expected a leaf after second rewind");
     assert.notEqual(leafId, sumC);
     const leaf = sm.getEntry(leafId);
-    if (leaf && leaf.type === "message") {
+    if (leaf?.type === "message" && leaf.message.role === "assistant") {
       const c0 = (
         leaf.message.content as Array<{ type: string; id?: string }>
       )[0];
@@ -1258,7 +1258,7 @@ describe("dispatch: rewind happy path", () => {
     assert.ok(leafId);
     const leaf = sm.getEntry(leafId as string);
     assert.ok(leaf && leaf.type === "message");
-    if (leaf && leaf.type === "message") {
+    if (leaf?.type === "message" && leaf.message.role === "assistant") {
       const c0 = (
         leaf.message.content as Array<{
           type: string;
@@ -1314,7 +1314,7 @@ describe("dispatch: rewind happy path", () => {
     assert.ok(leafId);
     const leaf = sm.getEntry(leafId as string);
     assert.ok(leaf && leaf.type === "message");
-    if (leaf && leaf.type === "message") {
+    if (leaf?.type === "message" && leaf.message.role === "assistant") {
       const c0 = (
         leaf.message.content as Array<{
           type: string;
@@ -1402,7 +1402,7 @@ describe("dispatch: rewind happy path", () => {
     const leafId = sm.getLeafId();
     assert.ok(leafId);
     const leaf = sm.getEntry(leafId as string);
-    if (leaf && leaf.type === "message") {
+    if (leaf?.type === "message" && leaf.message.role === "assistant") {
       const c0 = (
         leaf.message.content as Array<{
           type: string;
@@ -2147,7 +2147,7 @@ describe("dispatch: rewind salvage path", () => {
     assert.ok(leafId);
     const leaf = sm.getEntry(leafId as string);
     assert.ok(leaf && leaf.type === "message");
-    if (leaf && leaf.type === "message") {
+    if (leaf?.type === "message" && leaf.message.role === "assistant") {
       const c0 = (
         leaf.message.content as Array<{ type: string; id?: string }>
       )[0];

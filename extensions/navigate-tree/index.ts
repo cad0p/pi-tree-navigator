@@ -541,14 +541,16 @@ export default function (
     // Stateful: every action mutates SessionManager; concurrent calls would
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
-    description:
-      "Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.\n\n" +
-      "Operations (set the `action` parameter):\n" +
-      "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).\n" +
-      "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
-      "  • action='list': show all named anchors on the active branch in chronological order, with cumulative context % at each anchor.\n\n" +
-      "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it. Pi labels written via `/label anchor:foo` (manually or by other extensions) are also addressable here. Avoid the `anchor:` prefix in manually-set labels.\n\n" +
-      "`summaryFocus` is required when `action='rewind'` (≥20 chars after trim). Calls without it are rejected. It's passed to pi's `generateBranchSummary` as `customInstructions`, biasing the summarizer LLM toward the agent's specified focus while it rewrites the collapsed work into pi's structured summary format. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
+    description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, \`rewind\` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.
+
+Operations (set the \`action\` parameter):
+  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).
+  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.
+  • action='list': show all named anchors on the active branch in chronological order, with cumulative context % at each anchor.
+
+Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor namespace — either becomes addressable as a future \`labelStart\`. \`list\` shows every anchor under the \`anchor:\` prefix, regardless of which action wrote it. Pi labels written via \`/label anchor:foo\` (manually or by other extensions) are also addressable here. Avoid the \`anchor:\` prefix in manually-set labels.
+
+\`summaryFocus\` is required when \`action='rewind'\` (≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim). Calls without it are rejected. It's passed to pi's \`generateBranchSummary\` as \`customInstructions\`, biasing the summarizer LLM toward the agent's specified focus while it rewrites the collapsed work into pi's structured summary format. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.`,
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
@@ -578,7 +580,7 @@ export default function (
       ),
       labelEnd: Type.Optional(
         Type.String({
-          description: `Required when action='rewind'. Kebab-case name for the resulting branch_summary entry. Becomes addressable as a future labelStart.`,
+          description: `Required when action='rewind'. Kebab-case name (max ${MAX_NAME_LENGTH} chars) for the resulting branch_summary entry. Becomes addressable as a future labelStart.`,
         }),
       ),
       summaryFocus: Type.Optional(
