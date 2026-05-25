@@ -441,6 +441,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "navigate_tree",
     label: "Navigate Tree",
+    // Stateful: every action mutates SessionManager; concurrent calls would
+    // race on `leafId` / `labelsById` and produce an undefined tree.
+    executionMode: "sequential",
     description:
       "Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.\n\n" +
       "Operations (set the `action` parameter):\n" +
@@ -652,33 +655,83 @@ export default function (pi: ExtensionAPI) {
         readFiles: result.readFiles ?? [],
         modifiedFiles: result.modifiedFiles ?? [],
       });
-      pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
 
-      // Compute afterTokens NOW — before we append the synthetic. This
-      // captures the chain size at the new leaf (branch_summary) using the
-      // prior real assistant's usage as the baseline.
-      const tokensAtNewLeaf = estimateActiveBranchTokens(sm);
+      // Once `branchWithSummary` succeeds, the active leaf has moved to the
+      // new branch_summary. Pi will append the real tool_result after this
+      // execute returns; that tool_result needs a matching tool_use on the
+      // kept chain. Three load-bearing facts converge here — trim any of
+      // them and the chain breaks:
+      //   1. the synthetic's tool_call id MUST equal this in-flight
+      //      `toolCallId`, so pi's appended tool_result pairs with it;
+      //   2. the synthetic's `stopReason: "toolUse"` survives Kiro's
+      //      `normalizeMessages` filter (which strips only `error` /
+      //      `aborted`) — see `buildSyntheticAssistant` JSDoc;
+      //   3. our `prepareNextTurn` rebuilds context from
+      //      `sm.buildSessionContext()`, whose result includes the synthetic
+      //      and the tool_result in the correct positions for the next turn.
+      //
+      // Atomicity: every code path where `branchWithSummary` succeeded MUST
+      // append a synthetic with the matching `toolCallId`. If labelling,
+      // token-math, or refresh throws after the move, salvage by appending a
+      // minimal synthetic before the throw escapes — otherwise pi writes its
+      // own tool_result whose tool_use_id has no match on the new branch and
+      // Anthropic 400s the next API call.
+      let syntheticId: string;
+      let tokensAtNewLeaf: number;
+      let refreshed: boolean;
+      try {
+        pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
 
-      // Inject a synthetic assistant whose tool_call id matches this in-flight
-      // call. When pi appends our tool_result after this returns, it pairs
-      // cleanly with this synthetic tool_use rather than the abandoned one.
-      // Set the synthetic's `usage.totalTokens` to `tokensAtNewLeaf` so that
-      // future `estimateContextTokens` calls (which will pick up the synthetic
-      // as the last assistant) report the correct context size.
-      const syntheticMsg = buildSyntheticAssistant(
-        toolCallId,
-        "navigate_tree",
-        p as unknown as Record<string, unknown>,
-        ctx.model as
-          | { api?: string; provider?: string; id?: string }
-          | undefined,
-        tokensAtNewLeaf,
-      );
-      const syntheticId = sm.appendMessage(syntheticMsg);
+        // Compute afterTokens NOW — before we append the synthetic. This
+        // captures the chain size at the new leaf (branch_summary) using
+        // the prior real assistant's usage as the baseline.
+        tokensAtNewLeaf = estimateActiveBranchTokens(sm);
 
-      // Refresh agent.state.messages so the next prompt() snapshot reflects
-      // the rewound chain.
-      const refreshed = refreshAgentMessages(sm);
+        // Inject a synthetic assistant whose tool_call id matches this
+        // in-flight call. When pi appends our tool_result after this
+        // returns, it pairs cleanly with this synthetic tool_use rather
+        // than the abandoned one. Set the synthetic's `usage.totalTokens`
+        // to `tokensAtNewLeaf` so that future `estimateContextTokens`
+        // calls (which will pick up the synthetic as the last assistant)
+        // report the correct context size.
+        const syntheticMsg = buildSyntheticAssistant(
+          toolCallId,
+          "navigate_tree",
+          p as unknown as Record<string, unknown>,
+          ctx.model as
+            | { api?: string; provider?: string; id?: string }
+            | undefined,
+          tokensAtNewLeaf,
+        );
+        syntheticId = sm.appendMessage(syntheticMsg);
+
+        // Refresh agent.state.messages so the next prompt() snapshot
+        // reflects the rewound chain.
+        refreshed = refreshAgentMessages(sm);
+      } catch (err) {
+        // Salvage path: branchWithSummary already moved the leaf, but the
+        // happy-path injection failed before the synthetic landed. Append
+        // a degenerate synthetic (matching toolCallId is the only
+        // structural requirement) so the appended tool_result still pairs
+        // with a tool_use on the kept chain, then re-throw so the failure
+        // surfaces to the agent.
+        try {
+          const fallback = buildSyntheticAssistant(
+            toolCallId,
+            "navigate_tree",
+            p as unknown as Record<string, unknown>,
+            ctx.model as
+              | { api?: string; provider?: string; id?: string }
+              | undefined,
+            0,
+          );
+          sm.appendMessage(fallback);
+        } catch {
+          // If even the fallback append fails, fall through and re-throw
+          // the original error — there's nothing more we can do here.
+        }
+        throw err;
+      }
 
       const afterTokens = tokensAtNewLeaf;
 
