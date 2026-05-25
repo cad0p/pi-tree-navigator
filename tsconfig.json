@@ -16,7 +16,6 @@
   },
   "include": ["extensions/**/*.ts"],
   "exclude": [
-    "extensions/**/*.test.ts",
-    "extensions/**/_test-helpers.ts"
+    "extensions/**/*.test.ts"
   ]
 }

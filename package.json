@@ -26,8 +26,8 @@
   "files": [
     "extensions/**/*.ts",
     "!extensions/**/*.test.ts",
-    "!extensions/**/_test-helpers.ts",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "pi": {

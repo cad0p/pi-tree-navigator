@@ -254,7 +254,7 @@ function refreshAgentMessages(sm: SessionManager): boolean {
 }
 
 // =============================================================================
-// Helpers (extension-internal; pure helpers live in _lib/)
+// Helpers (extension-internal; pure helpers in ./helpers.ts)
 // =============================================================================
 
 function findLabeledEntry(
@@ -405,12 +405,12 @@ export default function (pi: ExtensionAPI) {
     name: "navigate_tree",
     label: "Navigate Tree",
     description:
-      "Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch.\n\n" +
+      "Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.\n\n" +
       "Operations (set the `action` parameter):\n" +
-      "  • action='anchor', name='<kebab-name>': label the current point so you can rewind back to here later. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start').\n" +
+      "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start').\n" +
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
-      "  • action='list': show all named labels on the active branch in chronological order.\n\n" +
-      "`summaryFocus` is REQUIRED on rewind. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
+      "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
+      "`summaryFocus` is REQUIRED on rewind. The schema marks it optional because the dispatched action determines which fields are required — the runtime guard rejects rewinds without a `summaryFocus` of ≥20 chars after trim. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     parameters: Type.Object({

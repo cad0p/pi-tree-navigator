@@ -7,22 +7,24 @@ Lets a pi agent anchor named milestones in its own conversation, then collapse w
 ## Install
 
 ```bash
-pi install npm:@cad0p/pi-tree-navigator
+pi install git:github.com/cad0p/pi-tree-navigator
 ```
 
+> **Status:** v0.1.0 is not yet on the npm registry (pending OIDC trusted-publisher setup). Install from the git source for now.
+
 <details>
-<summary>Pre-release / dev installs</summary>
+<summary>Once published / pre-release installs</summary>
+
+- Stable (once published to npm):
+
+  ```bash
+  pi install npm:@cad0p/pi-tree-navigator
+  ```
 
 - Pre-release (calver snapshots from `main`, published to npm `@next` on every push):
 
   ```bash
   pi install npm:@cad0p/pi-tree-navigator@next
-  ```
-
-- Install from source for local development:
-
-  ```bash
-  pi install git:github.com/cad0p/pi-tree-navigator
   ```
 
 </details>
@@ -39,8 +41,10 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 | action | params | effect |
 |---|---|---|
 | `anchor` | `name` | Label the current point in the conversation as a milestone. |
-| `rewind` | `labelStart`, `labelEnd`, `summaryFocus?` | Collapse work between `labelStart` and the current leaf into a `branch_summary` entry. The summary is itself labeled with `labelEnd`, so you can chain rewinds. |
+| `rewind` | `labelStart`, `labelEnd`, `summaryFocus` | Collapse work between `labelStart` and the current leaf into a `branch_summary` entry. The summary is itself labeled with `labelEnd`, so you can chain rewinds. `summaryFocus` is required (≥20 chars after trim). Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from `labelStart` and continues forward from a model-generated summary; the original subtree is preserved on disk but no longer on the active path. |
 | `list` | — | Show all anchors on the active branch with cumulative context %. |
+
+`name`, `labelStart`, and `labelEnd` all live in a single namespace under the reserved `anchor:` label prefix — every label written by `anchor` and every `labelEnd` written by `rewind` is referenceable by any subsequent `rewind`'s `labelStart`, and `list` shows all of them.
 
 ## How it works
 
@@ -90,6 +94,10 @@ The synthetic assistant we inject after each rewind shows up in `usage.totalToke
 
 - **Anthropic only (today).** The synthetic-tool_use trick is specifically for Anthropic's strict tool_use/tool_result pairing. Other providers may have different validation rules — untested.
 
+- **Loading the extension monkey-patches `AgentSession.prototype.prompt` globally.** Every session in the host pi process picks up the patch on import, including sessions that never call `navigate_tree`. The patch is install-on-import and not reversible within a running pi process; restart pi to fully unload it.
+
+- **`anchor:` is a reserved label prefix.** Any label written via pi's `/label` command or by another extension that begins with `anchor:` will be picked up by `list` and addressable by `rewind`'s `labelStart` / `labelEnd`. Avoid the prefix in manually-set labels.
+
 ## Development
 
 ```bash
@@ -99,7 +107,7 @@ bunx biome check extensions/
 bunx tsc --noEmit
 ```
 
-Tests live in `extensions/_tests/` and only cover the pure helpers in `extensions/_lib/`. The reflection-heavy code in `extensions/navigate-tree.ts` is exercised end-to-end via real pi sessions.
+Tests (`extensions/navigate-tree/helpers.test.ts`) cover the pure helpers in `extensions/navigate-tree/helpers.ts`. The reflection-heavy code in `extensions/navigate-tree/index.ts` is exercised end-to-end via real pi sessions.
 
 ## License
 
