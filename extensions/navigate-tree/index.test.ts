@@ -312,6 +312,21 @@ describe("schema shape \u2014 Kiro compatibility", () => {
       props.summaryFocus.description ?? "",
       /Required when action='rewind'/,
     );
+    // Pin schema-description interpolation of the named constants. The
+    // runtime guard error pins MIN_SUMMARY_FOCUS_LENGTH symmetrically
+    // (see the `summaryFocus` validation-guards table below); the
+    // schema-description side is the model-facing surface and deserves
+    // the same anti-drift pin. A regression that hardcodes "max 40" or
+    // "≥20" (instead of interpolating) silently desyncs when the
+    // constants are re-tuned.
+    assert.match(
+      props.name.description ?? "",
+      new RegExp(`max ${MAX_NAME_LENGTH}`),
+    );
+    assert.match(
+      props.summaryFocus.description ?? "",
+      new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`),
+    );
   });
 });
 
@@ -651,6 +666,17 @@ describe("dispatch: anchor action", () => {
     assert.equal(labelCall?.[0], t.assistantId);
     assert.equal(result.details.label, "impl-start");
     assert.equal(result.details.entryId, t.assistantId);
+    // Pin the anchor follow-up hint prose. This is the load-bearing
+    // nudge that gets the agent to chain `anchor → rewind` correctly
+    // with a populated `summaryFocus`. A future copy-edit that drops
+    // the `summaryFocus` mention or the `MIN_SUMMARY_FOCUS_LENGTH`
+    // interpolation would silently degrade the model's tool-use
+    // accuracy on the very first rewind.
+    const text = (result.content[0] as { text: string }).text;
+    assert.match(text, /navigate_tree\(action='rewind'/);
+    assert.match(text, /labelStart='impl-start'/);
+    assert.match(text, /summaryFocus=/);
+    assert.match(text, new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`));
   });
 
   it("move-on-collision: re-anchoring the same name moves the label off the prior entry", async () => {
@@ -805,6 +831,16 @@ describe("dispatch: anchor action", () => {
       ctx,
     );
     assert.equal(result.isError, true);
+    // Pin that the unknown-action falls through to the rewind-validation
+    // site specifically (not just "any error"). The rewind dispatch's
+    // first guard rejects a missing/invalid `labelStart` with a
+    // "kebab-case" message; pinning that text confirms the fall-through
+    // landed at the labelStart guard, not at a future explicit
+    // unknown-action default.
+    assert.match(
+      (result.content[0] as { text: string }).text,
+      /labelStart.*kebab-case/,
+    );
   });
 });
 
@@ -2155,10 +2191,10 @@ describe("dispatch: rewind salvage path", () => {
       // Pin the degenerate token count promised by the test name. When
       // the estimate step throws, the salvage path can't compute
       // `tokensAtNewLeaf`, so the synthetic must be built with
-      // `totalTokens=0` (mirroring the setLabel-throws sibling test at
-      // line ~1981). A regression that re-uses the pre-throw zero-init
-      // value silently (or worse, leaves it `undefined`) would surface
-      // here.
+      // `totalTokens=0` (mirroring the 'setLabel throws then retry
+      // succeeds' sibling test). A regression that re-uses the
+      // pre-throw zero-init value silently (or worse, leaves it
+      // `undefined`) would surface here.
       const usage = (leaf.message as { usage?: { totalTokens?: number } })
         .usage;
       assert.equal(
