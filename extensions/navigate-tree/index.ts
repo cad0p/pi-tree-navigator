@@ -1,63 +1,25 @@
 /**
  * navigate-tree — agent-callable session tree navigation.
  *
- * Lets the agent collapse work between named anchors into a model-generated
- * `branch_summary` without breaking Anthropic's tool_use ↔ tool_result
- * pairing. Without the synthetic-assistant injection described below, every
- * rewind would orphan the rewind tool's `tool_result`: pi appends the
- * assistant's tool_use BEFORE branchWithSummary moves the leaf, so on the
- * new branch the tool_result has no preceding tool_use, and Anthropic 400s
- * the next API call with "Improperly formed request". Kiro forwards that
- * as `context_length_exceeded`, which is misleading.
+ * See README “Implementation notes” for the user-facing narrative
+ * (Anthropic tool_use↔tool_result pairing, same-loop context refresh,
+ * reflection bootstrap). This file-level JSDoc carries only
+ * source-internal facts the README doesn't.
  *
- * Fix: after `sm.branchWithSummary(target)`, append a synthetic assistant
- * message whose single tool_call has the same id as the in-flight tool call
- * (the first arg to `execute`). When pi then writes the real tool_result, it
- * lands as a child of the synthetic assistant, with a matching id. The chain
- * is structurally valid.
+ * `/tree`-visible artifacts (empirical):
+ *   • Synthetic assistant message right after each `branch_summary`,
+ *     with one tool_call sharing the in-flight `toolCallId`.
+ *   • Dangling tool_use on the anchor entry whose original
+ *     tool_results were cut off by the rewind. Anthropic accepts this
+ *     — the dangling tool_use is buffered behind the branch_summary's
+ *     user-text rendering and the API doesn't reject it. No walk-up
+ *     logic at anchor time.
  *
- * The synthetic assistant is visible in /tree as a single-tool_call assistant
- * message right after the branch_summary. It carries no semantic content
- * beyond pairing the tool_result with a tool_use.
- *
- * Note: anchoring at an assistant message that has its own tool_calls (the
- * normal case, since `anchor` itself runs as a tool_call) leaves a dangling
- * tool_use on that anchor entry once the rewind cuts off its original
- * tool_results. Empirically, Anthropic accepts this — the dangling tool_use
- * is buffered behind the branch_summary's user-text rendering and the API
- * doesn't reject it. So no walk-up logic is required at anchor time.
- *
- * Within the same agent loop
- * --------------------------
- * Pi's `Agent` snapshots `state.messages` once at the start of `prompt()`
- * and pushes new messages onto its own in-loop array. A rewind issued from
- * a tool execute therefore doesn't reduce the next API call's size until
- * the user sends a fresh prompt — every assistant turn within the same
- * `prompt()` keeps paying the pre-rewind context cost.
- *
- * To make rewind take effect immediately for subsequent turns within the
- * same prompt, we wire `agent.prepareNextTurn` from the prompt patch. The
- * agent loop calls `prepareNextTurn` between every turn boundary, and we
- * return a fresh context built from `sm.buildSessionContext()`. After a
- * rewind, the next assistant turn in the same loop sees the rewound chain.
- *
- * Reflection bootstrap
- * --------------------
- * Pi exposes `navigateTree` only on `ExtensionCommandContext`, which is only
- * available in slash-command handlers — never in tool execute. We avoid the
- * user-facing arming step by monkey-patching `AgentSession.prototype.prompt`
- * at extension load time to capture every AgentSession instance into a
- * WeakRef array. From the tool's execute, we walk the array to find the
- * AgentSession whose `.sessionManager` matches `ctx.sessionManager`, then
- * mutate `session.agent.state.messages` directly — replicating the line that
- * pi's own `navigateTree` does:
+ * Reflection bootstrap replicates pi's own slash-command line
+ * verbatim (kept symmetric so a pi rename here surfaces as the
+ * runtime warning rather than silently drifting):
  *
  *   this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
- *
- * Without that mutation, `branchWithSummary` updates the session JSONL and
- * the leaf, but `agent.state.messages` (the cached message list pi snapshots
- * for the next prompt) stays stale, so the rewind isn't visible to the next
- * LLM call.
  *
  * Risks of the reflection approach:
  *   • If pi switches any of the five fields this extension reads —
@@ -67,8 +29,9 @@
  *     fundamentally.
  *   • If pi renames or restructures any of these fields, this breaks.
  *   • Patches `AgentSession.prototype.prompt` globally on import; not
- *     reversible without a process restart; affects every session in the
- *     pi process, including sessions that never call `navigate_tree`.
+ *     reversible without a process restart; affects every session in
+ *     the pi process, including sessions that never call
+ *     `navigate_tree`.
  *
  * Verified against pi 0.75.5.
  */
