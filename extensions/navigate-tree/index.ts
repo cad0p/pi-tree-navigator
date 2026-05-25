@@ -413,26 +413,66 @@ export default function (pi: ExtensionAPI) {
       "`summaryFocus` is REQUIRED on rewind. It's appended to pi's branch-summary prompt as `Additional focus: …`; the summarizer LLM then rewrites the collapsed work into pi's structured summary format, biased by this focus. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
-    parameters: Type.Object({
-      action: Type.Union([
-        Type.Literal("anchor"),
-        Type.Literal("rewind"),
-        Type.Literal("list"),
-      ]),
-      name: Type.Optional(Type.String()),
-      labelStart: Type.Optional(Type.String()),
-      labelEnd: Type.Optional(Type.String()),
-      summaryFocus: Type.Optional(Type.String()),
-    }),
+    parameters: Type.Union([
+      Type.Object(
+        {
+          action: Type.Literal("anchor"),
+          name: Type.String({
+            description:
+              "kebab-case name (e.g. 'impl-start'). Lowercase letters, digits, hyphens. 1-40 chars.",
+            minLength: 1,
+            maxLength: MAX_NAME_LENGTH,
+          }),
+        },
+        { description: "Set a named anchor at the current point." },
+      ),
+      Type.Object(
+        {
+          action: Type.Literal("rewind"),
+          labelStart: Type.String({
+            description:
+              "existing anchor name on the active branch to rewind back to.",
+            minLength: 1,
+            maxLength: MAX_NAME_LENGTH,
+          }),
+          labelEnd: Type.String({
+            description:
+              "new anchor name to attach to the resulting branch_summary.",
+            minLength: 1,
+            maxLength: MAX_NAME_LENGTH,
+          }),
+          summaryFocus: Type.String({
+            description:
+              "REQUIRED. Appended to pi's branch-summary prompt as 'Additional focus: ...'. Must keep (1) the user's most recent message verbatim, (2) what was done in the collapsed segment, (3) what's left to do as a next action.",
+            minLength: MIN_SUMMARY_FOCUS_LENGTH,
+          }),
+        },
+        {
+          description:
+            "Collapse work between labelStart and the current leaf into a model-generated branch_summary, freeing context.",
+        },
+      ),
+      Type.Object(
+        {
+          action: Type.Literal("list"),
+        },
+        {
+          description:
+            "Show all named anchors on the active branch with cumulative context %.",
+        },
+      ),
+    ]),
     execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
       const sm = ctx.sessionManager as SessionManager;
-      const p = params as {
-        action: "anchor" | "rewind" | "list";
-        name?: string;
-        labelStart?: string;
-        labelEnd?: string;
-        summaryFocus?: string;
-      };
+      const p = params as
+        | { action: "anchor"; name: string }
+        | {
+            action: "rewind";
+            labelStart: string;
+            labelEnd: string;
+            summaryFocus: string;
+          }
+        | { action: "list" };
 
       // --- list ---
       if (p.action === "list") {
