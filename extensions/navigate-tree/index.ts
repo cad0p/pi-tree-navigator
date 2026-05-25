@@ -159,11 +159,23 @@ function asInternals(session: AgentSession): PiInternals {
 }
 
 type PntResult = {
-  context?: unknown;
+  context?: {
+    systemPrompt?: unknown;
+    messages?: unknown[];
+    tools?: unknown[];
+    [k: string]: unknown;
+  };
   model?: unknown;
   thinkingLevel?: unknown;
 };
-type PntFn = (signal?: AbortSignal) => Promise<PntResult> | PntResult;
+// pi 0.75.5 invokes `agent.prepareNextTurn(signal)` from `Agent.createLoopConfig`
+// (agent.js:292) — a single AbortSignal argument. This differs from the
+// documented `AgentLoopConfig.prepareNextTurn(context: PrepareNextTurnContext)`
+// shape, which `Agent` is bridging. We accept whatever pi passes and forward
+// it verbatim to the prior wrapper so we don't fight a future signature
+// alignment. Verified against pi-coding-agent 0.75.5; revisit if the call
+// site changes.
+type PntFn = (...args: unknown[]) => Promise<PntResult> | PntResult;
 type MarkedPntFn = PntFn & { [PNT_MARKER]?: boolean; __prior?: PntFn };
 
 // =============================================================================
@@ -241,16 +253,27 @@ function installPrepareNextTurn(session: AgentSession): void {
       ? existing.__prior
       : (existing as PntFn | undefined);
 
-  const next: MarkedPntFn = async (signal?: AbortSignal) => {
+  const next: MarkedPntFn = async (...args: unknown[]) => {
     let priorResult: PntResult | undefined;
     if (typeof prior === "function") {
-      priorResult = await prior(signal);
+      priorResult = await prior(...args);
     }
+    // Chain composition: the prior wrapper's `context` (if any) is the
+    // base; this extension owns only `messages`. Other fields the prior
+    // returned in `context` (systemPrompt, tools, or future shape
+    // additions) survive verbatim. `model` and `thinkingLevel` are also
+    // propagated. Without this, a co-installed extension that mutates
+    // systemPrompt or tools via prepareNextTurn would be silently
+    // overwritten on every turn.
+    const baseContext = priorResult?.context ?? {
+      systemPrompt: agent.state.systemPrompt,
+      messages: [],
+      tools: agent.state.tools,
+    };
     return {
       context: {
-        systemPrompt: agent.state.systemPrompt,
+        ...baseContext,
         messages: sm.buildSessionContext().messages,
-        tools: agent.state.tools,
       },
       model: priorResult?.model,
       thinkingLevel: priorResult?.thinkingLevel,
@@ -543,18 +566,20 @@ export default function (
         if (!leafId) {
           return toolError("No session entries yet — nothing to anchor.");
         }
-        // Move-on-collision semantics: if the anchor name already exists on
-        // the active branch (on a different entry), clear the prior label
-        // before writing the new one. This makes the loop pattern "anchor at
-        // the start of every iteration with name='iter-start'" produce a
-        // single live anchor at the most recent leaf, rather than
-        // accumulating dead duplicates that confuse `list` and `rewind`.
+        // Write the new label first, then clear the prior. If the second
+        // setLabel throws, two labels of the same name briefly coexist on
+        // the active branch — `findLabeledEntry` walks leaf→root and
+        // returns the leaf-side match, so navigation behavior is correct
+        // during the overlap. The pre-PR "no enforcement" semantics already
+        // tolerated this. The reverse order (clear-then-set) was move-then-
+        // lose under failure: a partial collapse left the active branch
+        // with no anchor of the requested name at all.
         const fullLabel = LABEL_PREFIX + p.name;
         const prior = findLabeledEntry(sm, fullLabel);
+        pi.setLabel(leafId, fullLabel);
         if (prior && prior !== leafId) {
           pi.setLabel(prior, undefined);
         }
-        pi.setLabel(leafId, fullLabel);
         const cw = ctx.model?.contextWindow ?? 0;
         const tokensHere = estimateActiveBranchTokens(sm);
         const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
@@ -656,6 +681,33 @@ export default function (
         return toolError(
           `No entries between leaf and '${p.labelStart}' — nothing to summarize.`,
         );
+      }
+      // Chained-rewind-no-turns guard: if the only message-type entry
+      // between leaf and target is a synthetic this extension wrote on a
+      // prior rewind (assistant message whose sole content block is a
+      // navigate_tree toolCall), summarizing it produces a degenerate
+      // output. Catch it before we burn an LLM call. The agent should
+      // append at least one real turn between rewinds. Note that
+      // `entries` may also contain label-type entries inserted by the
+      // setLabel call that wrote the prior labelEnd — those don't carry
+      // semantic content, so they're filtered out for this check.
+      const messageEntries = entries.filter((e) => e.type === "message");
+      if (messageEntries.length === 1) {
+        const lone = messageEntries[0];
+        if (lone.type === "message" && lone.message.role === "assistant") {
+          const block = (
+            lone.message.content as Array<{ type?: string; name?: string }>
+          )[0];
+          if (
+            block &&
+            block.type === "toolCall" &&
+            block.name === "navigate_tree"
+          ) {
+            return toolError(
+              `Already at synthetic boundary — no work to summarize. Append at least one turn between rewinds.`,
+            );
+          }
+        }
       }
 
       const result = await summarize(entries, {
