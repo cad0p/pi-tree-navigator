@@ -553,26 +553,22 @@ export default function (
       ),
       name: Type.Optional(
         Type.String({
-          description:
-            "Required when action='anchor'. Kebab-case label (max 40 chars) for the milestone. If a label with this name already exists on the active branch, it is moved to the new leaf.",
+          description: `Required when action='anchor'. Kebab-case label (max ${MAX_NAME_LENGTH} chars) for the milestone. If a label with this name already exists on the active branch, it is moved to the new leaf.`,
         }),
       ),
       labelStart: Type.Optional(
         Type.String({
-          description:
-            "Required when action='rewind'. Kebab-case name (max 40 chars) of an existing anchor on the active branch — work between this anchor and the current leaf is summarized.",
+          description: `Required when action='rewind'. Kebab-case name (max ${MAX_NAME_LENGTH} chars) of an existing anchor on the active branch — work between this anchor and the current leaf is summarized.`,
         }),
       ),
       labelEnd: Type.Optional(
         Type.String({
-          description:
-            "Required when action='rewind'. Kebab-case name for the resulting branch_summary entry. Becomes addressable as a future labelStart.",
+          description: `Required when action='rewind'. Kebab-case name for the resulting branch_summary entry. Becomes addressable as a future labelStart.`,
         }),
       ),
       summaryFocus: Type.Optional(
         Type.String({
-          description:
-            "Required when action='rewind'. ≥20 chars after trim. Should encode (1) the user's most recent instruction verbatim, (2) what was done in the collapsed segment, (3) what's left to do as a next action.",
+          description: `Required when action='rewind'. ≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim. Should encode (1) the user's most recent instruction verbatim, (2) what was done in the collapsed segment, (3) what's left to do as a next action.`,
         }),
       ),
     }),
@@ -665,7 +661,7 @@ export default function (
               type: "text",
               text:
                 `[anchor '${p.name}'] set at ${positionLine}${hintLine}\n\n` +
-                `When you finish this stage, call: navigate_tree(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>').`,
+                `When you finish this stage, call: navigate_tree(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
             },
           ],
           details: {
@@ -859,18 +855,22 @@ export default function (
       // overlap), then clear the prior. Without this move, two anchors
       // with the same name coexist on the active branch — the namespace
       // asymmetry vs `anchor` lets duplicate anchors survive a chained
-      // rewind. The lookup happens BEFORE entering the try (a throw from
-      // findLabeledEntry shouldn't trip the synthetic-injection salvage
-      // path) but inside the salvage scope so that if the second
-      // setLabel (the prior-clear) throws, the existing best-effort
-      // labelEnd retry still fires for the new write.
+      // rewind. The lookup happens INSIDE the salvage try so that if
+      // findLabeledEntry throws (e.g. a malformed branch traversal), the
+      // synthetic still appends and pi's appended tool_result pairs with
+      // it. We don't retry the lookup itself — a lookup-throw means we
+      // don't know whether the prior labelEnd existed, so the safest
+      // recovery is to re-throw with the original error after the
+      // synthetic lands.
       const fullLabelEnd = LABEL_PREFIX + p.labelEnd;
-      const priorLabelEnd = findLabeledEntry(sm, fullLabelEnd);
+      let priorLabelEnd: ReturnType<typeof findLabeledEntry> = null;
       let tokensAtNewLeaf = 0;
       let originalErr: unknown;
       let salvageDetail = "";
-      let failedStep: "setLabel" | "estimate" | null = null;
+      let failedStep: "lookup" | "setLabel" | "estimate" | null = null;
       try {
+        failedStep = "lookup";
+        priorLabelEnd = findLabeledEntry(sm, fullLabelEnd);
         failedStep = "setLabel";
         pi.setLabel(summaryId, fullLabelEnd);
         if (priorLabelEnd && priorLabelEnd !== summaryId) {
@@ -889,10 +889,11 @@ export default function (
         // re-application; if the first call was the failure point and
         // some transient was the cause, this may succeed. Wrap in its
         // own try so a second failure can't recurse. Only retry when
-        // setLabel was the failing step — if estimate threw, the label
-        // already wrote successfully and a redundant retry would either
-        // succeed silently (wasted work) or, if the second call hits a
-        // new transient, fabricate a misleading "labelEnd retry failed"
+        // setLabel was the failing step — if lookup threw we don't know
+        // whether to retry; if estimate threw, the label already wrote
+        // successfully and a redundant retry would either succeed
+        // silently (wasted work) or, if the second call hits a new
+        // transient, fabricate a misleading "labelEnd retry failed"
         // diagnostic that hides the real (estimate) failure cause.
         if (failedStep === "setLabel") {
           try {

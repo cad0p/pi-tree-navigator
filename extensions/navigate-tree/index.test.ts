@@ -966,11 +966,14 @@ describe("dispatch: rewind happy path", () => {
     return { sm, pi, tool, ctx, fake, result };
   }
 
-  it("emits the [rewind] response prose with Done / Next Steps", async () => {
+  it("emits the [rewind] response prose with Done / In Progress / Blocked / Next Steps", async () => {
     const { result } = await rewindFixture();
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /\[rewind 'start' \u2192 'end'\]/);
     assert.match(result.content[0].text, /### Done/);
+    assert.match(result.content[0].text, /### In Progress/);
+    assert.match(result.content[0].text, /### Blocked/);
+    assert.match(result.content[0].text, /are pending/);
     assert.match(result.content[0].text, /## Next Steps/);
   });
 
@@ -2223,6 +2226,87 @@ describe("dispatch: rewind salvage path", () => {
     // "no recovery, no double-handling" claim. Exact equality pins it.
     assert.equal(msg, "appendMessage boom");
   });
+
+  it("findLabeledEntry(labelEnd) throws → synthetic still appended; original error propagates", async () => {
+    // The labelEnd-collision lookup runs inside the salvage try as the
+    // first step. If it throws (e.g. malformed branch traversal),
+    // setLabel cannot run — but the synthetic append still must, so
+    // pi's appended tool_result has a matching tool_use on the new
+    // branch. Without the in-try lookup, an upstream throw from
+    // findLabeledEntry would orphan the tool_result.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    appendTurn(sm, "u3", "a3", 300);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    // Trip `getBranch` ONLY after a `branch_summary` entry exists on
+    // the active branch — i.e. after `sm.branchWithSummary` ran. The
+    // labelEnd-collision lookup (`findLabeledEntry(sm, fullLabelEnd)`)
+    // is the first call past that point in the rewind handler. The
+    // labelStart lookup, beforeTokens, and collectEntriesForBranchSummary
+    // all run BEFORE the move and thus before the trip is armed.
+    const origGetBranch = sm.getBranch.bind(sm);
+    let thrown: unknown;
+    (sm as { getBranch: typeof sm.getBranch }).getBranch = (...args) => {
+      const branch = origGetBranch(...args);
+      if (branch.some((e) => e.type === "branch_summary")) {
+        throw new Error("getBranch boom");
+      }
+      return branch;
+    };
+
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+
+    // Restore for cleanliness.
+    (sm as { getBranch: typeof sm.getBranch }).getBranch = origGetBranch;
+
+    assert.ok(thrown, "rewind should re-throw the original error");
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    // Pin: original error from the lookup throw propagates verbatim,
+    // no salvage-detail wrapping (lookup-throw doesn't trigger the
+    // setLabel-retry path).
+    assert.match(msg, /getBranch boom/);
+    assert.ok(
+      !/salvage:.*labelEnd retry failed/.test(msg),
+      "lookup-throw must not trigger the setLabel-retry diagnostic",
+    );
+
+    // Synthetic still landed. Find the leaf assistant whose toolCall id
+    // matches our in-flight `toolCallId='tc-rewind'`.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId, "expected a leaf after lookup-throw salvage");
+    if (leafId) {
+      const leaf = sm.getEntry(leafId);
+      assert.ok(leaf && leaf.type === "message");
+      if (leaf && leaf.type === "message") {
+        assert.equal(leaf.message.role, "assistant");
+        const c0 = (
+          leaf.message.content as Array<{ type: string; id?: string }>
+        )[0];
+        assert.equal(c0.type, "toolCall");
+        assert.equal(c0.id, "tc-rewind");
+      }
+    }
+  });
 });
 
 // =============================================================================
@@ -2478,6 +2562,162 @@ describe("dispatch: rewind error branches", () => {
       summarizeCalled,
       true,
       "summarize must run when the lone intervening message is a real (nonzero-usage) navigate_tree call",
+    );
+  });
+
+  it("chained-rewind discriminator: lone intervening text-only assistant does NOT trip the guard", async () => {
+    // Synthetic-discriminator fall-through: a text-only assistant message
+    // (no toolCall block) must fall through the guard's first check
+    // (`block.type === 'toolCall'`) so the rewind proceeds normally and
+    // summarize is invoked. A regression that drops the block-shape gate
+    // would mis-classify any assistant turn as 'synthetic' and trip a
+    // spurious 'Already at synthetic boundary' error — catching that here.
+    let summarizeCalled = false;
+    const spySummarize = (async () => {
+      summarizeCalled = true;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:b");
+
+    // Append a single intervening assistant turn whose lone content
+    // block is a `text` block (no toolCall). The guard's `block.type ===
+    // 'toolCall'` predicate must short-circuit before reaching the
+    // synthetic-shape check, so the rewind proceeds.
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "thinking aloud, no tool call" }],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "endTurn",
+      timestamp: Date.now(),
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 150,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const r = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "b",
+        labelEnd: "c",
+        summaryFocus:
+          "Preserve user instructions and continue past the text-only intervening assistant.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      r.isError,
+      undefined,
+      "rewind must NOT trip the synthetic-boundary guard on a text-only assistant",
+    );
+    assert.equal(
+      summarizeCalled,
+      true,
+      "summarize must run when the lone intervening message is a text-only assistant",
+    );
+  });
+
+  it("chained-rewind discriminator: lone intervening non-navigate_tree toolCall does NOT trip the guard", async () => {
+    // Synthetic-discriminator fall-through: a synthetic-shaped
+    // (zero-usage, stopReason 'toolUse') assistant whose toolCall is for
+    // a DIFFERENT tool (e.g. `bash`) must fall through the
+    // `name === 'navigate_tree'` predicate so the rewind proceeds. A
+    // regression that drops the name gate would mis-classify any
+    // zero-usage toolCall as our synthetic and trip a spurious
+    // 'Already at synthetic boundary' error — catching that here.
+    let summarizeCalled = false;
+    const spySummarize = (async () => {
+      summarizeCalled = true;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:b");
+
+    // Append a single intervening assistant turn whose lone content
+    // block is a non-navigate_tree toolCall (`bash`) AND is otherwise
+    // synthetic-shaped (zero usage, stopReason 'toolUse'). The
+    // discriminator's `name === 'navigate_tree'` clause must short-
+    // circuit before the shape check matches, so the rewind proceeds.
+    sm.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "bash-tc",
+          name: "bash",
+          arguments: { command: "ls" },
+        },
+      ],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "toolUse",
+      timestamp: Date.now(),
+      usage: {
+        // Synthetic-shaped (zero input/output) — only the toolCall name
+        // distinguishes this from our synthetic. The name gate is the
+        // load-bearing discriminator here.
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const r = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "b",
+        labelEnd: "c",
+        summaryFocus:
+          "Preserve user instructions and continue past the non-navigate_tree intervening toolCall.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      r.isError,
+      undefined,
+      "rewind must NOT trip the synthetic-boundary guard on a non-navigate_tree toolCall",
+    );
+    assert.equal(
+      summarizeCalled,
+      true,
+      "summarize must run when the lone intervening message is a non-navigate_tree toolCall",
     );
   });
 });
