@@ -911,6 +911,20 @@ describe("dispatch: rewind validation guards", () => {
       want: /summaryFocus/,
     },
     {
+      // Trim-presence pin on the rejection path: raw length is above the
+      // floor (so a regression dropping `.trim()` would accept it), but
+      // trimmed length is below it. The guard with `.trim()` rejects;
+      // without `.trim()` it would slip past this row.
+      name: "summaryFocus shorter than min length after trim",
+      params: {
+        action: "rewind",
+        labelStart: "ok",
+        labelEnd: "ok2",
+        summaryFocus: `  ${"x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1)}  `,
+      },
+      want: /summaryFocus/,
+    },
+    {
       name: "summaryFocus mentions the 20-char threshold in error text",
       params: {
         action: "rewind",
@@ -963,11 +977,11 @@ describe("dispatch: rewind validation guards", () => {
 
   it("summaryFocus exactly 20 chars after trim passes the guard", async () => {
     // Boundary: summaryFocus.trim().length >= MIN_SUMMARY_FOCUS_LENGTH (the
-    // >= boundary). The call still errors at the next guard (no labelStart
-    // on chain), but it moves past the focus-length check. Pad with leading
-    // and trailing whitespace so the trim path is actually exercised at
-    // the boundary — a regression that drops the .trim() call would let
-    // the focus through with whitespace counted, masking the failure.
+    // >= boundary, not strict >). The call still errors at the next guard
+    // (no labelStart on chain), but it moves past the focus-length check —
+    // pinning that the comparison is inclusive at exactly MIN. Trim-
+    // presence on the rejection path is pinned by the
+    // "shorter than min length after trim" row above, not here.
     const { sm, tool, ctx } = setup();
     appendTurn(sm, "u", "a");
     const result = await tool.execute(
