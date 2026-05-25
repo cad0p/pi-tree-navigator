@@ -793,8 +793,9 @@ export default function (
 /**
  * Non-stable testing-only hooks. The `__` prefix marks this as a private
  * surface — not part of the package's public API. Intended for hermetic
- * tests that need to undo the AgentSession.prototype patch and clear the
- * captured-session list between cases.
+ * tests that need to undo the AgentSession.prototype patch, clear the
+ * captured-session list between cases, and reach the module-internal
+ * helpers without re-implementing them.
  */
 export const __testHooks = {
   /**
@@ -814,5 +815,18 @@ export const __testHooks = {
       delete proto[ORIG_PROMPT_KEY];
     }
     sessionInstances.length = 0;
+  },
+  /** Module-internal helpers exposed for hermetic unit tests. */
+  buildSyntheticAssistant,
+  findLabelHint,
+  findLabeledEntry,
+  installPrepareNextTurn,
+  refreshAgentMessages,
+  captureSession,
+  /** Symbol used to mark the wrapper installed by `installPrepareNextTurn`. */
+  PNT_MARKER,
+  /** Read-only view of captured-session ref count for reaping assertions. */
+  sessionRefCount(): number {
+    return sessionInstances.length;
   },
 };
