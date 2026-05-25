@@ -91,9 +91,7 @@ describe("formatPct1", () => {
     assert.equal(formatPct1(560_000, -1), "560.0k");
   });
   it("renders 100.0% when tokens === window exactly", () => {
-    // Boundary: at exactly the context window, the percent column should
-    // read 100.0% — wider than the LIST_PCT_COL_WIDTH=5 padStart, so the
-    // column will widen rather than truncate.
+    // Boundary: at the window, percent is exactly 100.0% (not clamped).
     assert.equal(formatPct1(1_000_000, 1_000_000), "100.0%");
   });
   it("renders > 100.0% when tokens overflow the window", () => {
@@ -153,9 +151,22 @@ describe("stripBranchSummaryBoilerplate", () => {
   it("returns text unchanged when no early ## Goal", () => {
     assert.equal(stripBranchSummaryBoilerplate("just text"), "just text");
   });
-  it("does not strip when ## Goal appears far into the text", () => {
+  it("does not strip without sentinel even with late ## Goal", () => {
+    // Negative pin: missing sentinel short-circuits the strip even when a
+    // "## Goal" appears later in the text. Distinct from the lead-in
+    // boundary check (which is exercised in the 199/200 pair below).
     const long = `${"x".repeat(300)}## Goal\nlate`;
     assert.equal(stripBranchSummaryBoilerplate(long), long);
+  });
+  it("does not strip when ## Goal appears past MAX_BOILERPLATE_LEAD_IN even with sentinel", () => {
+    // Lead-in boundary check WITH the sentinel: prelude prefix matches but
+    // the ## Goal is too late, so the strip is short-circuited by the
+    // distance check, not the sentinel guard. Pairs with the 199/200 tests
+    // below to fully cover the boundary.
+    const sentinel = "The user explored a different conversation branch";
+    const padding = "x".repeat(250);
+    const text = `${sentinel}${padding}## Goal\nlate`;
+    assert.equal(stripBranchSummaryBoilerplate(text), text);
   });
   it("does not strip when ## Goal is at index 0", () => {
     // Boilerplate always has prose before ## Goal, so a leading ## Goal isn't

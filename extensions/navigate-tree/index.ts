@@ -113,7 +113,7 @@ const MAX_HINT_WALK_DEPTH = 50;
 // act on). 20 is the empirical threshold below which the post-rewind turn
 // reliably loses continuity — raising it forces more useful focus text
 // without inviting verbosity.
-const MIN_SUMMARY_FOCUS_LENGTH = 20;
+export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // Hint length cap for the per-row hint shown in `list` output. 50 chars
 // fits one terminal column without wrapping in typical 80-column TUIs.
 const LIST_HINT_MAX_LENGTH = 50;
@@ -194,7 +194,7 @@ type MarkedPntFn = PntFn & { [PNT_MARKER]?: boolean; __prior?: PntFn };
 // =============================================================================
 
 const sessionInstances: WeakRef<AgentSession>[] = [];
-const seenSessions = new WeakSet<AgentSession>();
+let seenSessions = new WeakSet<AgentSession>();
 
 function captureSession(session: AgentSession): void {
   if (seenSessions.has(session)) return;
@@ -889,6 +889,10 @@ export const __testHooks = {
       delete proto[ORIG_PROMPT_KEY];
     }
     sessionInstances.length = 0;
+    // WeakSet has no .clear(); rebind to a fresh instance so a test that
+    // re-captures the SAME session identity post-reset isn't deduped by
+    // stale state from the previous test's capture.
+    seenSessions = new WeakSet();
   },
   /** Module-internal helpers exposed for hermetic unit tests. */
   buildSyntheticAssistant,

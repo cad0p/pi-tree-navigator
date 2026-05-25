@@ -24,10 +24,15 @@ import * as assert from "node:assert/strict";
 import {
   type AgentSession,
   type ExtensionAPI,
+  generateBranchSummary,
   type SessionEntry,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import navigateTree, { __testHooks } from "./index.ts";
+import { MAX_NAME_LENGTH } from "./helpers.ts";
+import navigateTree, {
+  __testHooks,
+  MIN_SUMMARY_FOCUS_LENGTH,
+} from "./index.ts";
 
 afterEach(() => {
   __testHooks.resetPrototype();
@@ -248,13 +253,59 @@ describe("schema shape \u2014 Kiro compatibility (LD-4)", () => {
     const params = tool.parameters as {
       type: string;
       required?: string[];
+      properties?: Record<string, unknown>;
       anyOf?: unknown;
       oneOf?: unknown;
     };
     assert.equal(params.type, "object");
-    assert.ok(params.required?.includes("action"), "action must be required");
+    // Tighter pin: `action` is the ONLY required field at the schema level.
+    // Runtime guards (in execute) handle the action-conditional required-ness
+    // for `name`, `labelStart`, `labelEnd`, `summaryFocus`. A regression
+    // that lifts a runtime guard into the schema (e.g. adding
+    // `summaryFocus` to `required`) would re-introduce the original Kiro
+    // 400 — this assertion catches it.
+    assert.deepEqual(params.required, ["action"]);
+    // Each action-conditional field must still exist in `properties` so the
+    // schema describes the full surface to the model.
+    const props = params.properties ?? {};
+    for (const key of ["name", "labelStart", "labelEnd", "summaryFocus"]) {
+      assert.ok(key in props, `${key} must be a schema property`);
+    }
     assert.equal(params.anyOf, undefined);
     assert.equal(params.oneOf, undefined);
+  });
+});
+
+// =============================================================================
+// production-default `summarize` resolution (COV2-3)
+// =============================================================================
+
+describe("production-default summarize resolution", () => {
+  it("the SDK exports `generateBranchSummary` as a callable", () => {
+    // If the import becomes stale (SDK rename, barrel-import shuffle),
+    // production code path — which falls back to this default — would
+    // explode at the first real rewind. Pin the export at module init.
+    assert.equal(typeof generateBranchSummary, "function");
+  });
+
+  it("registers without an `opts` argument and `list` succeeds", async () => {
+    // Production callers (pi's extension loader) pass a single arg. Confirm
+    // the registration succeeds and a non-summarizing action (`list`) runs
+    // without invoking the default `summarize` path.
+    const sm = SessionManager.inMemory("/tmp");
+    const fakePi = makeFakePi(sm);
+    navigateTree(fakePi.pi);
+    assert.equal(fakePi.registered.length, 1);
+    const tool = fakePi.registered[0];
+    const ctx = makeCtx(sm);
+    const result = await tool.execute(
+      "tc-1",
+      { action: "list" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
   });
 });
 
@@ -346,6 +397,27 @@ describe("dispatch: list action", () => {
     assert.ok(firstIdx >= 0 && secondIdx > firstIdx);
   });
 
+  it("pins the per-row line shape: percentage column then label column (COV2-9)", async () => {
+    // Pin the actual rendered shape so a formatting refactor that swaps
+    // column order or drops the percentage prefix surfaces here. The
+    // regex matches one or more leading spaces, a `\d+\.\d%` percent,
+    // more whitespace, then a non-whitespace label. We don't pin
+    // character offsets — padStart/padEnd widths are implementation
+    // details — just the shape.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:short");
+    const result = await tool.execute(
+      "tc-1",
+      { action: "list" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = result.content[0].text;
+    assert.match(text, /^\s+\d+\.\d+%\s+\S+/m);
+  });
+
   it("omits ' of <window>' from the header when contextWindow is 0", async () => {
     const { sm, tool, ctx } = setup({ contextWindow: 0 });
     appendTurn(sm, "u", "a");
@@ -405,7 +477,7 @@ describe("dispatch: anchor action", () => {
     ["leading hyphen", "-leading"],
     ["trailing hyphen", "trailing-"],
     ["double hyphen", "a--b"],
-    ["over max length", "a".repeat(41)],
+    ["over max length", "a".repeat(MAX_NAME_LENGTH + 1)],
   ];
   for (const [label, value] of invalidNames) {
     it(`rejects invalid name (${label}) with kebab-case message`, async () => {
@@ -491,6 +563,62 @@ describe("dispatch: anchor action", () => {
     );
     assert.ok(clearCall, "expected a clear of the prior label");
   });
+
+  it("re-anchor on the same leaf with the same name is idempotent: no spurious clear (COV2-8)", async () => {
+    // When `prior === leafId` (re-anchor at the same leaf, same name, no
+    // intervening turns), the dispatch skips the prior-clear and just
+    // re-sets the same label. Pin: zero `setLabel(<current leaf>,
+    // undefined)` calls. A regression that drops the `prior !== leafId`
+    // guard would issue a spurious clear of the very leaf we just labeled.
+    const { sm, pi, tool, ctx } = setup();
+    appendTurn(sm, "u", "a");
+    await tool.execute(
+      "tc-1",
+      { action: "anchor", name: "foo" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await tool.execute(
+      "tc-2",
+      { action: "anchor", name: "foo" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    // Snapshot the post-call leaf and assert no clear targeted IT (the
+    // prompt's COV2-8 contract). The legitimate clear that moves the
+    // label off the original message entry is allowed; what's banned is
+    // a clear of the entry we just wrote the new label onto.
+    const finalLeafId = sm.getLeafId();
+    assert.ok(finalLeafId);
+    const spuriousClears = pi.setLabelCalls.filter(
+      ([id, lbl]) => id === finalLeafId && lbl === undefined,
+    );
+    assert.equal(
+      spuriousClears.length,
+      0,
+      "no setLabel(currentLeaf, undefined) should have been issued",
+    );
+  });
+
+  it("falls through with a misleading rewind error on unknown `action` (COV2-7)", async () => {
+    // The schema declares `action` as a Union(anchor|rewind|list), but the
+    // runtime dispatch is three `if` checks with no explicit default —
+    // an unknown action falls through to the rewind validation block.
+    // Pin the current behavior so a future explicit `else` guard surfaces
+    // here as a deliberate change.
+    const { sm, tool, ctx } = setup();
+    appendTurn(sm, "u", "a");
+    const result = await tool.execute(
+      "tc-1",
+      { action: "bogus" } as unknown as Record<string, unknown>,
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+  });
 });
 
 // =============================================================================
@@ -527,7 +655,7 @@ describe("dispatch: rewind validation guards", () => {
         action: "rewind",
         labelStart: "ok",
         labelEnd: "ok2",
-        summaryFocus: "x".repeat(19), // MIN_SUMMARY_FOCUS_LENGTH = 20
+        summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1), // just under the floor
       },
       want: /summaryFocus/,
     },
@@ -537,7 +665,7 @@ describe("dispatch: rewind validation guards", () => {
         action: "rewind",
         labelStart: "ok",
         labelEnd: "ok2",
-        summaryFocus: `  ${"x".repeat(19)}  `,
+        summaryFocus: `  ${"x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1)}  `,
       },
       want: /summaryFocus/,
     },
@@ -549,7 +677,9 @@ describe("dispatch: rewind validation guards", () => {
         labelEnd: "ok2",
         summaryFocus: "short",
       },
-      want: /\u226520/, // \u22650
+      // Pin that the error text surfaces MIN_SUMMARY_FOCUS_LENGTH literally;
+      // the regex tracks the constant if the floor is bumped.
+      want: new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`),
     },
     {
       name: "labelStart kebab-invalid (uppercase)",
@@ -567,7 +697,7 @@ describe("dispatch: rewind validation guards", () => {
         action: "rewind",
         labelStart: "missing",
         labelEnd: "after",
-        summaryFocus: "x".repeat(20),
+        summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
       },
       want: /No label 'missing'/,
     },
@@ -591,9 +721,9 @@ describe("dispatch: rewind validation guards", () => {
   }
 
   it("summaryFocus exactly 20 chars after trim passes the guard", async () => {
-    // Boundary: summaryFocus.trim().length >= 20 (the >= boundary). The
-    // call still errors at the next guard (no labelStart on chain), but it
-    // moves past the focus-length check.
+    // Boundary: summaryFocus.trim().length >= MIN_SUMMARY_FOCUS_LENGTH (the
+    // >= boundary). The call still errors at the next guard (no labelStart
+    // on chain), but it moves past the focus-length check.
     const { sm, tool, ctx } = setup();
     appendTurn(sm, "u", "a");
     const result = await tool.execute(
@@ -602,7 +732,7 @@ describe("dispatch: rewind validation guards", () => {
         action: "rewind",
         labelStart: "missing",
         labelEnd: "after",
-        summaryFocus: "x".repeat(20),
+        summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
       },
       undefined,
       undefined,
@@ -619,15 +749,18 @@ describe("dispatch: rewind validation guards", () => {
 // =============================================================================
 
 describe("dispatch: rewind happy path", () => {
-  it("collapses the chain, labels the summary, injects a synthetic, and refreshes", async () => {
+  /**
+   * Set up a 3-turn chain anchored at the first assistant, capture a fake
+   * session so reflection succeeds, and drive a rewind. Returns everything
+   * the split tests need to pin distinct contracts on the same outcome.
+   */
+  async function rewindFixture() {
     const { sm, pi, tool, ctx } = setup();
-    // Build chain: t1 (anchor target) -> t2 -> t3 (leaf).
     const t1 = appendTurn(sm, "u1", "a1", 100);
     pi.pi.setLabel(t1.assistantId, "anchor:start");
     appendTurn(sm, "u2", "a2", 200);
     appendTurn(sm, "u3", "a3", 300);
 
-    // Capture a fake session so reflection finds it.
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
 
@@ -643,16 +776,19 @@ describe("dispatch: rewind happy path", () => {
       undefined,
       ctx,
     );
+    return { sm, pi, tool, ctx, fake, result };
+  }
 
+  it("emits the [rewind] response prose with Done / Next Steps", async () => {
+    const { result } = await rewindFixture();
     assert.equal(result.isError, undefined);
-    // Response prose contract.
     assert.match(result.content[0].text, /\[rewind 'start' \u2192 'end'\]/);
     assert.match(result.content[0].text, /## Done/);
     assert.match(result.content[0].text, /## Next Steps/);
-    // Details surface the contextBefore > contextAfter invariant.
-    const before = result.details.contextBefore as number;
-    const after = result.details.contextAfter as number;
-    assert.ok(before > after, `expected before (${before}) > after (${after})`);
+  });
+
+  it("labels the summary entry with anchor:<labelEnd> and leaves a synthetic leaf", async () => {
+    const { sm, result } = await rewindFixture();
     // The new summary entry carries the labelEnd.
     const summaryId = result.details.summaryId as string;
     assert.equal(sm.getLabel(summaryId), "anchor:end");
@@ -662,7 +798,7 @@ describe("dispatch: rewind happy path", () => {
     assert.notEqual(leafId, summaryId);
     const leaf = sm.getEntry(leafId);
     assert.ok(leaf && leaf.type === "message");
-    if (leaf.type === "message") {
+    if (leaf && leaf.type === "message") {
       assert.equal(leaf.message.role, "assistant");
       const c0 = (
         leaf.message.content as Array<{ type: string; id?: string }>
@@ -670,12 +806,54 @@ describe("dispatch: rewind happy path", () => {
       assert.equal(c0.type, "toolCall");
       assert.equal(c0.id, "tc-rewind");
     }
-    // Reflection ran successfully, agent.state.messages was updated.
+  });
+
+  it("shrinks contextBefore→contextAfter and refreshes agent.state.messages", async () => {
+    const { sm, fake, result } = await rewindFixture();
+    // Token-math contract: the chain shrinks across the rewind.
+    const before = result.details.contextBefore as number;
+    const after = result.details.contextAfter as number;
+    assert.ok(before > after, `expected before (${before}) > after (${after})`);
+    // Reflection contract: agent.state.messages mutated to match the new
+    // session context. (The pre-rewind snapshot is empty per fixture; the
+    // post-rewind value must equal sm.buildSessionContext().messages.)
     assert.equal(result.details.agentMessagesRefreshed, true);
     assert.deepEqual(
       fake.agent.state.messages,
       sm.buildSessionContext().messages,
     );
+  });
+
+  it("pins the synthetic-token bias contract: usage.totalTokens === pre-synthetic chain estimate (CORR2-10)", async () => {
+    // The synthetic's totalTokens is set to the chain size *before* the
+    // synthetic itself is appended — a deliberate ~50-token understatement
+    // documented in buildSyntheticAssistant's JSDoc. Pin the contract so a
+    // future refactor that tries to "fix" the bias by computing AFTER the
+    // append surfaces here.
+    const { sm, result } = await rewindFixture();
+    const summaryId = result.details.summaryId as string;
+    // The synthetic's recorded baseline equals the active-branch token count
+    // measured at the new branch_summary leaf, immediately after
+    // branchWithSummary and before the synthetic was appended. The simplest
+    // verifiable surface is `details.contextAfter` — production sets
+    // afterTokens = tokensAtNewLeaf, the same value that flows into the
+    // synthetic's `totalTokens`. We assert the round-trip.
+    const after = result.details.contextAfter as number;
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      const usage = (leaf.message as { usage?: { totalTokens?: number } })
+        .usage;
+      assert.equal(
+        usage?.totalTokens,
+        after,
+        "synthetic.totalTokens must equal contextAfter (pre-synthetic chain estimate)",
+      );
+    }
+    // Sanity: summaryId is on the chain and labeled.
+    assert.equal(sm.getLabel(summaryId), "anchor:end");
   });
 
   it("reflection-failed path: warns in response and reports refreshed=false", async () => {
@@ -927,6 +1105,28 @@ describe("captureSession reaping", () => {
     assert.equal(afterFirst - before, 1);
     assert.equal(afterRepeats, afterFirst);
   });
+
+  it("resetPrototype clears seenSessions so a re-captured identity isn't deduped (COV2-11)", () => {
+    // Pre-reset: capturing the same identity twice dedupes (afterRepeat
+    // === afterFirst). Post-reset: the SAME identity captures freshly,
+    // proving the WeakSet was rebound. WeakSet has no .clear() so this
+    // pins the rebind contract — a regression that drops the rebind in
+    // resetPrototype would silently observe stale dedupe across tests.
+    const sm = SessionManager.inMemory("/tmp");
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    const afterFirst = __testHooks.sessionRefCount();
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    const afterRepeat = __testHooks.sessionRefCount();
+    assert.equal(afterRepeat, afterFirst, "pre-reset: dedupe is active");
+
+    __testHooks.resetPrototype();
+    // After reset, sessionInstances is drained and seenSessions is fresh.
+    assert.equal(__testHooks.sessionRefCount(), 0);
+    // Re-capturing the SAME identity must succeed (count goes from 0 → 1).
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    assert.equal(__testHooks.sessionRefCount(), 1);
+  });
 });
 
 // =============================================================================
@@ -1069,7 +1269,7 @@ describe("dispatch: adversarial inputs", () => {
         action: "rewind",
         labelStart: "same",
         labelEnd: "same",
-        summaryFocus: "x".repeat(20),
+        summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
       },
       undefined,
       undefined,
