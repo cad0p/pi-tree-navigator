@@ -1,13 +1,14 @@
 /**
  * Tests for navigate-tree pure helpers.
  *
- * Run with: node --test ~/.pi/agent/extensions/_tests/navigate-tree-helpers.test.ts
+ * Run with: bun test
  *
- * Requires Node 22.6+ (TypeScript stripping is built-in). Tested against
- * Node 24.
+ * Uses node:test + node:assert/strict so the file is also runnable directly
+ * via `node --test extensions/navigate-tree/helpers.test.ts` on Node 22.6+
+ * (built-in TypeScript stripping). Tested against bun 1.3.13 and Node 24.
  *
- * This directory has no `index.ts` or `package.json`, so pi's extension
- * loader skips it.
+ * The pi extension loader treats `./index.ts` as the entry point and ignores
+ * sibling files — so this test file is not loaded as a separate extension.
  */
 
 import * as assert from "node:assert/strict";
@@ -21,7 +22,7 @@ import {
   MAX_NAME_LENGTH,
   stripBranchSummaryBoilerplate,
   toOneLine,
-} from "../_lib/navigate-tree-helpers.ts";
+} from "./helpers.ts";
 
 describe("isValidName", () => {
   it("accepts kebab-case", () => {

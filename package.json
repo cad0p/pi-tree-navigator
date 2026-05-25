@@ -32,7 +32,7 @@
   ],
   "pi": {
     "extensions": [
-      "extensions/navigate-tree.ts"
+      "extensions/navigate-tree"
     ]
   },
   "scripts": {

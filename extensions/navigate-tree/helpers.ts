@@ -1,8 +1,9 @@
 /**
- * Pure helpers for navigate-tree.ts.
+ * Pure helpers for the navigate-tree extension.
  *
- * Lives in `_lib/` (subdirectory without index.ts) so pi's extension loader
- * skips it. Imported by `../navigate-tree.ts` and `../_tests/*.test.ts`.
+ * Imported by `./index.ts` and `./helpers.test.ts`. Pi's extension loader
+ * loads `./index.ts` and ignores everything else in this directory unless
+ * referenced from there — so this file isn't loaded as a separate extension.
  *
  * No pi runtime imports — these are pure functions over plain JS values.
  */

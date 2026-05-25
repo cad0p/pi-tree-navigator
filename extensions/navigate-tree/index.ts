@@ -89,7 +89,7 @@ import {
   MAX_NAME_LENGTH,
   stripBranchSummaryBoilerplate,
   toOneLine,
-} from "./_lib/navigate-tree-helpers.ts";
+} from "./helpers.ts";
 
 const LABEL_PREFIX = "anchor:";
 const MAX_SESSION_REFS = 16;
