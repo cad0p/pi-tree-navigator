@@ -761,7 +761,9 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
         priorLabelEnd = findLabeledEntry(sm, fullLabelEnd);
         failedStep = "setLabelEnd";
         pi.setLabel(summaryId, fullLabelEnd);
-        if (priorLabelEnd && priorLabelEnd !== summaryId) {
+        // `summaryId` was freshly allocated by branchWithSummary above;
+        // no pre-existing label can already point at it.
+        if (priorLabelEnd) {
           failedStep = "clearPrior";
           pi.setLabel(priorLabelEnd, undefined);
         }
