@@ -32,6 +32,10 @@ pi install git:github.com/cad0p/pi-tree-navigator
 ### Requirements
 
 - **pi 0.74+** with at least one model provider configured.
+- Peer dependencies (the source of truth is `package.json` `peerDependencies`):
+  - `@earendil-works/pi-coding-agent ^0.74.0`
+  - `@earendil-works/pi-agent-core ^0.74.0`
+  - `typebox ^1.0.0` (used to declare the tool's parameter schema; bundled with pi but listed explicitly so a standalone install resolves correctly).
 - The reflection bootstrap depends on five plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. Verified against pi 0.75.x.
 
 ## What you get
@@ -92,7 +96,7 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 - **Abandoned branches grow the JSONL forever.** Each rewind preserves the abandoned subtree on disk. Session files get bigger over time even as live context shrinks. For very long autonomous runs (days), session files can hit hundreds of MB.
 
-- **Anthropic only (today).** The synthetic-tool_use trick is specifically for Anthropic's strict tool_use/tool_result pairing. Other providers may have different validation rules — untested.
+- **Tested against Anthropic and Kiro providers.** The synthetic-tool_use trick is specifically for Anthropic's strict tool_use/tool_result pairing; the synthetic's `stopReason: "toolUse"` survives Kiro's `normalizeMessages` filter. Other providers may have different validation rules — untested.
 
 - **Loading the extension monkey-patches `AgentSession.prototype.prompt` globally.** Every session in the host pi process picks up the patch on import, including sessions that never call `navigate_tree`. The patch is install-on-import and not reversible within a running pi process; restart pi to fully unload it.
 
@@ -102,7 +106,7 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 ```bash
 bun install
-bun test          # 118 tests covering helpers (helpers.test.ts) + dispatch / reflection bootstrap / salvage path (index.test.ts)
+bun test          # helpers + dispatch / reflection bootstrap / salvage path
 bunx biome check extensions/
 bunx tsc --noEmit
 ```

@@ -61,9 +61,12 @@
  * LLM call.
  *
  * Risks of the reflection approach:
- *   • If pi switches `agent`, `state`, or `messages` to ES `#` private fields
- *     in a future version, this breaks fundamentally.
- *   • If pi renames or restructures these fields, this breaks.
+ *   • If pi switches any of the five fields this extension reads —
+ *     `AgentSession.prototype.prompt`, `agent.state.messages`,
+ *     `agent.state.systemPrompt`, `agent.state.tools`, or
+ *     `agent.prepareNextTurn` — to ES `#` private fields, this breaks
+ *     fundamentally.
+ *   • If pi renames or restructures any of these fields, this breaks.
  *   • Patches the AgentSession prototype globally.
  *
  * Verified against pi 0.75.5.
