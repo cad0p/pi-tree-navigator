@@ -33,8 +33,8 @@ pi install git:github.com/cad0p/pi-tree-navigator
 
 - **pi 0.74+** with at least one model provider configured.
 - Peer dependencies (the source of truth is `package.json` `peerDependencies`):
-  - `@earendil-works/pi-coding-agent ^0.74.0`
-  - `@earendil-works/pi-agent-core ^0.74.0`
+  - `@earendil-works/pi-coding-agent >=0.74.0`
+  - `@earendil-works/pi-agent-core >=0.74.0`
   - `typebox ^1.0.0` (used to declare the tool's parameter schema; bundled with pi but listed explicitly so a standalone install resolves correctly).
 - The reflection bootstrap depends on five plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. Verified against pi 0.75.x.
 
@@ -48,7 +48,7 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 | `rewind` | `labelStart`, `labelEnd`, `summaryFocus` | Collapse work between `labelStart` and the current leaf into a `branch_summary` entry. The summary is itself labeled with `labelEnd`, so you can chain rewinds. `summaryFocus` is required (≥20 chars after trim). Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from `labelStart` and continues forward from a model-generated summary; the original subtree is preserved on disk but no longer on the active path. |
 | `list` | — | Show all anchors on the active branch with cumulative context %. |
 
-`name`, `labelStart`, and `labelEnd` all live in a single namespace under the reserved `anchor:` label prefix — every label written by `anchor` and every `labelEnd` written by `rewind` is referenceable by any subsequent `rewind`'s `labelStart`, and `list` shows all of them.
+`name` (written by `anchor`) and `labelEnd` (written by `rewind`) both share the reserved `anchor:` label prefix; `labelStart` resolves against that same namespace. Every label written by `anchor` and every `labelEnd` written by `rewind` is referenceable by any subsequent `rewind`'s `labelStart`, and `list` shows all of them.
 
 ## How it works
 
@@ -82,7 +82,7 @@ Why this is more involved than just calling pi's `branchWithSummary`:
 
 3. **Reflection bootstrap.** Pi's slash-command `navigateTree` has access to `commandCtx.navigateTree`, which mutates `agent.state.messages`. Tool executes don't get that ctx, so we capture every `AgentSession` instance via the prompt patch and replicate the mutation manually. Without it, the on-disk leaf moves but `agent.state.messages` stays stale.
 
-4. **`summaryFocus` is mandatory.** The summary is the only thing the agent will see of the collapsed work. The first time the agent uses `rewind`, blanket prompts produce vague summaries; subsequent rewinds are weaker. Forcing the agent to articulate `summaryFocus` (passed to pi's `BRANCH_SUMMARY_PROMPT` as `Additional focus: …`) measurably improves what survives.
+4. **`summaryFocus` is mandatory.** The summary is the only thing the agent will see of the collapsed work. The first time the agent uses `rewind`, blanket prompts produce vague summaries; subsequent rewinds are weaker. Forcing the agent to articulate `summaryFocus` (passed to pi's `generateBranchSummary` as `customInstructions`) measurably improves what survives.
 
 ### Synthetic assistant token bias
 

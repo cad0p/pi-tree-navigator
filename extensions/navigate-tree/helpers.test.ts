@@ -155,7 +155,8 @@ describe("stripBranchSummaryBoilerplate", () => {
   it("does not strip without sentinel even with late ## Goal", () => {
     // Negative pin: missing sentinel short-circuits the strip even when a
     // "## Goal" appears later in the text. Distinct from the lead-in
-    // boundary check (which is exercised in the 199/200 pair below).
+    // boundary check (which is exercised in the MAX_BOILERPLATE_LEAD_IN ± 1
+    // pair below).
     const long = `${"x".repeat(300)}## Goal\nlate`;
     assert.equal(stripBranchSummaryBoilerplate(long), long);
   });

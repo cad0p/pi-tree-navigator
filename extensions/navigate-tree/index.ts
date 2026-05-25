@@ -1,15 +1,14 @@
 /**
- * navigate-tree v3 — agent-callable session tree navigation that doesn't
- * corrupt the chain.
+ * navigate-tree — agent-callable session tree navigation.
  *
- * The original navigate-tree extension produced a structural break every time
- * a rewind ran: pi unconditionally appends the rewind tool's tool_result to
- * the new branch, but the matching tool_use lives in the assistant entry that
- * called navigate_tree, which is on the abandoned branch. The result is a
- * tool_result whose tool_use_id has no matching tool_use anywhere in the kept
- * chain, and Anthropic 400s the next API call with "Improperly formed
- * request". Kiro forwards that as `context_length_exceeded`, which is
- * misleading.
+ * Lets the agent collapse work between named anchors into a model-generated
+ * `branch_summary` without breaking Anthropic's tool_use ↔ tool_result
+ * pairing. Without the synthetic-assistant injection described below, every
+ * rewind would orphan the rewind tool's `tool_result`: pi appends the
+ * assistant's tool_use BEFORE branchWithSummary moves the leaf, so on the
+ * new branch the tool_result has no preceding tool_use, and Anthropic 400s
+ * the next API call with "Improperly formed request". Kiro forwards that
+ * as `context_length_exceeded`, which is misleading.
  *
  * Fix: after `sm.branchWithSummary(target)`, append a synthetic assistant
  * message whose single tool_call has the same id as the in-flight tool call
@@ -533,7 +532,7 @@ export default function (
       "  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).\n" +
       "  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.\n" +
       "  • action='list': show all named anchors on the active branch in chronological order.\n\n" +
-      "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it.\n\n" +
+      "Both `name` (anchor) and `labelEnd` (rewind) write into the same anchor namespace — either becomes addressable as a future `labelStart`. `list` shows every anchor under the `anchor:` prefix, regardless of which action wrote it. Pi labels written via `/label anchor:foo` (manually or by other extensions) are also addressable here. Avoid the `anchor:` prefix in manually-set labels.\n\n" +
       "`summaryFocus` is required when `action='rewind'` (≥20 chars after trim). Calls without it are rejected. It's passed to pi's `generateBranchSummary` as `customInstructions`, biasing the summarizer LLM toward the agent's specified focus while it rewrites the collapsed work into pi's structured summary format. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.",
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
