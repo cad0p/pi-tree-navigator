@@ -20,7 +20,7 @@ const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 // branch...") fits in the first ~150 chars; 200 is a generous upper bound.
 // A "## Goal" found later than this is treated as in-content prose, not
 // the boilerplate marker, and the strip is a no-op.
-const MAX_BOILERPLATE_LEAD_IN = 200;
+export const MAX_BOILERPLATE_LEAD_IN = 200;
 
 // Sentinel that pi's branch-summary prelude always starts with. Gating the
 // strip on this prefix makes the helper a no-op for any non-boilerplate

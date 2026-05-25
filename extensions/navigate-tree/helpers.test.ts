@@ -15,6 +15,7 @@ import {
   formatPct1,
   formatWindow,
   isValidName,
+  MAX_BOILERPLATE_LEAD_IN,
   MAX_NAME_LENGTH,
   stripBranchSummaryBoilerplate,
   toOneLine,
@@ -161,10 +162,11 @@ describe("stripBranchSummaryBoilerplate", () => {
   it("does not strip when ## Goal appears past MAX_BOILERPLATE_LEAD_IN even with sentinel", () => {
     // Lead-in boundary check WITH the sentinel: prelude prefix matches but
     // the ## Goal is too late, so the strip is short-circuited by the
-    // distance check, not the sentinel guard. Pairs with the 199/200 tests
-    // below to fully cover the boundary.
+    // distance check, not the sentinel guard. Pairs with the boundary
+    // tests below (MAX_BOILERPLATE_LEAD_IN - 1 strips, exact boundary
+    // does not) to fully cover the cap.
     const sentinel = "The user explored a different conversation branch";
-    const padding = "x".repeat(250);
+    const padding = "x".repeat(MAX_BOILERPLATE_LEAD_IN + 50);
     const text = `${sentinel}${padding}## Goal\nlate`;
     assert.equal(stripBranchSummaryBoilerplate(text), text);
   });
@@ -180,22 +182,24 @@ describe("stripBranchSummaryBoilerplate", () => {
       "Some quick notes on the parser refactor.\n\n## Goal\nMake it faster.";
     assert.equal(stripBranchSummaryBoilerplate(userDoc), userDoc);
   });
-  it("strips when ## Goal is at index 199 (just inside the boundary)", () => {
-    // Sentinel is 49 chars; pad to put '## Goal' at index 199 exactly.
-    // The boundary check is `goalIdx < 200`, so 199 should still strip.
+  it("strips when ## Goal is at the boundary - 1 (just inside MAX_BOILERPLATE_LEAD_IN)", () => {
+    // The boundary check is `goalIdx < MAX_BOILERPLATE_LEAD_IN`. Pad so
+    // '## Goal' lands at exactly `MAX_BOILERPLATE_LEAD_IN - 1`: the
+    // strict-less-than check passes and the strip runs.
     const sentinel = "The user explored a different conversation branch";
-    const padding = "x".repeat(199 - sentinel.length);
+    const goalIdx = MAX_BOILERPLATE_LEAD_IN - 1;
+    const padding = "x".repeat(goalIdx - sentinel.length);
     const text = `${sentinel}${padding}## Goal\nbody`;
-    assert.equal(text.indexOf("## Goal"), 199);
+    assert.equal(text.indexOf("## Goal"), goalIdx);
     assert.equal(stripBranchSummaryBoilerplate(text), "\nbody");
   });
-  it("does not strip when ## Goal is at index 200 (boundary)", () => {
-    // Boundary case: at exactly 200, the strict-less-than check fails and
-    // the text is preserved as-is.
+  it("does not strip when ## Goal is at MAX_BOILERPLATE_LEAD_IN (boundary)", () => {
+    // Boundary case: at exactly MAX_BOILERPLATE_LEAD_IN, the
+    // strict-less-than check fails and the text is preserved as-is.
     const sentinel = "The user explored a different conversation branch";
-    const padding = "x".repeat(200 - sentinel.length);
+    const padding = "x".repeat(MAX_BOILERPLATE_LEAD_IN - sentinel.length);
     const text = `${sentinel}${padding}## Goal\nbody`;
-    assert.equal(text.indexOf("## Goal"), 200);
+    assert.equal(text.indexOf("## Goal"), MAX_BOILERPLATE_LEAD_IN);
     assert.equal(stripBranchSummaryBoilerplate(text), text);
   });
 });

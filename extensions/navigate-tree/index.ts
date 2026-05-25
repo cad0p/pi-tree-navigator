@@ -98,14 +98,14 @@ const LABEL_PREFIX = "anchor:";
 // /resume cycles on top of a couple of /new cycles) without prematurely
 // reaping a still-live session. Bump if the reaper fires while a session
 // is still live.
-const MAX_SESSION_REFS = 16;
+export const MAX_SESSION_REFS = 16;
 // Hard ceiling on parentId chain walks in `findLabelHint`. The hint is a UX
 // preview only — we don't need to walk all the way to the root for a 50-char
 // snippet. 50 entries is far enough that we'll find a meaningful text-bearing
 // entry even after a tool-call-heavy stretch (assistant tool_calls produce
 // content-less text), and short enough that a malformed graph can't pin the
 // CPU.
-const MAX_HINT_WALK_DEPTH = 50;
+export const MAX_HINT_WALK_DEPTH = 50;
 // Floor on `summaryFocus` length (after trim) for `rewind`. The user's most
 // recent instruction lives on the chain about to be collapsed; if the focus
 // is shorter than this, it almost always elides that instruction (a terse
@@ -354,7 +354,7 @@ function refreshAgentMessages(sm: SessionManager): boolean {
   try {
     const sessionContext = sm.buildSessionContext();
     const agent = asInternals(session).agent;
-    if (!agent || !agent.state) return false;
+    if (!agent?.state) return false;
     agent.state.messages = sessionContext.messages;
     return true;
   } catch {
@@ -597,7 +597,7 @@ export default function (
         const lines: string[] = [];
         for (const e of path) {
           const lbl = sm.getLabel(e.id);
-          if (lbl && lbl.startsWith(LABEL_PREFIX)) {
+          if (lbl?.startsWith(LABEL_PREFIX)) {
             const name = lbl.slice(LABEL_PREFIX.length);
             const tokensAt = estimateAtEntry(allEntries, e.id, byId);
             const pct = formatPct1(tokensAt, cw).padStart(LIST_PCT_COL_WIDTH);

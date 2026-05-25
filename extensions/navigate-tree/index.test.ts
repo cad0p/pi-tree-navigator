@@ -31,6 +31,8 @@ import {
 import { MAX_NAME_LENGTH } from "./helpers.ts";
 import navigateTree, {
   __testHooks,
+  MAX_HINT_WALK_DEPTH,
+  MAX_SESSION_REFS,
   MIN_SUMMARY_FOCUS_LENGTH,
 } from "./index.ts";
 
@@ -717,7 +719,7 @@ describe("dispatch: anchor action", () => {
     // this models a hypothetical future pi (or extension-runner) where
     // setLabel is leaf-stable. The guard's correctness should not depend
     // on which behavior pi exposes.
-    const { sm, tool, ctx } = setup();
+    const { sm, ctx } = setup();
     const t1 = appendTurn(sm, "u", "a");
 
     // In-place pi: setLabel mutates labelsById directly, no leaf advance.
@@ -1430,16 +1432,18 @@ describe("refreshAgentMessages", () => {
 
 describe("captureSession reaping", () => {
   it("deduplicates the same session and bounds growth across many distinct sessions", () => {
-    // Register 100 short-lived sessions; the seenSessions WeakSet
-    // dedupes within the same identity, and the sessionInstances array
-    // gets reaped once it exceeds MAX_SESSION_REFS=16.
+    // Register a batch of short-lived sessions well above
+    // MAX_SESSION_REFS so the reaper has work to do; the seenSessions
+    // WeakSet dedupes within the same identity, and the sessionInstances
+    // array gets reaped once length exceeds MAX_SESSION_REFS.
     //
     // Since WeakRef GC timing is non-deterministic, the bounded
     // assertion is the contract: the array doesn't grow proportional to
     // the number of pushes. (`Bun.gc(true)` is best-effort; if the
     // runtime doesn't expose it, we still get the dedupe + reap
     // bookkeeping.)
-    for (let i = 0; i < 100; i++) {
+    const pushes = MAX_SESSION_REFS * 6 + 4; // comfortably above the cap
+    for (let i = 0; i < pushes; i++) {
       const sm = SessionManager.inMemory("/tmp");
       const fake = makeFakeSession(sm);
       __testHooks.captureSession(fake as unknown as AgentSession);
@@ -1458,13 +1462,14 @@ describe("captureSession reaping", () => {
     const refs = __testHooks.sessionRefCount();
     // Loose bound: the array shouldn't grow proportional to the number
     // of pushes once the reaper has fired.
-    assert.ok(refs <= 101, `sessionRefCount=${refs} grew unbounded`);
+    assert.ok(refs <= pushes + 1, `sessionRefCount=${refs} grew unbounded`);
     // Tighter bound when GC ran: post-reap, only live ref(s) remain.
-    // (101 - 100 dead = 1, plus the trailer = at most ~2.)
+    // (most of the prior pushes were dead, plus the trailer = at most
+    // a few \u2014 well under MAX_SESSION_REFS.)
     if (typeof g?.gc === "function") {
       assert.ok(
-        refs <= 16,
-        `sessionRefCount=${refs}; expected the reaper to bound it at MAX_SESSION_REFS=16`,
+        refs <= MAX_SESSION_REFS,
+        `sessionRefCount=${refs}; expected the reaper to bound it at MAX_SESSION_REFS=${MAX_SESSION_REFS}`,
       );
     }
   });
@@ -1510,21 +1515,23 @@ describe("captureSession reaping", () => {
 // =============================================================================
 
 describe("findLabelHint", () => {
-  it("returns null when no text is found within MAX_HINT_WALK_DEPTH (50)", () => {
+  it("returns null when no text is found within MAX_HINT_WALK_DEPTH", () => {
     // Build a chain whose head is a custom_message with no text content,
-    // followed by 100 user-text entries deep below \u2014 the walker should
-    // give up at depth 50 and not reach the texts.
+    // followed by user-text entries beyond the walker's reach \u2014 the
+    // walker should give up at depth MAX_HINT_WALK_DEPTH and never
+    // reach the texts.
     const sm = SessionManager.inMemory("/tmp");
-    // First push the deep texts.
+    // First push the deep texts (positioned beyond the walker's reach).
     for (let i = 0; i < 100; i++) {
       sm.appendMessage({
         role: "user",
         content: [{ type: "text", text: `deep ${i}` }],
       } as never);
     }
-    // Now push 60 thinking-only assistant messages on top so the walk
-    // bottoms out before reaching the user texts.
-    for (let i = 0; i < 60; i++) {
+    // Now push thinking-only assistant messages on top so the walk
+    // bottoms out before reaching the user texts. We need at least
+    // MAX_HINT_WALK_DEPTH thinking entries; use +10 for safety margin.
+    for (let i = 0; i < MAX_HINT_WALK_DEPTH + 10; i++) {
       sm.appendMessage({
         role: "assistant",
         content: [{ type: "thinking", thinking: "..." }],
