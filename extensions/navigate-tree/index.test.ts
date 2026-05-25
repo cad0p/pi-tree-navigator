@@ -1149,3 +1149,556 @@ describe("dispatch: adversarial inputs", () => {
     assert.match(result.content[0].text, /No model configured/);
   });
 });
+
+// =============================================================================
+// salvage path (post-branchWithSummary failures)
+// =============================================================================
+
+/**
+ * Wrap an existing `pi.setLabel` so the Nth call (1-indexed) throws. Earlier
+ * calls go through to the original. Used to inject a throw on the rewind's
+ * labelEnd write (the second setLabel call after the anchor write).
+ */
+function throwOnNthSetLabel(pi: FakePi, n: number, err: Error): void {
+  const orig = pi.pi.setLabel.bind(pi.pi);
+  let count = 0;
+  (pi.pi as { setLabel: typeof pi.pi.setLabel }).setLabel = (
+    entryId: string,
+    label: string | undefined,
+  ) => {
+    count++;
+    if (count === n) throw err;
+    return orig(entryId, label);
+  };
+}
+
+/**
+ * Wrap `sm.appendMessage` so the next call throws. Used to inject a throw on
+ * the synthetic append. Returns a restore function.
+ */
+function throwOnNextAppendMessage(sm: SessionManager, err: Error): () => void {
+  const orig = sm.appendMessage.bind(sm);
+  let armed = true;
+  (sm as { appendMessage: typeof sm.appendMessage }).appendMessage = ((
+    msg: never,
+  ) => {
+    if (armed) {
+      armed = false;
+      throw err;
+    }
+    return orig(msg);
+  }) as typeof sm.appendMessage;
+  return () => {
+    (sm as { appendMessage: typeof sm.appendMessage }).appendMessage = orig;
+  };
+}
+
+describe("dispatch: rewind salvage path", () => {
+  it("setLabel(labelEnd) throws \u2192 synthetic still appended; original error wraps salvage detail", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    appendTurn(sm, "u3", "a3", 300);
+
+    // Capture so refresh path runs.
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    // We patch AFTER the anchor write above, so the patch counter starts
+    // at 0. The first patched call is the rewind's labelEnd write; the
+    // second is the salvage retry. Throw on every call so BOTH the
+    // original write and the retry fail, surfacing the salvage detail in
+    // the wrapped error.
+    let calls = 0;
+    const origSetLabel = pi.pi.setLabel.bind(pi.pi);
+    void origSetLabel; // kept for parity with the helper used elsewhere
+    (pi.pi as { setLabel: typeof pi.pi.setLabel }).setLabel = (
+      _entryId: string,
+      _label: string | undefined,
+    ) => {
+      calls++;
+      throw new Error(`setLabel boom #${calls}`);
+    };
+
+    let thrown: unknown;
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown, "rewind should re-throw the original error");
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    assert.match(msg, /setLabel boom #1/);
+    // Salvage detail (CORR2-3 + SB2-9) wraps the original: the retry
+    // (#2) ALSO threw, so the salvage-failure clause is appended.
+    assert.match(msg, /salvage:.*labelEnd retry failed/);
+    assert.equal(calls, 2, "setLabel was called twice (original + retry)");
+    // Synthetic landed on the chain so pi's tool_result will pair correctly.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      assert.equal(leaf.message.role, "assistant");
+      const c0 = (
+        leaf.message.content as Array<{ type: string; id?: string }>
+      )[0];
+      assert.equal(c0.type, "toolCall");
+      assert.equal(c0.id, "tc-rewind");
+    }
+    // Refresh ran in the salvage path: agent.state.messages was mutated.
+    assert.deepEqual(
+      fake.agent.state.messages,
+      sm.buildSessionContext().messages,
+    );
+  });
+
+  it("setLabel throws then retry succeeds \u2192 no salvage detail in re-thrown error", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+
+    // Throw on call #1 (original labelEnd write). The salvage retry runs
+    // as call #2 and succeeds, so no salvage detail in the wrapped error.
+    throwOnNthSetLabel(pi, 1, new Error("transient setLabel boom"));
+
+    let thrown: unknown;
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown);
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    assert.match(msg, /transient setLabel boom/);
+    // Retry succeeded \u2014 no salvage detail.
+    assert.ok(
+      !/salvage:/.test(msg),
+      `expected no salvage detail when retry succeeds; got: ${msg}`,
+    );
+    // labelEnd was eventually written, so a chained rewind could find it.
+    const summaryLabel = "anchor:end";
+    let foundLabelEnd = false;
+    for (const e of sm.getBranch()) {
+      if (sm.getLabel(e.id) === summaryLabel) {
+        foundLabelEnd = true;
+        break;
+      }
+    }
+    assert.equal(foundLabelEnd, true, "labelEnd retry should have written");
+  });
+
+  it("estimateActiveBranchTokens throws \u2192 synthetic still appended with degenerate token count", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+
+    // Make buildSessionContext throw \u2014 estimateActiveBranchTokens calls it.
+    // Throw only AFTER the branchWithSummary has succeeded by counting calls.
+    // The earliest in-flow caller is `beforeTokens` math (which uses
+    // estimateAtEntry, not buildSessionContext directly, in the assistant
+    // branch). Here we monkey-patch buildSessionContext on the SM and have
+    // it throw on the second call (the one inside estimateActiveBranchTokens
+    // post-branchWithSummary). The first call comes from
+    // refreshAgentMessages \u2014 but no session is captured here, so refresh
+    // returns false fast without calling buildSessionContext. The first
+    // sm.buildSessionContext() call is inside estimateActiveBranchTokens
+    // post-branchWithSummary.
+    let thrown: unknown;
+    const origBuild = sm.buildSessionContext.bind(sm);
+    let buildCalls = 0;
+    (
+      sm as { buildSessionContext: typeof sm.buildSessionContext }
+    ).buildSessionContext = ((...args: unknown[]) => {
+      buildCalls++;
+      if (buildCalls === 1) throw new Error("estimate boom");
+      // biome-ignore lint/suspicious/noExplicitAny: forward to original
+      return (origBuild as (...a: unknown[]) => unknown).apply(sm, args as any);
+    }) as typeof sm.buildSessionContext;
+
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown);
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    assert.match(msg, /estimate boom/);
+    // Restore so leaf inspection works.
+    (
+      sm as { buildSessionContext: typeof sm.buildSessionContext }
+    ).buildSessionContext = origBuild;
+    // Synthetic landed.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      const c0 = (
+        leaf.message.content as Array<{ type: string; id?: string }>
+      )[0];
+      assert.equal(c0.id, "tc-rewind");
+    }
+  });
+
+  it("synthetic appendMessage throws \u2192 original error propagates cleanly (no recovery)", async () => {
+    // Post-restructure the synthetic append is the recovery itself \u2014 if
+    // it throws there's nothing more we can do. Pin: the throw escapes
+    // verbatim (no double-handling, no swallowing).
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+
+    // Arm appendMessage to throw on the next call \u2014 the synthetic append
+    // is the only appendMessage from inside the tool's rewind path
+    // (branchWithSummary doesn't go through appendMessage). The summarize
+    // stub doesn't append either.
+    const restore = throwOnNextAppendMessage(
+      sm,
+      new Error("appendMessage boom"),
+    );
+    let thrown: unknown;
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    restore();
+    assert.ok(thrown);
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    assert.match(msg, /appendMessage boom/);
+  });
+});
+
+// =============================================================================
+// rewind error branches (COV2-2)
+// =============================================================================
+
+describe("dispatch: rewind error branches", () => {
+  it("'Already at <labelStart>' fires when the labelStart anchor is on the leaf", async () => {
+    // setLabel itself advances the leaf (it appends a label-type entry as
+    // child of the prior leaf), so anchoring then driving rewind doesn't
+    // naturally hit `oldLeaf === target`. Reset the leaf back to the
+    // labeled assistant via `sm.branch(...)` so the guard fires. This is
+    // the contract the message pins ("Already at <labelStart>"); the
+    // path-construction is test-internal.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:here");
+    sm.branch(t1.assistantId);
+    const result = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "here",
+        labelEnd: "after",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+    assert.match(
+      result.content[0].text,
+      /Already at 'here' \u2014 nothing to summarize/,
+    );
+  });
+
+  it("summarize aborted \u2192 'Summarization aborted.'", async () => {
+    const { sm, pi, tool, ctx } = setup({
+      summarize: (async () => ({
+        summary: "",
+        readFiles: [],
+        modifiedFiles: [],
+        aborted: true,
+      })) as never,
+    });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    const result = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Summarization aborted/);
+  });
+
+  it("summarize returns error \u2192 'Summarization failed: <error>'", async () => {
+    const { sm, pi, tool, ctx } = setup({
+      summarize: (async () => ({
+        summary: "",
+        readFiles: [],
+        modifiedFiles: [],
+        aborted: false,
+        error: "rate limited",
+      })) as never,
+    });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    const result = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Summarization failed: rate limited/);
+  });
+
+  it("summarize returns empty summary \u2192 'no summary text'", async () => {
+    const { sm, pi, tool, ctx } = setup({
+      summarize: (async () => ({
+        summary: "",
+        readFiles: [],
+        modifiedFiles: [],
+        aborted: false,
+      })) as never,
+    });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    const result = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+    assert.match(
+      result.content[0].text,
+      /Summarization failed: no summary text/,
+    );
+  });
+
+  it("chained-rewind no-turns: synthetic-only intervening trips the boundary guard (CORR2-6)", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const tA = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(tA.assistantId, "anchor:a");
+    appendTurn(sm, "u2", "a2", 200);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    // First rewind a\u2192b succeeds and leaves the leaf as a synthetic
+    // assistant whose parent is the labeled b-summary.
+    const r1 = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "a",
+        labelEnd: "b",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r1.isError, undefined);
+
+    // Immediately rewind b\u2192c with no intervening turns. The only entry
+    // between leaf (synthetic) and target (b-summary) is the synthetic
+    // itself \u2014 the new guard trips before summarize is invoked.
+    const r2 = await tool.execute(
+      "tc-2",
+      {
+        action: "rewind",
+        labelStart: "b",
+        labelEnd: "c",
+        summaryFocus: "Preserve user instructions across the second rewind.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r2.isError, true);
+    assert.match(
+      r2.content[0].text,
+      /Already at synthetic boundary \u2014 no work to summarize/,
+    );
+  });
+});
+
+// =============================================================================
+// installPrepareNextTurn cross-extension preservation (COV2-5)
+// =============================================================================
+
+describe("installPrepareNextTurn cross-extension preservation", () => {
+  it("foreign extension's prepareNextTurn survives /reload re-install", async () => {
+    // A foreign extension installs first (no marker). We install our
+    // wrapper (wrap A); we install AGAIN simulating /reload (wrap B). The
+    // foreign hook should still run and its `model` should propagate
+    // through both wrappers \u2014 catching a regression where wrap B captures
+    // wrap A as `__prior` instead of unwrapping to recover the foreign
+    // function.
+    const sm = SessionManager.inMemory("/tmp");
+    const fake = makeFakeSession(sm);
+    let priorRan = 0;
+    fake.agent.prepareNextTurn = async () => {
+      priorRan++;
+      return { model: "from-foreign", thinkingLevel: "high" };
+    };
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+
+    type Pnt = (
+      ...args: unknown[]
+    ) => Promise<{ model?: unknown; thinkingLevel?: unknown }>;
+    const fn = fake.agent.prepareNextTurn as Pnt;
+    const r = await fn();
+    // Foreign ran exactly once \u2014 not zero (which would signal that
+    // wrap B captured wrap A as prior and the foreign got stranded), and
+    // not twice (which would signal both A and B chained over the foreign).
+    assert.equal(priorRan, 1);
+    assert.equal(r.model, "from-foreign");
+    assert.equal(r.thinkingLevel, "high");
+  });
+
+  it("prior wrapper's context.systemPrompt + tools propagate through the chain (CORR2-4)", async () => {
+    // A foreign prepareNextTurn that returns a context with a custom
+    // systemPrompt and tools. Our wrapper should preserve those fields and
+    // override only `messages`.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.prepareNextTurn = async () => ({
+      context: {
+        systemPrompt: "FOREIGN_PROMPT",
+        messages: [{ role: "user", content: "should be overwritten" }],
+        tools: ["foreign-tool"],
+      },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pnt = (...args: unknown[]) => Promise<{
+      context?: {
+        systemPrompt?: unknown;
+        messages?: unknown;
+        tools?: unknown;
+      };
+    }>;
+    const fn = fake.agent.prepareNextTurn as Pnt;
+    const r = await fn();
+    // systemPrompt + tools survive from the foreign wrapper.
+    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
+    assert.deepEqual(r.context?.tools, ["foreign-tool"]);
+    // messages is overridden by sm.buildSessionContext().messages.
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+});
+
+// =============================================================================
+// non-assistant oldLeafEntry fallback (COV2-6)
+// =============================================================================
+
+describe("dispatch: rewind beforeTokens fallback", () => {
+  it("non-assistant leaf: beforeTokens uses estimateActiveBranchTokens fallback (smoke)", async () => {
+    // Build chain ending in a user message (not an assistant). The
+    // happy-path beforeTokens math gates on role==='assistant' &&
+    // parentId; otherwise falls back to estimateActiveBranchTokens.
+    // Smoke-level pin: a sensible non-zero contextBefore lands in details.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    // Append a trailing user message so the leaf isn't an assistant.
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "u3" }],
+    } as never);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const result = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const before = result.details.contextBefore as number;
+    assert.ok(
+      typeof before === "number" && before > 0,
+      `expected non-zero contextBefore; got ${before}`,
+    );
+  });
+});
