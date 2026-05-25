@@ -381,25 +381,12 @@ function findLabelHint(
  * matches the in-flight tool_call id. Appended after `branchWithSummary` so
  * the real tool_result lands paired with a matching tool_use.
  *
- * Notes on the `usage` shape:
- *   - Pi's TUI footer iterates ALL session entries and reads
- *     `usage.{input,output,cacheRead,cacheWrite,cost.total}` to compute
- *     cumulative session totals. We leave those at 0 so this synthetic
- *     contributes nothing to cumulative cost — which is correct, since no
- *     real LLM call happened.
- *   - pi-agent-core's `estimateContextTokens` finds the LAST assistant with
- *     a usage block and uses its `calculateContextTokens(usage)` value as
- *     the baseline (`usage.totalTokens || input + output + cacheRead + cacheWrite`).
- *     We set `totalTokens` to the post-rewind chain size so the baseline is
- *     accurate. (Picking it up directly via the synthetic also avoids
- *     stopReason "error"/"aborted", which the kiro provider's
- *     `normalizeMessages` strips before sending to the API — that would
- *     re-orphan the tool_result and trip Anthropic's validation.)
- *   - The `totalTokens` we set is the chain size measured *before* the
- *     synthetic itself is appended. Once appended, the synthetic's
- *     toolCall block adds ~50 tokens that aren't reflected in the baseline.
- *     Future estimates therefore understate the chain by ~50 tokens —
- *     negligible at typical anchor cadence.
+ * `usage` fields are zeroed except `totalTokens`, which is set to the
+ * chain size measured BEFORE this synthetic is appended (the post-rewind
+ * baseline that pi-agent-core's `estimateContextTokens` reads off the last
+ * assistant). `stopReason: "toolUse"` survives Kiro's `normalizeMessages`
+ * filter (which strips `error` / `aborted`); without it the synthetic would
+ * be filtered out and the tool_result would re-orphan.
  */
 function buildSyntheticAssistant(
   toolCallId: string,
