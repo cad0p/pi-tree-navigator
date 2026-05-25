@@ -700,23 +700,13 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
           `No entries between leaf and '${p.labelStart}' — nothing to summarize.`,
         );
       }
-      // Chained-rewind-no-turns guard: if the only message-type entry
-      // between leaf and target is a synthetic this extension wrote on a
-      // prior rewind (assistant message whose sole content block is a
-      // navigate_tree toolCall), summarizing it produces a degenerate
-      // output. Catch it before we burn an LLM call. The agent should
-      // append at least one real turn between rewinds. Note that
-      // `entries` may also contain label-type entries inserted by the
-      // setLabel call that wrote the prior labelEnd — those don't carry
-      // semantic content, so they're filtered out for this check.
-      //
-      // The guard discriminates against THIS extension's synthetic
-      // (not arbitrary navigate_tree calls) by additionally requiring
-      // synthetic-shape: stopReason === "toolUse" and zero input/output
-      // usage. `buildSyntheticAssistant` pins these fields; a real
-      // navigate_tree assistant turn has nonzero usage from the model
-      // call. This avoids false-positives if a real navigate_tree call
-      // ever lands as the lone intervening message.
+      // Chained-rewind-no-turns guard: bail if the only message between
+      // leaf and target matches our synthetic shape (single navigate_tree
+      // toolCall block + stopReason "toolUse" + zero usage), meaning the
+      // agent didn't append a real turn between rewinds. Filter out
+      // label-type entries (they carry no semantic content); the
+      // synthetic-shape predicate avoids false-positives on real
+      // navigate_tree calls (which have nonzero usage from the model).
       const messageEntries = entries.filter((e) => e.type === "message");
       if (messageEntries.length === 1) {
         const lone = messageEntries[0];
