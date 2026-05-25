@@ -79,12 +79,8 @@ const LABEL_PREFIX = "anchor:";
 // reaping a still-live session. Bump if the reaper fires while a session
 // is still live.
 export const MAX_SESSION_REFS = 16;
-// Hard ceiling on parentId chain walks in `findLabelHint`. The hint is a UX
-// preview only — we don't need to walk all the way to the root for a 50-char
-// snippet. 50 entries is far enough that we'll find a meaningful text-bearing
-// entry even after a tool-call-heavy stretch (assistant tool_calls produce
-// content-less text), and short enough that a malformed graph can't pin the
-// CPU.
+// Cap on parentId chain walks in `findLabelHint` (UX preview only;
+// no need to walk to the root for a 50-char snippet).
 export const MAX_HINT_WALK_DEPTH = 50;
 // Floor on `summaryFocus` length (after trim) for `rewind`. The user's most
 // recent instruction lives on the chain about to be collapsed; if the focus
@@ -100,11 +96,9 @@ export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // the synthetic's args because pi's `convertToLlm` re-emits the synthetic's
 // toolCall block (including its arguments) on every subsequent turn until
 // another rewind. Without a cap, a 100K-char focus inflates every later
-// turn's input by ~100K chars indefinitely. 1024 chars (UTF-16 code units,
-// per `String.prototype.slice`; for non-ASCII focus the byte cost may be
-// 2–4× higher under UTF-8) is generous — well above empirically useful
-// focus length, and the agent already saw the full focus string when it
-// issued the rewind.
+// turn's input by ~100K chars indefinitely. 1024 chars is generous — well
+// above empirically useful focus length, and the agent already saw the
+// full focus string when it issued the rewind.
 export const MAX_SYNTHETIC_FOCUS_LENGTH = 1024;
 // Hint length cap for the per-row hint shown in `list` output. 50 chars
 // fits one terminal column without wrapping in typical 80-column TUIs.
@@ -659,11 +653,10 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
 
       // The leaf at execute time is the assistant that just streamed the
       // rewind tool call. Its `usage.input` is the *minimum* of recent API
-      // calls in this turn (extended-thinking strips earlier-turn thinking),
-      // so estimating from it understates what the user just saw. Use the
-      // chain *up to its parent* (which has the prior assistant's usage as
-      // baseline) so beforeTokens matches the value `list` would have
-      // reported on the previous turn.
+      // calls in this turn, so estimating from it understates what the
+      // user just saw. Use the chain up to its parent (which has the prior
+      // assistant's usage as baseline) so beforeTokens matches the value
+      // `list` would have reported on the previous turn.
       const oldLeafEntry = sm.getEntry(oldLeaf);
       let beforeTokens: number;
       if (
