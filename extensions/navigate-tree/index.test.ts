@@ -274,6 +274,42 @@ describe("schema shape \u2014 Kiro compatibility", () => {
     assert.equal(params.anyOf, undefined);
     assert.equal(params.oneOf, undefined);
   });
+
+  it("declares executionMode: 'sequential' (concurrency contract)", () => {
+    // Concurrent dispatch would race on the SessionManager's leaf pointer
+    // and corrupt the tree. The tool relies on the pi runtime to serialize
+    // calls. A regression that drops or flips this property is the only
+    // practical defense — source has no in-process double-call guard.
+    const { tool } = setup();
+    assert.equal(tool.executionMode, "sequential");
+  });
+
+  it("each conditional-required field carries an action-conditional description", () => {
+    // The schema descriptions encode the conditional-required contract
+    // for the model (the `Required when action='X'` phrase). A drift in
+    // this prose silently degrades model tool-use accuracy. Pin presence
+    // of the canonical conditional phrase so a future copy-edit that
+    // drops it surfaces here.
+    const { tool } = setup();
+    const props = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties;
+    assert.match(props.name.description ?? "", /Required when action='anchor'/);
+    assert.match(
+      props.labelStart.description ?? "",
+      /Required when action='rewind'/,
+    );
+    assert.match(
+      props.labelEnd.description ?? "",
+      /Required when action='rewind'/,
+    );
+    assert.match(
+      props.summaryFocus.description ?? "",
+      /Required when action='rewind'/,
+    );
+  });
 });
 
 // =============================================================================
@@ -461,6 +497,56 @@ describe("dispatch: list action", () => {
     assert.doesNotMatch(result.content[0].text, /reflection bootstrap missing/);
     assert.equal(result.details.reflectionOk, true);
   });
+
+  it("list and rewind warnings cite the same REFLECTION_BOOTSTRAP_WARNING constant verbatim (SSOT)", async () => {
+    // The source claims `REFLECTION_BOOTSTRAP_WARNING` is the single
+    // source of truth for both the list-site and rewind-site warning.
+    // Pin literal containment of the constant at both sites so a future
+    // drift (e.g. dropping the recovery hint at one site) surfaces here.
+    const sentinel = __testHooks.REFLECTION_BOOTSTRAP_WARNING;
+    assert.ok(sentinel.length > 0, "warning constant must be non-empty");
+
+    // List site: no captured session — reflection finds nothing.
+    {
+      const { tool, ctx } = setup();
+      const result = await tool.execute(
+        "tc-list",
+        { action: "list" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.ok(
+        result.content[0].text.includes(sentinel),
+        "list output must include REFLECTION_BOOTSTRAP_WARNING verbatim",
+      );
+    }
+
+    // Rewind site: same conditions — the reflection-failed footer should
+    // contain the constant verbatim.
+    {
+      const { sm, pi, tool, ctx } = setup();
+      const t1 = appendTurn(sm, "u1", "a1", 100);
+      pi.pi.setLabel(t1.assistantId, "anchor:start");
+      appendTurn(sm, "u2", "a2", 200);
+      const result = await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.ok(
+        result.content[0].text.includes(sentinel),
+        "rewind output must include REFLECTION_BOOTSTRAP_WARNING verbatim",
+      );
+    }
+  });
 });
 
 // =============================================================================
@@ -562,6 +648,24 @@ describe("dispatch: anchor action", () => {
       ([id, lbl]) => id === t1.assistantId && lbl === undefined,
     );
     assert.ok(clearCall, "expected a clear of the prior label");
+    // Pin write-before-clear ordering: setLabel(newLeaf, fullLabel) MUST
+    // land before setLabel(prior, undefined). The reverse order leaves a
+    // "prior cleared, new failed to install" window if the second call
+    // throws — source comment at the anchor handler documents this as
+    // load-bearing. A regression to clear-then-set would still produce
+    // the right end state but lose the rollback property.
+    const setIdx = pi.setLabelCalls.findIndex(
+      ([id, lbl]) => id === t2.assistantId && lbl === "anchor:iter-start",
+    );
+    const clearIdx = pi.setLabelCalls.findIndex(
+      ([id, lbl]) => id === t1.assistantId && lbl === undefined,
+    );
+    assert.ok(setIdx >= 0, "expected the new-leaf set call");
+    assert.ok(clearIdx >= 0, "expected the prior-clear call");
+    assert.ok(
+      setIdx < clearIdx,
+      `expected set-before-clear; got setIdx=${setIdx} clearIdx=${clearIdx}`,
+    );
   });
 
   it("re-anchor on the same leaf with the same name is idempotent: no spurious clear", async () => {
@@ -1251,6 +1355,45 @@ describe("findLabelHint", () => {
     assert.ok(hint);
     if (hint) assert.match(hint, /the user's instruction/);
   });
+
+  it("branch_summary entry: returns 'summary: <stripped lead-in>'", () => {
+    // findLabelHint walks the parent chain; when it lands on a
+    // branch_summary entry, the hint should be prefixed with 'summary: '
+    // and stripBranchSummaryBoilerplate should remove pi's prelude. A
+    // regression that drops the prefix or the strip call would surface
+    // here.
+    const sm = SessionManager.inMemory("/tmp");
+    appendTurn(sm, "u1", "a1");
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const summaryId = sm.branchWithSummary(
+      leafId,
+      "This is the summary content of the rewound branch.",
+    );
+    const hint = __testHooks.findLabelHint(sm, summaryId, 80);
+    assert.ok(hint, "branch_summary entry should produce a hint");
+    if (hint) {
+      assert.match(hint, /^summary: /);
+      assert.match(hint, /summary content of the rewound branch/);
+    }
+  });
+
+  it("custom_message entry: hint extracts the content text", () => {
+    // findLabelHint also walks into `custom_message` entries (e.g. the
+    // pi /label command's audit entries). Pin: the text content lands
+    // in the hint, no prefix.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendCustomMessageEntry(
+      "some-custom-type",
+      [{ type: "text", text: "custom message content" }],
+      true,
+    );
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const hint = __testHooks.findLabelHint(sm, leafId, 80);
+    assert.ok(hint, "custom_message entry should produce a hint");
+    if (hint) assert.match(hint, /custom message content/);
+  });
 });
 
 // =============================================================================
@@ -1556,6 +1699,26 @@ describe("dispatch: rewind salvage path", () => {
       }
     }
     assert.equal(foundLabelEnd, true, "labelEnd retry should have written");
+    // Synthetic's `usage.totalTokens === 0` regardless of retry outcome:
+    // the salvage path can't safely run estimateActiveBranchTokens
+    // post-throw (the SM may be in an unknown state), so the synthetic
+    // is built with `totalTokens=0` whenever we landed in the salvage
+    // catch block. This pins that the salvage skips the post-rewind
+    // chain measurement — a future refactor that "fixes" this would
+    // mask the salvage's degenerate-fallback contract.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      const usage = (leaf.message as { usage?: { totalTokens?: number } })
+        .usage;
+      assert.equal(
+        usage?.totalTokens,
+        0,
+        "salvage synthetic must use totalTokens=0",
+      );
+    }
   });
 
   it("estimateActiveBranchTokens throws \u2192 synthetic still appended with degenerate token count", async () => {
@@ -1621,6 +1784,23 @@ describe("dispatch: rewind salvage path", () => {
       )[0];
       assert.equal(c0.id, "tc-rewind");
     }
+    // labelEnd write succeeded BEFORE the estimate threw — so a chained
+    // rewind could still find it. Pin: walking the active branch finds
+    // an entry with `anchor:end`. A regression that moves the label
+    // write inside the throwing closure (or aborts the salvage label
+    // retry policy) would silently drop the label, surfacing here.
+    let foundLabelEnd = false;
+    for (const e of sm.getBranch()) {
+      if (sm.getLabel(e.id) === "anchor:end") {
+        foundLabelEnd = true;
+        break;
+      }
+    }
+    assert.equal(
+      foundLabelEnd,
+      true,
+      "labelEnd should have landed before estimate threw",
+    );
   });
 
   it("synthetic appendMessage throws \u2192 original error propagates cleanly (no recovery)", async () => {
@@ -1660,7 +1840,11 @@ describe("dispatch: rewind salvage path", () => {
     restore();
     assert.ok(thrown);
     const msg = thrown instanceof Error ? thrown.message : String(thrown);
-    assert.match(msg, /appendMessage boom/);
+    // Tight equality (not regex match): a regression that wraps the
+    // throw (e.g. `throw new Error("salvage failed: " + e.message)`)
+    // would still match a /appendMessage boom/ regex, defeating the
+    // "no recovery, no double-handling" claim. Exact equality pins it.
+    assert.equal(msg, "appendMessage boom");
   });
 });
 
@@ -1903,6 +2087,73 @@ describe("installPrepareNextTurn cross-extension preservation", () => {
     // messages is overridden by sm.buildSessionContext().messages.
     assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
   });
+
+  it("partial prior context: missing tools is filled from agent.state.tools", async () => {
+    // A foreign wrapper that returns a partial `context` (only
+    // systemPrompt; no tools). Pi's loop wholesale-replaces context
+    // (`currentContext = ctx ?? currentContext`), so without our
+    // defensive fill the next turn's context.tools would be undefined.
+    // Pin: our wrapper falls back to agent.state.tools when the prior
+    // didn't supply one.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = ["agent-state-tool"];
+    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
+    fake.agent.prepareNextTurn = async () => ({
+      // Partial: only systemPrompt; no tools, no messages.
+      context: {
+        systemPrompt: "FOREIGN_PROMPT",
+      },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pnt = (...args: unknown[]) => Promise<{
+      context?: {
+        systemPrompt?: unknown;
+        tools?: unknown;
+        messages?: unknown;
+      };
+    }>;
+    const fn = fake.agent.prepareNextTurn as Pnt;
+    const r = await fn();
+    // Foreign systemPrompt wins (it was set explicitly).
+    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
+    // tools fell back to agent.state.tools — the defensive fill.
+    assert.deepEqual(r.context?.tools, ["agent-state-tool"]);
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("prior throwing in prepareNextTurn: error propagates verbatim (no swallow)", async () => {
+    // If a foreign extension's prepareNextTurn throws, our wrapper
+    // re-throws — we don't swallow + log + fall through, because that
+    // would mask the foreign extension's bug behind our context-refresh.
+    // Pin: the throw escapes verbatim so the failure surfaces at the
+    // pi loop boundary where it's actionable. A future change to catch
+    // + best-effort recover would surface here.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.prepareNextTurn = async () => {
+      throw new Error("foreign boom");
+    };
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pnt = (...args: unknown[]) => Promise<unknown>;
+    const fn = fake.agent.prepareNextTurn as Pnt;
+    let thrown: unknown;
+    try {
+      await fn();
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) assert.equal(thrown.message, "foreign boom");
+  });
 });
 
 // =============================================================================
@@ -1927,6 +2178,21 @@ describe("dispatch: rewind beforeTokens fallback", () => {
 
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
+
+    // Pre-snapshot: leaf at execute time IS NOT a role==='assistant'
+    // entry. This is the precondition for the fallback branch — without
+    // it the test would silently exercise the happy path.
+    const oldLeafId = sm.getLeafId();
+    assert.ok(oldLeafId);
+    const oldLeaf = sm.getEntry(oldLeafId as string);
+    assert.ok(oldLeaf && oldLeaf.type === "message");
+    if (oldLeaf && oldLeaf.type === "message") {
+      assert.equal(
+        oldLeaf.message.role,
+        "user",
+        "precondition: oldLeaf must NOT be assistant for fallback branch",
+      );
+    }
 
     const result = await tool.execute(
       "tc-1",

@@ -102,7 +102,7 @@ The synthetic assistant we inject after each rewind shows up in `usage.totalToke
 
 ```bash
 bun install
-bun test          # 111 tests covering helpers (helpers.test.ts) + dispatch / reflection bootstrap / salvage path (index.test.ts)
+bun test          # 118 tests covering helpers (helpers.test.ts) + dispatch / reflection bootstrap / salvage path (index.test.ts)
 bunx biome check extensions/
 bunx tsc --noEmit
 ```

@@ -1000,4 +1000,10 @@ export const __testHooks = {
   sessionRefCount(): number {
     return sessionInstances.length;
   },
+  /**
+   * The reflection-bootstrap-missing warning string. Exported so tests can
+   * pin the single-source-of-truth claim (the constant is used by both
+   * `list` and `rewind`; tests assert literal containment to catch drift).
+   */
+  REFLECTION_BOOTSTRAP_WARNING,
 };
