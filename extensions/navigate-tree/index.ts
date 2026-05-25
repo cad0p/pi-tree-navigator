@@ -700,9 +700,18 @@ export default function (
       // minimal synthetic before the throw escapes — otherwise pi writes its
       // own tool_result whose tool_use_id has no match on the new branch and
       // Anthropic 400s the next API call.
-      let syntheticId: string;
-      let tokensAtNewLeaf: number;
-      let refreshed: boolean;
+      // Structure: the only operations that need salvage are
+      // `pi.setLabel(labelEnd)` and `estimateActiveBranchTokens` — both run
+      // BEFORE the synthetic append, so a throw from either leaves the
+      // chain invalid until the synthetic lands. Move the synthetic append
+      // OUTSIDE the try so it executes exactly once regardless of which
+      // earlier step threw — no idempotence guard needed because there's
+      // only one call site. The catch makes a best-effort attempt to retry
+      // the labelEnd write (idempotent in pi's setLabel contract) and
+      // surfaces salvage detail in the re-thrown error.
+      let tokensAtNewLeaf = 0;
+      let originalErr: unknown;
+      let salvageDetail = "";
       try {
         pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
 
@@ -710,51 +719,55 @@ export default function (
         // captures the chain size at the new leaf (branch_summary) using
         // the prior real assistant's usage as the baseline.
         tokensAtNewLeaf = estimateActiveBranchTokens(sm);
-
-        // Inject a synthetic assistant whose tool_call id matches this
-        // in-flight call. When pi appends our tool_result after this
-        // returns, it pairs cleanly with this synthetic tool_use rather
-        // than the abandoned one. Set the synthetic's `usage.totalTokens`
-        // to `tokensAtNewLeaf` so that future `estimateContextTokens`
-        // calls (which will pick up the synthetic as the last assistant)
-        // report the correct context size.
-        const syntheticMsg = buildSyntheticAssistant(
-          toolCallId,
-          "navigate_tree",
-          p as unknown as Record<string, unknown>,
-          ctx.model as
-            | { api?: string; provider?: string; id?: string }
-            | undefined,
-          tokensAtNewLeaf,
-        );
-        syntheticId = sm.appendMessage(syntheticMsg);
-
-        // Refresh agent.state.messages so the next prompt() snapshot
-        // reflects the rewound chain.
-        refreshed = refreshAgentMessages(sm);
       } catch (err) {
-        // Salvage path: branchWithSummary already moved the leaf, but the
-        // happy-path injection failed before the synthetic landed. Append
-        // a degenerate synthetic (matching toolCallId is the only
-        // structural requirement) so the appended tool_result still pairs
-        // with a tool_use on the kept chain, then re-throw so the failure
-        // surfaces to the agent.
+        originalErr = err;
+        // Best-effort labelEnd retry. setLabel is idempotent under
+        // re-application; if the first call was the failure point and
+        // some transient was the cause, this may succeed. Wrap in its
+        // own try so a second failure can't recurse.
         try {
-          const fallback = buildSyntheticAssistant(
-            toolCallId,
-            "navigate_tree",
-            p as unknown as Record<string, unknown>,
-            ctx.model as
-              | { api?: string; provider?: string; id?: string }
-              | undefined,
-            0,
-          );
-          sm.appendMessage(fallback);
-        } catch {
-          // If even the fallback append fails, fall through and re-throw
-          // the original error — there's nothing more we can do here.
+          pi.setLabel(summaryId, LABEL_PREFIX + p.labelEnd);
+        } catch (retryErr) {
+          salvageDetail = `labelEnd retry failed: ${
+            retryErr instanceof Error ? retryErr.message : String(retryErr)
+          }`;
         }
-        throw err;
+      }
+
+      // Synthetic append: runs in BOTH the happy path and the salvage path.
+      // If `originalErr` is set we use a degenerate synthetic
+      // (totalTokens=0, since `tokensAtNewLeaf` may not have been computed).
+      // The synthetic's matching toolCallId is the only structural
+      // requirement for chain validity — pi's appended tool_result pairs
+      // with this synthetic regardless of which earlier step threw.
+      const syntheticMsg = buildSyntheticAssistant(
+        toolCallId,
+        "navigate_tree",
+        p as unknown as Record<string, unknown>,
+        ctx.model as
+          | { api?: string; provider?: string; id?: string }
+          | undefined,
+        originalErr ? 0 : tokensAtNewLeaf,
+      );
+      const syntheticId = sm.appendMessage(syntheticMsg);
+
+      // Refresh agent.state.messages so the next prompt() snapshot reflects
+      // the rewound chain. Runs in both paths; `refreshAgentMessages`
+      // already swallows internal throws, so it can't re-trigger salvage.
+      const refreshed = refreshAgentMessages(sm);
+
+      if (originalErr) {
+        // Salvage path: synthetic landed (chain is valid), labelEnd retry
+        // and refresh were best-effort. Re-throw the original error with
+        // any salvage detail attached so the failure surfaces to the
+        // agent and post-mortem reviewers can tell what was recovered.
+        const baseMsg =
+          originalErr instanceof Error
+            ? originalErr.message
+            : String(originalErr);
+        throw new Error(
+          salvageDetail ? `${baseMsg} (salvage: ${salvageDetail})` : baseMsg,
+        );
       }
 
       const afterTokens = tokensAtNewLeaf;
