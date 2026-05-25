@@ -1096,6 +1096,198 @@ describe("dispatch: rewind happy path", () => {
       assert.equal(c0.id, "tc-2");
     }
   });
+
+  it("summaryFocus.length === MAX_SYNTHETIC_FOCUS_LENGTH (1024) is stored verbatim with no truncation marker", async () => {
+    // Below-boundary case: the cap check is `length > 1024`, so a focus
+    // exactly 1024 chars long must pass through unchanged. Pin the
+    // strict-greater-than comparison so a regression to `>=` (which
+    // would chop the last char + append the marker) surfaces.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const focus = "x".repeat(1024);
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: focus,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+
+    // Read the synthetic's args back: under-cap focus survives verbatim.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      const c0 = (
+        leaf.message.content as Array<{
+          type: string;
+          arguments?: { summaryFocus?: string };
+        }>
+      )[0];
+      assert.equal(c0.type, "toolCall");
+      assert.equal(
+        c0.arguments?.summaryFocus?.length,
+        1024,
+        "focus at the cap boundary must be stored at full length",
+      );
+      assert.equal(
+        c0.arguments?.summaryFocus,
+        focus,
+        "under-cap focus must be stored verbatim, no truncation",
+      );
+      assert.ok(
+        !/\[truncated\]/.test(c0.arguments?.summaryFocus ?? ""),
+        "under-cap focus must NOT carry the truncation marker",
+      );
+    }
+  });
+
+  it("summaryFocus.length === 1025 truncates to 1024 chars + '\u2026 [truncated]' marker", async () => {
+    // Above-boundary case: the first char beyond the cap triggers the
+    // truncation branch. Pin the marker shape so a regression that
+    // drops the suffix (or moves the cap) surfaces.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const focus = "x".repeat(1025);
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: focus,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      const c0 = (
+        leaf.message.content as Array<{
+          type: string;
+          arguments?: { summaryFocus?: string };
+        }>
+      )[0];
+      const stored = c0.arguments?.summaryFocus ?? "";
+      // Stored = 1024 chars of x + the literal marker suffix.
+      assert.equal(
+        stored,
+        `${"x".repeat(1024)}\u2026 [truncated]`,
+        "over-cap focus must be sliced at MAX_SYNTHETIC_FOCUS_LENGTH and carry the marker",
+      );
+      assert.match(
+        stored,
+        /\[truncated\]$/,
+        "truncation marker must terminate the stored focus",
+      );
+    }
+  });
+
+  it("dual-channel: summarize sees the full focus while the synthetic stores the truncated copy", async () => {
+    // The full focus is passed live to `generateBranchSummary`, so the
+    // summarizer always sees the original; only the synthetic's
+    // re-emitted args are trimmed. Pin both channels with one spy: a
+    // 1500-char focus must reach `summarize`'s `customInstructions`
+    // unchanged, while the synthetic's args carry the 1024 + marker
+    // form. A regression that pre-truncates the focus everywhere
+    // ("simpler \u2014 one source of truth") would silently lobotomize the
+    // summarizer's input.
+    let capturedCustomInstructions: unknown;
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedCustomInstructions = (opts as { customInstructions?: unknown })
+        .customInstructions;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const fullFocus = "y".repeat(1500);
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: fullFocus,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+
+    // (a) summarize spy received the FULL 1500-char focus.
+    assert.equal(
+      typeof capturedCustomInstructions,
+      "string",
+      "summarize must be invoked with a string customInstructions",
+    );
+    assert.equal(
+      (capturedCustomInstructions as string).length,
+      1500,
+      "summarize must see the un-truncated focus",
+    );
+    assert.equal(
+      capturedCustomInstructions,
+      fullFocus,
+      "summarize must see the focus verbatim (no pre-truncation upstream)",
+    );
+
+    // (b) synthetic's args store the truncated copy.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    if (leaf && leaf.type === "message") {
+      const c0 = (
+        leaf.message.content as Array<{
+          type: string;
+          arguments?: { summaryFocus?: string };
+        }>
+      )[0];
+      const stored = c0.arguments?.summaryFocus ?? "";
+      assert.equal(
+        stored,
+        `${"y".repeat(1024)}\u2026 [truncated]`,
+        "synthetic must store the truncated form",
+      );
+    }
+  });
 });
 
 // =============================================================================
@@ -1633,6 +1825,21 @@ describe("dispatch: rewind salvage path", () => {
     // Salvage detail wraps the original: the retry
     // (#2) ALSO threw, so the salvage-failure clause is appended.
     assert.match(msg, /salvage:.*labelEnd retry failed/);
+    // Error.cause carries the original throw verbatim so post-mortem
+    // readers walking the cause chain (or callers doing
+    // `err.cause instanceof TypeError`-style checks) can recover the
+    // original error class + stack. The wrapped string-formatted message
+    // is for the agent; `cause` is for the debugger.
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) {
+      assert.ok(
+        thrown.cause instanceof Error,
+        "thrown.cause must preserve the original Error",
+      );
+      if (thrown.cause instanceof Error) {
+        assert.match(thrown.cause.message, /setLabel boom #1/);
+      }
+    }
     assert.equal(calls, 2, "setLabel was called twice (original + retry)");
     // Synthetic landed on the chain so pi's tool_result will pair correctly.
     const leafId = sm.getLeafId();
@@ -1689,6 +1896,20 @@ describe("dispatch: rewind salvage path", () => {
       !/salvage:/.test(msg),
       `expected no salvage detail when retry succeeds; got: ${msg}`,
     );
+    // Error.cause still preserves the original throw even when the
+    // salvage retry succeeded \u2014 the wrapped Error always carries the
+    // first-failure cause, regardless of whether salvage detail was
+    // appended to the message.
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) {
+      assert.ok(
+        thrown.cause instanceof Error,
+        "thrown.cause must preserve the original Error",
+      );
+      if (thrown.cause instanceof Error) {
+        assert.match(thrown.cause.message, /transient setLabel boom/);
+      }
+    }
     // labelEnd was eventually written, so a chained rewind could find it.
     const summaryLabel = "anchor:end";
     let foundLabelEnd = false;
@@ -1769,6 +1990,20 @@ describe("dispatch: rewind salvage path", () => {
     assert.ok(thrown);
     const msg = thrown instanceof Error ? thrown.message : String(thrown);
     assert.match(msg, /estimate boom/);
+    // Error.cause preserves the original throw from the estimate step
+    // (different from the setLabel-throws cases above) \u2014 pinning that
+    // every salvage-rethrow path attaches `cause`, regardless of which
+    // step (`setLabel` vs `estimate`) failed first.
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) {
+      assert.ok(
+        thrown.cause instanceof Error,
+        "thrown.cause must preserve the original Error",
+      );
+      if (thrown.cause instanceof Error) {
+        assert.match(thrown.cause.message, /estimate boom/);
+      }
+    }
     // Restore so leaf inspection works.
     (
       sm as { buildSessionContext: typeof sm.buildSessionContext }
@@ -2017,6 +2252,92 @@ describe("dispatch: rewind error branches", () => {
       /Already at synthetic boundary \u2014 no work to summarize/,
     );
   });
+
+  it("chained-rewind discriminator: real navigate_tree call with nonzero usage does NOT trip the guard", async () => {
+    // The chained-rewind no-turns guard discriminates THIS extension's
+    // synthetic (zero usage + stopReason: 'toolUse') from a real
+    // navigate_tree assistant turn (nonzero usage from the model call).
+    // False-positive avoidance pin: a single intervening message shaped
+    // like navigate_tree but with nonzero `usage.input`/`output` must
+    // fall through the synthetic-shape check, so the rewind proceeds
+    // normally (summarize is invoked). A regression that simplifies the
+    // discriminator ("just check the toolCall name") would re-classify
+    // this as a synthetic and trip a spurious 'Already at synthetic
+    // boundary' error \u2014 catching that here.
+    let summarizeCalled = false;
+    const spySummarize = (async () => {
+      summarizeCalled = true;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:b");
+
+    // Append a single intervening assistant turn whose lone content
+    // block is a navigate_tree toolCall AND whose usage carries
+    // nonzero input/output \u2014 the shape of a real model-issued
+    // navigate_tree call. The synthetic discriminator must NOT match.
+    sm.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "real-navtree-tc",
+          name: "navigate_tree",
+          arguments: { action: "anchor", name: "impl-start" },
+        },
+      ],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "toolUse",
+      timestamp: Date.now(),
+      usage: {
+        // Nonzero usage \u2014 this is what distinguishes a real model call
+        // from this extension's synthetic (which pins both to 0).
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 150,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const r = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "b",
+        labelEnd: "c",
+        summaryFocus:
+          "Preserve user instructions and continue past the real navigate_tree call.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    // Pin: rewind proceeded (no boundary-guard error), summarize fired.
+    assert.equal(
+      r.isError,
+      undefined,
+      "rewind must NOT trip the synthetic-boundary guard on a real navigate_tree call with nonzero usage",
+    );
+    assert.equal(
+      summarizeCalled,
+      true,
+      "summarize must run when the lone intervening message is a real (nonzero-usage) navigate_tree call",
+    );
+  });
 });
 
 // =============================================================================
@@ -2123,6 +2444,90 @@ describe("installPrepareNextTurn cross-extension preservation", () => {
     assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
     // tools fell back to agent.state.tools — the defensive fill.
     assert.deepEqual(r.context?.tools, ["agent-state-tool"]);
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("partial prior context: missing systemPrompt is filled from agent.state.systemPrompt", async () => {
+    // Symmetric to the tools-fill test above. A foreign wrapper that
+    // returns only `tools` (no systemPrompt) must have systemPrompt
+    // filled from agent.state.systemPrompt by our defensive merge.
+    // Pin: a regression that drops the systemPrompt fallback line
+    // (keeping only the tools fill) would let the next turn's context
+    // ship with `systemPrompt: undefined` and lose the agent's prompt.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = ["agent-state-tool"];
+    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
+    fake.agent.prepareNextTurn = async () => ({
+      // Partial: only tools; no systemPrompt, no messages.
+      context: {
+        tools: ["foreign-tool"],
+      },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pnt = (...args: unknown[]) => Promise<{
+      context?: {
+        systemPrompt?: unknown;
+        tools?: unknown;
+        messages?: unknown;
+      };
+    }>;
+    const fn = fake.agent.prepareNextTurn as Pnt;
+    const r = await fn();
+    // Foreign tools wins (it was set explicitly).
+    assert.deepEqual(r.context?.tools, ["foreign-tool"]);
+    // systemPrompt fell back to agent.state.systemPrompt \u2014 the defensive fill.
+    assert.equal(r.context?.systemPrompt, "AGENT_STATE_PROMPT");
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("explicit-undefined prior context: tools=undefined still falls back to agent.state.tools", async () => {
+    // Regression pin for the merge-order bug: when the prior wrapper
+    // returns `{ context: { systemPrompt: 'X', tools: undefined } }`
+    // (key present, value explicitly undefined), the merged context
+    // must still fall back to `agent.state.tools` rather than
+    // ship `tools: undefined` to pi's loop. The pre-fix shape
+    // (defaults written first, `...priorContext` spread after) silently
+    // re-introduced `undefined` because the trailing spread overwrote
+    // the fallback. Post-fix the spread runs first and the explicit
+    // fallbacks overlay any `undefined` value the spread brought back.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = ["agent-state-tool"];
+    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
+    fake.agent.prepareNextTurn = async () => ({
+      context: {
+        systemPrompt: "FOREIGN_PROMPT",
+        tools: undefined,
+      },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pnt = (...args: unknown[]) => Promise<{
+      context?: {
+        systemPrompt?: unknown;
+        tools?: unknown;
+        messages?: unknown;
+      };
+    }>;
+    const fn = fake.agent.prepareNextTurn as Pnt;
+    const r = await fn();
+    // Foreign systemPrompt wins (set to a real value).
+    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
+    // The critical pin: tools must NOT be undefined \u2014 the explicit
+    // fallback overlays the spread's undefined re-introduction.
+    assert.deepEqual(
+      r.context?.tools,
+      ["agent-state-tool"],
+      "tools=undefined from prior must fall back to agent.state.tools",
+    );
     assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
   });
 

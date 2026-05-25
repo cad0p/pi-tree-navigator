@@ -294,12 +294,22 @@ function installPrepareNextTurn(session: AgentSession): void {
     // API call would lose the agent's tool surface. Defensively fill
     // any missing fields from `agent.state` so the merged context is
     // always complete.
+    //
+    // Merge order matters: the spread runs FIRST so any fields the prior
+    // wrapper returned survive verbatim, then the explicit fallbacks
+    // overlay only `systemPrompt` and `tools` (filling them from
+    // `agent.state` whenever the prior left them as `undefined` — whether
+    // the key was absent or present-but-undefined). `messages` is owned
+    // by this wrapper and always overwrites. The reverse order (defaults
+    // first, spread after) silently re-introduced `undefined` from priors
+    // that explicitly returned `tools: undefined`, since the trailing
+    // spread overwrites the fallback.
     const priorContext = priorResult?.context;
     return {
       context: {
+        ...priorContext,
         systemPrompt: priorContext?.systemPrompt ?? agent.state.systemPrompt,
         tools: priorContext?.tools ?? agent.state.tools,
-        ...priorContext,
         messages: sm.buildSessionContext().messages,
       },
       model: priorResult?.model,
