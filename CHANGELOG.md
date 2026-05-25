@@ -19,6 +19,11 @@ Designed for long autonomous sessions where the agent itself decides when to sum
 <!-- USER-EDITABLE SECTION END -->
 
 
+### 🚀 Features
+
+- Discriminated-union schema makes summaryFocus required at the wire level ([#1](https://github.com/cad0p/pi-tree-navigator/pull/1))
+
+
 ### 🚜 Refactor
 
 - Nest extension under extensions/navigate-tree/ per pi-napkin convention
