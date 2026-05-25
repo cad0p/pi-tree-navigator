@@ -2348,9 +2348,9 @@ describe("dispatch: rewind salvage path", () => {
   });
 
   it("prior-clear (clearPrior) throws once → retry succeeds; new labelEnd lives, prior label is cleared, no salvage detail", async () => {
-    // CORR9-2: the move-on-collision pair is two distinct setLabel
-    // calls. (A) writes the new labelEnd onto the summary; (B) clears
-    // the prior entry's labelEnd. If (A) succeeds and (B) throws, the
+    // The move-on-collision pair is two distinct setLabel calls.
+    // (A) writes the new labelEnd onto the summary; (B) clears the
+    // prior entry's labelEnd. If (A) succeeds and (B) throws, the
     // salvage retry must re-run (B) — not (A) — so the duplicate-label
     // state doesn't survive. Discriminator is `failedStep` (`setLabelEnd`
     // vs `clearPrior`); without the split, the retry would re-run the
