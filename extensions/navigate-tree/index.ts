@@ -881,18 +881,44 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       // don't know whether the prior labelEnd existed, so the safest
       // recovery is to re-throw with the original error after the
       // synthetic lands.
+      //
+      // The two `setLabel` calls are tagged distinctly (`setLabelEnd`
+      // for the new write, `clearPrior` for the move-on-collision
+      // clear) because they fail in different intermediate states and
+      // need different retry targets:
+      //   - `setLabelEnd` failure: the new label never wrote. Retry the
+      //     same `pi.setLabel(summaryId, fullLabelEnd)` (idempotent
+      //     under re-application).
+      //   - `clearPrior` failure: the new label DID write, but the
+      //     prior entry's label was never cleared, leaving two entries
+      //     with `anchor:<labelEnd>` on the active branch (visible in
+      //     `list` output, silently violating the move-on-collision
+      //     invariant). Retry `pi.setLabel(priorLabelEnd, undefined)`
+      //     (also idempotent: clearing an already-cleared label is a
+      //     no-op).
+      // Without this split, a `clearPrior` failure would re-run the
+      // already-succeeded `setLabelEnd` write, succeed silently, and
+      // leave the duplicate-label state with no salvage diagnostic —
+      // the agent gets the original error verbatim and `list` shows
+      // duplicate anchors with no signal that the prior-clear failed.
       const fullLabelEnd = LABEL_PREFIX + p.labelEnd;
       let priorLabelEnd: ReturnType<typeof findLabeledEntry> = null;
       let tokensAtNewLeaf = 0;
       let originalErr: unknown;
       let salvageDetail = "";
-      let failedStep: "lookup" | "setLabel" | "estimate" | null = null;
+      let failedStep:
+        | "lookup"
+        | "setLabelEnd"
+        | "clearPrior"
+        | "estimate"
+        | null = null;
       try {
         failedStep = "lookup";
         priorLabelEnd = findLabeledEntry(sm, fullLabelEnd);
-        failedStep = "setLabel";
+        failedStep = "setLabelEnd";
         pi.setLabel(summaryId, fullLabelEnd);
         if (priorLabelEnd && priorLabelEnd !== summaryId) {
+          failedStep = "clearPrior";
           pi.setLabel(priorLabelEnd, undefined);
         }
 
@@ -904,21 +930,42 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
         failedStep = null;
       } catch (err) {
         originalErr = err;
-        // Best-effort labelEnd retry. setLabel is idempotent under
-        // re-application; if the first call was the failure point and
-        // some transient was the cause, this may succeed. Wrap in its
-        // own try so a second failure can't recurse. Only retry when
-        // setLabel was the failing step — if lookup threw we don't know
-        // whether to retry; if estimate threw, the label already wrote
-        // successfully and a redundant retry would either succeed
-        // silently (wasted work) or, if the second call hits a new
-        // transient, fabricate a misleading "labelEnd retry failed"
-        // diagnostic that hides the real (estimate) failure cause.
-        if (failedStep === "setLabel") {
+        // Best-effort retry per failed step. `pi.setLabel` is idempotent
+        // under re-application (re-applying the same label, or clearing
+        // an already-cleared label, is a no-op), so retrying the
+        // specific step that failed is safe. Wrap each retry in its own
+        // try so a second failure can't recurse.
+        //
+        // Why per-step retry (not a single "retry whatever setLabel
+        // step ran last"):
+        //   - `setLabelEnd` failure: the new labelEnd never wrote;
+        //     retry the same `pi.setLabel(summaryId, fullLabelEnd)`.
+        //   - `clearPrior` failure: the new labelEnd DID write; retry
+        //     the prior-clear `pi.setLabel(priorLabelEnd, undefined)`.
+        //     Conflating these would re-run the already-succeeded
+        //     labelEnd write on a `clearPrior` failure, succeed
+        //     silently, and leave the duplicate-label state with no
+        //     salvage diagnostic.
+        //   - `lookup` threw: we don't know whether the prior labelEnd
+        //     existed, so no retry is safe.
+        //   - `estimate` threw: both setLabel calls already succeeded;
+        //     a redundant labelEnd retry would either succeed silently
+        //     (wasted work) or, if the second call hits a new
+        //     transient, fabricate a misleading "retry failed"
+        //     diagnostic that hides the real (estimate) failure cause.
+        if (failedStep === "setLabelEnd") {
           try {
             pi.setLabel(summaryId, fullLabelEnd);
           } catch (retryErr) {
             salvageDetail = `labelEnd retry failed: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`;
+          }
+        } else if (failedStep === "clearPrior" && priorLabelEnd) {
+          try {
+            pi.setLabel(priorLabelEnd, undefined);
+          } catch (retryErr) {
+            salvageDetail = `prior-clear retry failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
             }`;
           }

@@ -2346,6 +2346,219 @@ describe("dispatch: rewind salvage path", () => {
       }
     }
   });
+
+  it("prior-clear (clearPrior) throws once → retry succeeds; new labelEnd lives, prior label is cleared, no salvage detail", async () => {
+    // CORR9-2: the move-on-collision pair is two distinct setLabel
+    // calls. (A) writes the new labelEnd onto the summary; (B) clears
+    // the prior entry's labelEnd. If (A) succeeds and (B) throws, the
+    // salvage retry must re-run (B) — not (A) — so the duplicate-label
+    // state doesn't survive. Discriminator is `failedStep` (`setLabelEnd`
+    // vs `clearPrior`); without the split, the retry would re-run the
+    // already-succeeded (A) and silently leave both entries labeled.
+    //
+    // Setup mirrors the move-on-collision happy-path test:
+    //   root → tB(anchor:b) → tA(anchor:a) → t3 → leaf
+    // Rewind a→b: branchWithSummary collapses [tA-child … leaf] into
+    // summaryId; (A) writes anchor:b onto summaryId; (B) clears anchor:b
+    // off tB. We arm setLabel to throw on call #2 (B) only — #1 (A)
+    // succeeds, #3 (the salvage retry of B) succeeds.
+    const { sm, pi, tool, ctx } = setup();
+    const tB = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(tB.assistantId, "anchor:b");
+    const tA = appendTurn(sm, "u2", "a2", 200);
+    pi.pi.setLabel(tA.assistantId, "anchor:a");
+    appendTurn(sm, "u3", "a3", 300);
+
+    // Patch AFTER the pre-anchor writes so the counter starts at 0.
+    // Call #1 inside execute = (A) the new labelEnd write; call #2 = (B)
+    // the prior-clear (throws once); call #3 = the salvage retry of (B)
+    // (succeeds).
+    throwOnNthSetLabel(pi, 2, new Error("transient prior-clear boom"));
+
+    let thrown: unknown;
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "a",
+          labelEnd: "b",
+          summaryFocus:
+            "Preserve the user's instruction and continue the work.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown, "rewind should re-throw the original (B) error");
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    assert.match(msg, /transient prior-clear boom/);
+    // Retry succeeded — no salvage detail.
+    assert.ok(
+      !/salvage:/.test(msg),
+      `expected no salvage detail when prior-clear retry succeeds; got: ${msg}`,
+    );
+    // Error.cause preserves the original (B) throw.
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) {
+      assert.ok(
+        thrown.cause instanceof Error,
+        "thrown.cause must preserve the original (B) Error",
+      );
+      if (thrown.cause instanceof Error) {
+        assert.match(thrown.cause.message, /transient prior-clear boom/);
+      }
+    }
+    // (A) wrote successfully on the first call: anchor:b lives on the
+    // new summary entry (the leaf-side synthetic's parent).
+    let summaryWithLabelEnd: string | null = null;
+    for (const e of sm.getBranch()) {
+      if (e.type === "branch_summary" && sm.getLabel(e.id) === "anchor:b") {
+        summaryWithLabelEnd = e.id;
+        break;
+      }
+    }
+    assert.ok(
+      summaryWithLabelEnd,
+      "the new branch_summary must carry anchor:b (call #1 succeeded)",
+    );
+    // (B) RETRY succeeded: the prior tB lost its label. Without the
+    // discriminant split, the retry would re-run (A) instead, leaving
+    // tB still labeled — anchor:b would resolve to two entries.
+    assert.notEqual(
+      sm.getLabel(tB.assistantId),
+      "anchor:b",
+      "prior anchor:b must be cleared by the salvage retry of (B)",
+    );
+    // findLabeledEntry resolves anchor:b uniquely to the new summary.
+    assert.equal(
+      __testHooks.findLabeledEntry(sm, "anchor:b"),
+      summaryWithLabelEnd,
+      "anchor:b must resolve uniquely to the new summary post-salvage",
+    );
+    // Synthetic landed on the chain so pi's tool_result will pair correctly.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf && leaf.type === "message") {
+      assert.equal(leaf.message.role, "assistant");
+      const c0 = (
+        leaf.message.content as Array<{ type: string; id?: string }>
+      )[0];
+      assert.equal(c0.type, "toolCall");
+      assert.equal(c0.id, "tc-rewind");
+    }
+  });
+
+  it("prior-clear (clearPrior) throws on every call → salvage detail surfaces 'prior-clear retry failed'; new labelEnd still lives", async () => {
+    // Sister test to the retry-succeeds case above: when BOTH the
+    // original (B) prior-clear AND the salvage retry of (B) throw,
+    // the wrapped error must surface a salvage detail that names the
+    // prior-clear (NOT "labelEnd retry failed" — that diagnostic is
+    // for the (A) failure mode and would be misleading here). This
+    // pins the salvage-detail prose introduced by the failedStep
+    // split: a regression that re-conflated the discriminants would
+    // either retry (A) (silently succeeding, no detail) or surface
+    // the wrong salvage-detail string.
+    const { sm, pi, tool, ctx } = setup();
+    const tB = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(tB.assistantId, "anchor:b");
+    const tA = appendTurn(sm, "u2", "a2", 200);
+    pi.pi.setLabel(tA.assistantId, "anchor:a");
+    appendTurn(sm, "u3", "a3", 300);
+
+    // Patch after pre-anchors. Throw on call #2 onward (B and the
+    // retry of B). Call #1 (A) succeeds.
+    let calls = 0;
+    const origSetLabel = pi.pi.setLabel.bind(pi.pi);
+    (pi.pi as { setLabel: typeof pi.pi.setLabel }).setLabel = (
+      entryId: string,
+      label: string | undefined,
+    ) => {
+      calls++;
+      if (calls >= 2) throw new Error(`prior-clear boom #${calls}`);
+      return origSetLabel(entryId, label);
+    };
+
+    let thrown: unknown;
+    try {
+      await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "a",
+          labelEnd: "b",
+          summaryFocus:
+            "Preserve the user's instruction and continue the work.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown);
+    const msg = thrown instanceof Error ? thrown.message : String(thrown);
+    // Original (B) error propagates verbatim as the base.
+    assert.match(msg, /prior-clear boom #2/);
+    // Salvage detail names the prior-clear, NOT the labelEnd retry.
+    // Tight on both sides: the correct diagnostic must be present, and
+    // the wrong (labelEnd-retry) diagnostic must NOT be present.
+    assert.match(msg, /salvage:.*prior-clear retry failed/);
+    assert.ok(
+      !/labelEnd retry failed/.test(msg),
+      `prior-clear failure must not surface a labelEnd-retry diagnostic; got: ${msg}`,
+    );
+    // Three setLabel calls fired: (A), original (B), retry of (B).
+    assert.equal(
+      calls,
+      3,
+      "setLabel was called three times: (A) write + (B) original + (B) retry",
+    );
+    // Error.cause preserves the original (B) throw.
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) {
+      assert.ok(
+        thrown.cause instanceof Error,
+        "thrown.cause must preserve the original (B) Error",
+      );
+      if (thrown.cause instanceof Error) {
+        assert.match(thrown.cause.message, /prior-clear boom #2/);
+      }
+    }
+    // (A) succeeded: the new summary still carries anchor:b. Even when
+    // the prior-clear permanently fails, the new write survives so
+    // single-call navigation still resolves correctly via
+    // findLabeledEntry's leaf→root walk.
+    let summaryWithLabelEnd: string | null = null;
+    for (const e of sm.getBranch()) {
+      if (e.type === "branch_summary" && sm.getLabel(e.id) === "anchor:b") {
+        summaryWithLabelEnd = e.id;
+        break;
+      }
+    }
+    assert.ok(
+      summaryWithLabelEnd,
+      "the new branch_summary must carry anchor:b (call #1 succeeded before (B) threw)",
+    );
+    // Synthetic landed.
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf?.type === "message" && leaf.message.role === "assistant") {
+      const c0 = (
+        leaf.message.content as Array<{ type: string; id?: string }>
+      )[0];
+      assert.equal(c0.type, "toolCall");
+      assert.equal(c0.id, "tc-rewind");
+    }
+  });
 });
 
 // =============================================================================
