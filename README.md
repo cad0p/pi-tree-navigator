@@ -6,28 +6,31 @@ Lets a pi agent anchor named milestones in its own conversation, then collapse w
 
 ## Install
 
+Stable npm release:
+
+```bash
+pi install npm:@cad0p/pi-tree-navigator
+```
+
+Pre-release npm snapshots from `main` are published with the `next` dist-tag:
+
+```bash
+pi install npm:@cad0p/pi-tree-navigator@next
+```
+
+You can also install directly from the git source when testing unreleased branches:
+
 ```bash
 pi install git:github.com/cad0p/pi-tree-navigator
 ```
 
-> **Status:** v0.1.0 is not yet on the npm registry (pending OIDC trusted-publisher setup). Install from the git source for now.
+## Publishing
 
-<details>
-<summary>Once published / pre-release installs</summary>
+This repo uses [`cad0p/semver-calver-release`](https://github.com/cad0p/semver-calver-release)'s npm-package workflow:
 
-- Stable (once published to npm):
-
-  ```bash
-  pi install npm:@cad0p/pi-tree-navigator
-  ```
-
-- Pre-release (calver snapshots from `main`, published to npm `@next` on every push):
-
-  ```bash
-  pi install npm:@cad0p/pi-tree-navigator@next
-  ```
-
-</details>
+- Pushes to `main` compute the next hybrid SemVer + CalVer version, tag a GitHub prerelease, and publish to npm with the `next` dist-tag.
+- Curated release PRs from `release/from-v*` branches bump the base `package.json` version and publish stable npm releases.
+- npm publishing uses GitHub OIDC / npm trusted publishing via `.github/workflows/release.yml` (`id-token: write`) and `publishConfig.access: public`.
 
 ### Requirements
 
