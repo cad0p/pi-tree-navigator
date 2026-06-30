@@ -1,7 +1,7 @@
 /**
  * Tests for navigate-tree dispatch + reflection bootstrap.
  *
- * Bun test runner. Run with: bun test
+ * Node test runner. Run with: pnpm test
  *
  * The pi extension loader treats `./index.ts` as the entry point and ignores
  * sibling files \u2014 so this test file is not loaded as a separate extension.
@@ -19,8 +19,8 @@
  *     no real LLM call fires during rewind tests.
  */
 
-import { afterEach, describe, it } from "bun:test";
 import * as assert from "node:assert/strict";
+import { afterEach, describe, it } from "node:test";
 import {
   type AgentSession,
   type ExtensionAPI,
