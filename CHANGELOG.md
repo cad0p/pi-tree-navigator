@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- Discriminated-union schema makes summaryFocus required at the wire level ([#1](https://github.com/cad0p/pi-tree-navigator/pull/1))
+
+### 🐛 Bug Fixes
+
+- Revert discriminated-union parameters — Kiro rejects non-object root schemas ([#2](https://github.com/cad0p/pi-tree-navigator/pull/2))
+
+### 🚜 Refactor
+
+- Nest extension under extensions/navigate-tree/ per pi-napkin convention
+
+### 📚 Documentation
+
+- Promote npm install and publishing ([#4](https://github.com/cad0p/pi-tree-navigator/pull/4))
+
+### ⚙️ Miscellaneous Tasks
+
+- Release-grade cleanup for v0.1.0 ([#3](https://github.com/cad0p/pi-tree-navigator/pull/3))
+
+
 ## [0.1.0] - 2026-05-25
 
 <!-- USER-EDITABLE SECTION START -->
