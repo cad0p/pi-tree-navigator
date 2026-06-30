@@ -1,14 +1,14 @@
 /**
  * Tests for navigate-tree pure helpers.
  *
- * Bun test runner (project-pinned to bun). Run with: bun test
+ * Node test runner. Run with: pnpm test
  *
  * The pi extension loader treats `./index.ts` as the entry point and ignores
  * sibling files — so this test file is not loaded as a separate extension.
  */
 
-import { describe, it } from "bun:test";
 import * as assert from "node:assert/strict";
+import { describe, it } from "node:test";
 import {
   extractTextContent,
   formatContextDelta,
