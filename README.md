@@ -39,7 +39,7 @@ This repo uses [`cad0p/semver-calver-release`](https://github.com/cad0p/semver-c
   - `@earendil-works/pi-coding-agent >=0.74.0`
   - `@earendil-works/pi-agent-core >=0.74.0`
   - `typebox ^1.0.0` (used to declare the tool's parameter schema; bundled with pi but listed explicitly so a standalone install resolves correctly).
-- The reflection bootstrap depends on five plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. Verified against pi 0.75.x.
+- The reflection bootstrap depends on six plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, `agent.prepareNextTurn` (pi ≤0.80.2), and `agent.prepareNextTurnWithContext` (preferred by pi ≥0.80.3). Verified against pi 0.75.5 and pi 0.83.0.
 
 ## What you get
 
@@ -93,7 +93,7 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 ## Limitations
 
-- **Brittle to pi version bumps.** The fix uses five independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurn`. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
+- **Brittle to pi version bumps.** The fix uses six independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, `agent.prepareNextTurn`, and `agent.prepareNextTurnWithContext`. This is not hypothetical: pi 0.80.3 added `prepareNextTurnWithContext` and made the loop prefer it, silently dead-ending the `prepareNextTurn`-only hook until v0.1.1. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 
@@ -110,13 +110,13 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 ## Development
 
 ```bash
-bun install
-bun test          # helpers + dispatch / reflection bootstrap / salvage path
-bunx biome check extensions/
-bunx tsc --noEmit
+pnpm install
+pnpm test          # helpers + dispatch / reflection bootstrap / salvage path
+pnpm run lint      # biome check extensions/
+pnpm run typecheck # tsc --noEmit
 ```
 
-Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against pi 0.75.x is recommended for any pi version bump (the reflection bootstrap depends on internal field shapes).
+Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against the current pi release (0.83.x at time of writing) is recommended for any pi version bump (the reflection bootstrap depends on internal field shapes).
 
 ## License
 
