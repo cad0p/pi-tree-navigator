@@ -1,6 +1,6 @@
 {
   "name": "@cad0p/pi-tree-navigator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "agent-callable session tree navigation for pi: anchor named milestones, rewind work into a branch summary, free up context for long autonomous sessions",
   "publishConfig": {
     "access": "public",
