@@ -229,6 +229,7 @@ interface FakeAgentSession {
   agent: {
     state: { systemPrompt: string; messages: unknown[]; tools: unknown[] };
     prepareNextTurn?: unknown;
+    prepareNextTurnWithContext?: unknown;
   };
 }
 
@@ -238,6 +239,7 @@ function makeFakeSession(sm: SessionManager): FakeAgentSession {
     agent: {
       state: { systemPrompt: "S", messages: [], tools: [] },
       prepareNextTurn: undefined,
+      prepareNextTurnWithContext: undefined,
     },
   };
 }
@@ -1530,6 +1532,363 @@ describe("installPrepareNextTurn", () => {
     // The new wrapper's __prior is undefined: we recovered after1's
     // own __prior (which was undefined), not after1 itself.
     assert.equal(after2.__prior, undefined);
+  });
+});
+
+// =============================================================================
+// installPrepareNextTurn — prepareNextTurnWithContext path (pi ≥0.80.3)
+//
+// Since pi-coding-agent 0.80.3, AgentSession's constructor installs its own
+// `agent.prepareNextTurnWithContext` (`_installAgentNextTurnRefresh`) and
+// pi-agent-core's `createLoopConfig` prefers it over `prepareNextTurn`:
+//
+//   prepareNextTurn: this.prepareNextTurnWithContext || this.prepareNextTurn
+//     ? async (context) => {
+//         if (this.prepareNextTurnWithContext) {
+//           return await this.prepareNextTurnWithContext(context, this.signal);
+//         }
+//         return await this.prepareNextTurn?.(this.signal);
+//       } : undefined,
+//
+// Pi's own wrapper refreshes systemPrompt/tools/model/thinkingLevel but
+// leaves `messages` stale — so our in-loop refresh must live on the
+// WithContext field on new pi. These tests pin that wrapper; a regression
+// here re-opens the "footer % and wire context stay pre-rewind for the
+// rest of the loop" bug.
+// =============================================================================
+
+describe("installPrepareNextTurn — prepareNextTurnWithContext (pi ≥0.80.3)", () => {
+  it("installs wrappers on BOTH hook fields in one call", () => {
+    // One install must cover both eras: old pi reads prepareNextTurn,
+    // new pi prefers prepareNextTurnWithContext. Installing the
+    // WithContext wrapper unconditionally is harmless on old pi (the
+    // field is never read there).
+    const sm = SessionManager.inMemory("/tmp");
+    const fake = makeFakeSession(sm);
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    assert.equal(typeof fake.agent.prepareNextTurn, "function");
+    assert.equal(typeof fake.agent.prepareNextTurnWithContext, "function");
+    const markedWc = fake.agent.prepareNextTurnWithContext as Record<
+      symbol,
+      unknown
+    >;
+    assert.equal(markedWc[__testHooks.PNTWC_MARKER], true);
+  });
+
+  it("basic: returns a context whose messages match buildSessionContext()", async () => {
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    const fn = fake.agent.prepareNextTurnWithContext as (
+      turn?: unknown,
+      signal?: AbortSignal,
+    ) => Promise<{ context?: { messages: unknown[] } }>;
+    const result = await fn({ context: {} });
+    assert.deepEqual(
+      result.context?.messages,
+      sm.buildSessionContext().messages,
+    );
+  });
+
+  it("chains pi's own _installAgentNextTurnRefresh-style prior: its per-turn refreshes survive, messages overridden", async () => {
+    // Replicates pi 0.83.0's own wrapper shape: returns prior context
+    // fields + refreshed systemPrompt/tools/model/thinkingLevel, with
+    // STALE messages (turn.context.messages). Our wrapper must keep all
+    // of pi's refreshes and override only `messages`.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    let priorRan = false;
+    // Pi-style prior: (turn, signal) => snapshot.
+    fake.agent.prepareNextTurnWithContext = async (turn: {
+      context?: Record<string, unknown>;
+    }) => {
+      priorRan = true;
+      const previousContext = turn?.context;
+      return {
+        context: {
+          ...previousContext,
+          systemPrompt: "PI_REFRESHED_PROMPT",
+          tools: ["pi-refreshed-tool"],
+          // stale messages, as pi leaves them:
+          messages: [{ role: "user", content: "STALE" }],
+        },
+        model: "pi-state-model",
+        thinkingLevel: "high",
+      };
+    };
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pntwc = (...args: unknown[]) => Promise<{
+      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
+      model?: unknown;
+      thinkingLevel?: unknown;
+    }>;
+    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
+    const r = await fn(
+      { context: { messages: [] } },
+      new AbortController().signal,
+    );
+    assert.equal(priorRan, true);
+    // pi's per-turn refreshes propagate.
+    assert.equal(r.context?.systemPrompt, "PI_REFRESHED_PROMPT");
+    assert.deepEqual(r.context?.tools, ["pi-refreshed-tool"]);
+    assert.equal(r.model, "pi-state-model");
+    assert.equal(r.thinkingLevel, "high");
+    // messages is overridden from the session tree — NOT pi's stale ones.
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("no prior: falls back to the turn's live context for systemPrompt/tools (mirrors pi's own wrapper)", async () => {
+    // Pi's own wrapper does `previousSnapshot?.context ?? turn.context`.
+    // If our wrapper is ever installed without a prior (e.g. a future pi
+    // that reads the field but doesn't pre-install its own), dropping
+    // the turn context would blank systemPrompt/tools for the next LLM
+    // call. Pin the fallback.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pntwc = (...args: unknown[]) => Promise<{
+      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
+    }>;
+    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
+    const turn = {
+      message: { role: "assistant" },
+      toolResults: [],
+      context: {
+        systemPrompt: "TURN_PROMPT",
+        tools: ["turn-tool"],
+        messages: [{ role: "user", content: "STALE" }],
+      },
+      newMessages: [],
+    };
+    const r = await fn(turn, new AbortController().signal);
+    assert.equal(r.context?.systemPrompt, "TURN_PROMPT");
+    assert.deepEqual(r.context?.tools, ["turn-tool"]);
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("partial prior context: missing tools is filled from agent.state.tools", async () => {
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = ["agent-state-tool"];
+    fake.agent.prepareNextTurnWithContext = async () => ({
+      context: { systemPrompt: "FOREIGN_PROMPT" },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pntwc = (...args: unknown[]) => Promise<{
+      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
+    }>;
+    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
+    const r = await fn({ context: {} });
+    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
+    assert.deepEqual(r.context?.tools, ["agent-state-tool"]);
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("re-install (/reload) unwraps __prior on the WithContext field; pi's own wrapper runs exactly once", async () => {
+    // Mirror of the prepareNextTurn /reload test: pi's own wrapper is
+    // the "foreign" hook here. Two installs (load + /reload) must not
+    // strand it (wrap B capturing wrap A) nor double-chain it.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    let piPriorRan = 0;
+    fake.agent.prepareNextTurnWithContext = async () => {
+      piPriorRan++;
+      return { model: "pi-state-model" };
+    };
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    const after1 = fake.agent.prepareNextTurnWithContext;
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    const after2 = fake.agent.prepareNextTurnWithContext as Record<
+      string | symbol,
+      unknown
+    >;
+    assert.notEqual(after2, after1);
+    type Pntwc = (...args: unknown[]) => Promise<{
+      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
+      model?: unknown;
+      thinkingLevel?: unknown;
+    }>;
+    const r = await (after2 as unknown as Pntwc)({ context: {} });
+    assert.equal(piPriorRan, 1);
+    assert.equal(r.model, "pi-state-model");
+    // after2's __prior is pi's own wrapper, NOT after1 (no self-capture).
+    assert.equal(typeof after2.__prior, "function");
+    assert.notEqual(after2.__prior, after1);
+  });
+
+  it("partial prior context: missing systemPrompt is filled from agent.state.systemPrompt", async () => {
+    // Symmetric to the tools-fill test above (and to the prepareNextTurn
+    // twin). A foreign WithContext wrapper that returns only `tools`
+    // must have systemPrompt filled from agent.state.systemPrompt.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
+    fake.agent.prepareNextTurnWithContext = async () => ({
+      context: { tools: ["foreign-tool"] },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pntwc = (...args: unknown[]) => Promise<{
+      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
+    }>;
+    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
+    const r = await fn({ context: {} });
+    assert.deepEqual(r.context?.tools, ["foreign-tool"]);
+    assert.equal(r.context?.systemPrompt, "AGENT_STATE_PROMPT");
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("explicit-undefined prior context: tools=undefined still falls back to agent.state.tools", async () => {
+    // Regression pin mirroring the prepareNextTurn twin: when the prior
+    // returns `{ context: { systemPrompt: 'X', tools: undefined } }`
+    // (key present, value explicitly undefined), the merged context
+    // must still fall back to `agent.state.tools`. The spread-first /
+    // fallback-overlay order is what protects this; flipping it would
+    // ship `tools: undefined` to pi's loop.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = ["agent-state-tool"];
+    fake.agent.prepareNextTurnWithContext = async () => ({
+      context: {
+        systemPrompt: "FOREIGN_PROMPT",
+        tools: undefined,
+      },
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pntwc = (...args: unknown[]) => Promise<{
+      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
+    }>;
+    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
+    const r = await fn({ context: {} });
+    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
+    assert.deepEqual(
+      r.context?.tools,
+      ["agent-state-tool"],
+      "tools=undefined from prior must fall back to agent.state.tools",
+    );
+    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+  });
+
+  it("prior throwing in prepareNextTurnWithContext: error propagates verbatim (no swallow)", async () => {
+    // Mirror of the prepareNextTurn twin: a throwing prior (pi's own
+    // wrapper or a foreign extension) must surface at the pi loop
+    // boundary, not be swallowed behind our context-refresh.
+    const sm = SessionManager.inMemory("/tmp");
+    const fake = makeFakeSession(sm);
+    fake.agent.prepareNextTurnWithContext = async () => {
+      throw new Error("foreign boom");
+    };
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    type Pntwc = (...args: unknown[]) => Promise<unknown>;
+    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
+    let thrown: unknown;
+    try {
+      await fn({ context: {} });
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof Error);
+    if (thrown instanceof Error) assert.equal(thrown.message, "foreign boom");
+  });
+
+  it("end-to-end through pi's createLoopConfig preference: WithContext wins and carries the refreshed messages", async () => {
+    // Simulate pi ≥0.80.3's Agent.createLoopConfig bridge verbatim: it
+    // prefers prepareNextTurnWithContext whenever set (always, since
+    // pi's constructor installs one) and only falls back to
+    // prepareNextTurn otherwise. The regression this guards: a fix that
+    // only refreshes messages in the prepareNextTurn wrapper is dead
+    // code on pi ≥0.80.3.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "hi" }],
+    } as never);
+    const fake = makeFakeSession(sm);
+    // Pi's constructor-time own wrapper (the reason the gate always
+    // prefers the WithContext field).
+    fake.agent.prepareNextTurnWithContext = async (turn: {
+      context?: Record<string, unknown>;
+    }) => ({
+      context: {
+        ...turn?.context,
+        systemPrompt: "PI_REFRESHED_PROMPT",
+        tools: ["pi-tool"],
+      },
+      model: "pi-model",
+      thinkingLevel: "high",
+    });
+    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
+    const agent = fake.agent as {
+      prepareNextTurn?: (signal?: AbortSignal) => Promise<unknown>;
+      prepareNextTurnWithContext?: (
+        turn: unknown,
+        signal?: AbortSignal,
+      ) => Promise<{ context?: { messages?: unknown[] } }>;
+    };
+    // Verbatim bridge shape from pi-agent-core 0.83.0 createLoopConfig.
+    const signal = new AbortController().signal;
+    const bridge =
+      agent.prepareNextTurnWithContext || agent.prepareNextTurn
+        ? async (context: unknown) => {
+            if (agent.prepareNextTurnWithContext) {
+              return await agent.prepareNextTurnWithContext(context, signal);
+            }
+            return (await agent.prepareNextTurn?.(signal)) as {
+              context?: { messages?: unknown[] };
+            };
+          }
+        : undefined;
+    assert.ok(bridge, "bridge must be installed when either field is set");
+    const snapshot = await bridge({
+      context: { messages: [{ role: "user", content: "STALE" }] },
+    });
+    // The whole point: messages come from the session tree, not the
+    // loop's stale array.
+    assert.deepEqual(
+      snapshot?.context?.messages,
+      sm.buildSessionContext().messages,
+    );
+    // And pi's own per-turn refreshes survive the bridge end-to-end
+    // (not just in the isolated chaining test above): the loop reads
+    // these straight off the snapshot, so dropping them here would
+    // revert the system prompt / tool set / model / thinking level
+    // to prompt-start values on every turn after a rewind.
+    const full = snapshot as {
+      context?: { systemPrompt?: unknown; tools?: unknown };
+      model?: unknown;
+      thinkingLevel?: unknown;
+    };
+    assert.equal(full.context?.systemPrompt, "PI_REFRESHED_PROMPT");
+    assert.deepEqual(full.context?.tools, ["pi-tool"]);
+    assert.equal(full.model, "pi-model");
+    assert.equal(full.thinkingLevel, "high");
   });
 });
 

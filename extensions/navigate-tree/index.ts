@@ -22,18 +22,20 @@
  *   this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
  *
  * Risks of the reflection approach:
- *   • If pi switches any of the five fields this extension reads —
+ *   • If pi switches any of the six fields this extension reads —
  *     `AgentSession.prototype.prompt`, `agent.state.messages`,
- *     `agent.state.systemPrompt`, `agent.state.tools`, or
- *     `agent.prepareNextTurn` — to ES `#` private fields, this breaks
- *     fundamentally.
+ *     `agent.state.systemPrompt`, `agent.state.tools`,
+ *     `agent.prepareNextTurn`, or `agent.prepareNextTurnWithContext` —
+ *     to ES `#` private fields, this breaks fundamentally.
  *   • If pi renames or restructures any of these fields, this breaks.
  *   • Patches `AgentSession.prototype.prompt` globally on import; not
  *     reversible without a process restart; affects every session in
  *     the pi process, including sessions that never call
  *     `navigate_tree`.
  *
- * Verified against pi 0.75.5.
+ * Verified against pi 0.75.5 (`prepareNextTurn` path) and pi 0.83.0
+ * (`prepareNextTurnWithContext` path — required since pi 0.80.3, see
+ * `installPrepareNextTurn`).
  */
 
 import { estimateContextTokens } from "@earendil-works/pi-agent-core";
@@ -116,6 +118,7 @@ const LIST_PCT_COL_WIDTH = 5;
 // hint column visible without truncating common names.
 const LIST_LABEL_COL_WIDTH = 28;
 const PNT_MARKER = Symbol.for("navigate-tree.pnt-installed");
+const PNTWC_MARKER = Symbol.for("navigate-tree.pntwc-installed");
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
 // Two warnings: list-site (read-only path; warns about the next turn's
@@ -144,6 +147,10 @@ interface PiInternals {
       tools: unknown[];
     };
     prepareNextTurn?: unknown;
+    // Preferred over `prepareNextTurn` by `Agent.createLoopConfig`
+    // when set; pi's own AgentSession always sets it (via
+    // `_installAgentNextTurnRefresh`) since pi-coding-agent 0.80.3.
+    prepareNextTurnWithContext?: unknown;
   };
   sessionManager: SessionManager;
 }
@@ -163,14 +170,22 @@ type PntResult = {
   thinkingLevel?: unknown;
 };
 // pi 0.75.5 invokes `agent.prepareNextTurn(signal)` from
-// `Agent.createLoopConfig` — a single AbortSignal argument. This differs
-// from the documented `AgentLoopConfig.prepareNextTurn(context: PrepareNextTurnContext)`
-// shape, which `Agent` is bridging. We accept whatever pi passes and forward
-// it verbatim to the prior wrapper so we don't fight a future signature
-// alignment. Verified against pi-coding-agent 0.75.5; revisit if the call
-// site changes.
+// `Agent.createLoopConfig` — a single AbortSignal argument. Since pi
+// 0.80.3 the loop instead invokes
+// `agent.prepareNextTurnWithContext(nextTurnContext, signal)` (and only
+// falls back to `prepareNextTurn` when the WithContext field is unset).
+// Both differ from the documented
+// `AgentLoopConfig.prepareNextTurn(context: PrepareNextTurnContext)`
+// shape, which `Agent` is bridging. We accept whatever pi passes and
+// forward it verbatim to the prior wrapper so we don't fight a future
+// signature alignment. Verified against pi-coding-agent 0.75.5 and
+// 0.83.0; revisit if the call site changes.
 type PntFn = (...args: unknown[]) => Promise<PntResult> | PntResult;
-type MarkedPntFn = PntFn & { [PNT_MARKER]?: boolean; __prior?: PntFn };
+type MarkedPntFn = PntFn & {
+  [PNT_MARKER]?: boolean;
+  [PNTWC_MARKER]?: boolean;
+  __prior?: PntFn;
+};
 
 // =============================================================================
 // Reflection bootstrap & in-loop refresh
@@ -218,17 +233,32 @@ function patchAgentSessionPrototype(): void {
 }
 
 /**
- * Wire `agent.prepareNextTurn` so the in-flight agent loop refreshes its
- * context from sessionManager between turns within the same prompt() call.
- * Without this, the loop snapshots agent.state.messages once at prompt start
- * and pushes new messages onto its own array — a rewind issued mid-loop
- * doesn't reduce the next API call's size until the user sends a new prompt.
+ * Wire the in-flight agent loop to refresh its context from sessionManager
+ * between turns within the same prompt() call. Without this, the loop
+ * snapshots agent.state.messages once at prompt start and pushes new
+ * messages onto its own array — a rewind issued mid-loop doesn't reduce
+ * the next API call's size until the user sends a new prompt.
  *
- * The Agent class's `createLoopConfig` dereferences `this.prepareNextTurn`
- * at the closure call site, so the value here is read at every turn boundary.
- * But it gates the closure on `this.prepareNextTurn` being truthy at config
- * creation — so we have to set this BEFORE prompt() runs, hence wiring it
- * from inside the prompt patch.
+ * Two hook fields, by pi version:
+ *   • pi ≤0.80.2: `Agent.createLoopConfig` reads `agent.prepareNextTurn`.
+ *   • pi ≥0.80.3: AgentSession's constructor installs its own
+ *     `agent.prepareNextTurnWithContext` (`_installAgentNextTurnRefresh`),
+ *     and `createLoopConfig` prefers that field over `prepareNextTurn`.
+ *     Pi's wrapper refreshes systemPrompt/tools/model/thinkingLevel per
+ *     turn but leaves `messages` stale — so wrapping only
+ *     `prepareNextTurn` silently dead-ends (footer % and the wire context
+ *     stay pre-rewind for the rest of the loop).
+ *
+ * We install on BOTH fields, each with the same marker/__prior chaining
+ * discipline: on new pi the WithContext wrapper chains pi's own (keeping
+ * its per-turn refreshes) and overrides only `messages`; on old pi the
+ * WithContext field is never read and `prepareNextTurn` does the work.
+ *
+ * The Agent class's `createLoopConfig` dereferences both fields at the
+ * closure call site, so the values here are read at every turn boundary.
+ * But it gates the closure on either field being truthy at config
+ * creation — so we have to set this BEFORE prompt() runs, hence wiring
+ * it from inside the prompt patch.
  */
 function installPrepareNextTurn(session: AgentSession): void {
   const internals = asInternals(session);
@@ -237,15 +267,22 @@ function installPrepareNextTurn(session: AgentSession): void {
 
   const sm = internals.sessionManager;
 
-  // If the existing prepareNextTurn was installed by a previous load of THIS
-  // extension, recover the chain it captured (its `__prior`) so we don't
-  // strand other extensions' closures across /reload. Preserve any other
-  // extension's prepareNextTurn so we compose with them.
+  // If the existing hooks were installed by a previous load of THIS
+  // extension, recover the chains they captured (their `__prior`) so we
+  // don't strand other extensions' closures across /reload. Preserve any
+  // other extension's (or pi's own) hooks so we compose with them.
   const existing = agent.prepareNextTurn as MarkedPntFn | undefined;
   const prior: PntFn | undefined =
     typeof existing === "function" && existing[PNT_MARKER]
       ? existing.__prior
       : (existing as PntFn | undefined);
+  const existingWc = agent.prepareNextTurnWithContext as
+    | MarkedPntFn
+    | undefined;
+  const priorWc: PntFn | undefined =
+    typeof existingWc === "function" && existingWc[PNTWC_MARKER]
+      ? existingWc.__prior
+      : (existingWc as PntFn | undefined);
 
   const next: MarkedPntFn = async (...args: unknown[]) => {
     let priorResult: PntResult | undefined;
@@ -273,6 +310,40 @@ function installPrepareNextTurn(session: AgentSession): void {
   next[PNT_MARKER] = true;
   next.__prior = prior;
   agent.prepareNextTurn = next;
+
+  const nextWc: MarkedPntFn = async (...args: unknown[]) => {
+    // On pi ≥0.80.3 the loop calls this as (nextTurnContext, signal),
+    // where nextTurnContext = { message, toolResults, context,
+    // newMessages }. Forward args verbatim to the prior (pi's own
+    // wrapper expects exactly this shape).
+    const turn = args[0] as { context?: PntResult["context"] } | undefined;
+    let priorResult: PntResult | undefined;
+    if (typeof priorWc === "function") {
+      priorResult = await priorWc(...args);
+    }
+    // Same wholesale-replacement rationale as the prepareNextTurn
+    // wrapper above. When no prior result exists, fall back to the
+    // turn's live context (mirrors pi's own wrapper, which does
+    // `previousSnapshot?.context ?? turn.context`) so systemPrompt and
+    // tools are never dropped. `messages` is owned by this wrapper —
+    // this override is the entire point of the hook on pi ≥0.80.3, whose
+    // own wrapper refreshes every other field but leaves messages stale.
+    const priorContext = priorResult?.context ?? turn?.context;
+    return {
+      ...priorResult,
+      context: {
+        ...priorContext,
+        systemPrompt: priorContext?.systemPrompt ?? agent.state.systemPrompt,
+        tools: priorContext?.tools ?? agent.state.tools,
+        messages: sm.buildSessionContext().messages,
+      },
+      model: priorResult?.model,
+      thinkingLevel: priorResult?.thinkingLevel,
+    };
+  };
+  nextWc[PNTWC_MARKER] = true;
+  nextWc.__prior = priorWc;
+  agent.prepareNextTurnWithContext = nextWc;
 }
 
 function findOwningSession(sm: SessionManager): AgentSession | null {
@@ -934,8 +1005,11 @@ export const __testHooks = {
   installPrepareNextTurn,
   refreshAgentMessages,
   captureSession,
-  /** Symbol used to mark the wrapper installed by `installPrepareNextTurn`. */
+  /** Symbols used to mark the wrappers installed by `installPrepareNextTurn`
+   * (`PNT_MARKER` on `agent.prepareNextTurn`, `PNTWC_MARKER` on
+   * `agent.prepareNextTurnWithContext` — the field pi ≥0.80.3 prefers). */
   PNT_MARKER,
+  PNTWC_MARKER,
   /** Read-only view of captured-session ref count for reaping assertions. */
   sessionRefCount(): number {
     return sessionInstances.length;
