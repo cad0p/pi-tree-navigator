@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 📚 Documentation
+
+- Update reflection field count/versions and dev commands for v0.1.1 reality ([#9](https://github.com/cad0p/pi-tree-navigator/pull/9))
+- Port AGENTS.md bootstrap instructions from pi-napkin ([#11](https://github.com/cad0p/pi-tree-navigator/pull/11))
+
+
 ## [0.1.1] - 2026-07-31
 
 <!-- USER-EDITABLE SECTION START -->
