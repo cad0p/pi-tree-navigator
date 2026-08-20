@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(ci)* Daily pi-upstream reflection probe (closes #17)
+
+
 ## [0.1.2] - 2026-08-20
 
 <!-- USER-EDITABLE SECTION START -->
