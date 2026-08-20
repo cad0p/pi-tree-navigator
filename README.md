@@ -34,12 +34,12 @@ This repo uses [`cad0p/semver-calver-release`](https://github.com/cad0p/semver-c
 
 ### Requirements
 
-- **pi 0.74+** with at least one model provider configured.
+- **pi 0.81+** with at least one model provider configured.
 - Peer dependencies (the source of truth is `package.json` `peerDependencies`):
-  - `@earendil-works/pi-coding-agent >=0.74.0`
-  - `@earendil-works/pi-agent-core >=0.74.0`
+  - `@earendil-works/pi-coding-agent >=0.81.0`
+  - `@earendil-works/pi-agent-core >=0.81.0`
   - `typebox ^1.0.0` (used to declare the tool's parameter schema; bundled with pi but listed explicitly so a standalone install resolves correctly).
-- The reflection bootstrap depends on six plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, `agent.prepareNextTurn` (pi ≤0.80.2), and `agent.prepareNextTurnWithContext` (preferred by pi ≥0.80.3). Verified against pi 0.75.5 and pi 0.83.0.
+- The reflection bootstrap depends on five plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurnWithContext` (preferred by pi ≥0.80.3; `agent.prepareNextTurn` was the pre-0.80.3 name). Verified against pi 0.81.0 and pi 0.83.0.
 
 ## What you get
 
@@ -93,7 +93,9 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 ## Limitations
 
-- **Brittle to pi version bumps.** The fix uses six independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, `agent.prepareNextTurn`, and `agent.prepareNextTurnWithContext`. This is not hypothetical: pi 0.80.3 added `prepareNextTurnWithContext` and made the loop prefer it, silently dead-ending the `prepareNextTurn`-only hook until v0.1.1. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
+- **Brittle to pi version bumps.** The fix uses five independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, and `agent.prepareNextTurnWithContext`. This is not hypothetical: pi 0.80.3 added `prepareNextTurnWithContext` and made the loop prefer it, silently dead-ending the `prepareNextTurn`-only hook until v0.1.1. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
+
+  **Audited against pi 0.81.0 / 0.83.0 / 0.84.2 (2026-08):** three of the five are eliminable via public APIs — `ctx.getSystemPrompt()` (base `ExtensionContext`) and `ctx.getAllTools()` (both since 0.80.2) replace the `agent.state.systemPrompt` / `agent.state.tools` reads, and the public `context` extension event (fired via `transformContext` before **every** LLM call, including the turn right after a mid-loop rewind) can replace the `prepareNextTurnWithContext` wrapper's per-turn refresh. The remaining two are NOT eliminable for the tool-based design: `AgentSession.prototype.prompt` (no public per-prompt hook for tool executes — the `context` event fires too late to install hooks before `createLoopConfig`) and `agent.state.messages` (pi's own `navigateTree` refresh is only reachable via `ctx.navigateTree()`, which exists solely on `ExtensionCommandContext`, not the `ExtensionContext` a `tool.execute` receives).
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 

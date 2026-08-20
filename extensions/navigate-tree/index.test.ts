@@ -1471,6 +1471,100 @@ describe("dispatch: rewind happy path", () => {
       );
     }
   });
+
+  it("passes the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
+    // Regression: rewind failed with "No API provider registered for api:
+    // commandcode-custom" for providers registered via
+    // pi.registerProvider(name, { api: <custom-id>, streamSimple }) because
+    // generateBranchSummary was called WITHOUT streamFn, making
+    // completeSummarization fall back to the pi-ai compat registry (which
+    // only knows builtin apis). The fix forwards the composed provider's
+    // `streamSimple` via the public modelRegistry.getProvider() API — the
+    // same routing pi's own branchWithSummary uses.
+    // A regression that drops the forwarding re-introduces the failure for
+    // commandcode 0.5.x and every other custom-api provider.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Simulate a custom-api provider (e.g. commandcode 0.5.x with
+    // api "commandcode-custom"): the composed provider exposes
+    // `streamSimple` via the public modelRegistry.getProvider().
+    const providerStreamSimple = async () => ({}) as never;
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: providerStreamSimple });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "custom-api stream routing regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      providerStreamSimple,
+      "summarize must receive the provider's streamSimple as streamFn",
+    );
+  });
+
+  it("omits streamFn when the provider has no streamSimple (builtin-compat fallback)", async () => {
+    // A provider whose composed entry lacks `streamSimple` (or a
+    // modelRegistry without getProvider, e.g. pre-0.81 hosts) must fall
+    // back to the previous behavior: no streamFn → pi-ai compat dispatch.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Provider exists but has no streamSimple.
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({});
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "no-streamSimple fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when provider has no streamSimple",
+    );
+  });
 });
 
 // =============================================================================
