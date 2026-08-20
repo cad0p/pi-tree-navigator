@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 <!-- Add your curated release notes here. -->
 <!-- USER-EDITABLE SECTION END -->
 
+### 🐛 Bug Fixes
+
+- *(rewind)* Route summarization through provider streamSimple (public API) (closes #13)
+
 ### 📚 Documentation
 
 - Update reflection field count/versions and dev commands for v0.1.1 reality ([#9](https://github.com/cad0p/pi-tree-navigator/pull/9))
