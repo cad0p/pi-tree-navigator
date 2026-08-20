@@ -831,9 +831,16 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       }
 
       const result = await summarize(entries, {
-        model: ctx.model,
+        // `auth.baseUrl` (OAuth/credential-derived endpoint, e.g.
+        // githubCopilotOAuth) must be applied to the model, mirroring pi's
+        // own `_getSummarizationRequestAuth` (`result.auth.baseUrl ?
+        // { ...model, baseUrl: result.auth.baseUrl } : model`).
+        model: auth.baseUrl
+          ? { ...ctx.model, baseUrl: auth.baseUrl }
+          : ctx.model,
         apiKey: auth.apiKey ?? "",
         headers: stripNullHeaders(auth.headers),
+        ...(auth.env ? { env: auth.env } : {}),
         signal: signal ?? new AbortController().signal,
         customInstructions: p.summaryFocus,
         // Route through the composed provider's `streamSimple` (public

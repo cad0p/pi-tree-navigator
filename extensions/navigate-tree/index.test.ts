@@ -1744,6 +1744,66 @@ describe("dispatch: rewind happy path", () => {
       "null-marked headers must be stripped before summarize",
     );
   });
+
+  it("forwards auth.baseUrl onto the model and auth.env (OAuth-derived endpoints)", async () => {
+    // pi's own _getSummarizationRequestAuth applies `result.auth.baseUrl`
+    // onto the model (OAuth/credential-derived endpoints, e.g.
+    // githubCopilotOAuth) and forwards `env`. The extension must mirror
+    // that — dropping baseUrl would hit the catalog default endpoint.
+    let capturedModel: unknown;
+    let capturedEnv: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedModel = (opts as { model?: unknown }).model;
+      capturedEnv = (opts as { env?: unknown }).env;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      baseUrl: "https://oauth-derived.example.com",
+      env: { FOO: "bar" },
+    });
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: async () => ({}) as never });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "oauth baseUrl/env forwarding regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (capturedModel as { baseUrl?: string } | undefined)?.baseUrl,
+      "https://oauth-derived.example.com",
+      "auth.baseUrl must be applied onto the summarization model",
+    );
+    assert.deepEqual(
+      capturedEnv,
+      { FOO: "bar" },
+      "auth.env must be forwarded to summarize",
+    );
+  });
 });
 
 // =============================================================================
