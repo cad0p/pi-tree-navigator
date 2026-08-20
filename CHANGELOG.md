@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-08-20
+
+<!-- USER-EDITABLE SECTION START -->
+Patch release: fixes rewind summarization for custom-api providers and eliminates 3 of the 5 reflection points via public APIs.
+
+**Rewind summarization for custom providers (#13):** `rewind` failed with `No API provider registered for api: <custom-id>` for any provider registered via `pi.registerProvider(name, { api: <custom-id>, streamSimple })` (e.g. pi-commandcode-provider 0.5.x with `api: "commandcode-custom"`). The summarizer now routes through the composed provider's `streamSimple`, obtained via the public `ctx.modelRegistry.getProvider(providerId)` API (pi ≥0.81.0) — the same routing pi's own `branchWithSummary` uses. Peer floor bumped to `>=0.81.0`; `null` header-deletion markers stripped (pi 0.84+ `ProviderHeaders`).
+
+**Reflection surface five → two (#14):** the per-turn in-loop context refresh no longer reads `agent.state.systemPrompt` / `agent.state.tools` or wraps `agent.prepareNextTurnWithContext` / `agent.prepareNextTurn`. Instead a `pi.on("context")` handler (the public `context` extension event, fired via `Agent.transformContext` before every LLM call) returns the session-tree projection `sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages)`. Pi's own `_installAgentNextTurnRefresh` keeps systemPrompt/tools/model/thinkingLevel fresh per turn. Remaining reflection points: `AgentSession.prototype.prompt` (session capture) and `agent.state.messages` (post-rewind refresh so the next prompt snapshots the rewound chain) — neither is eliminable via public APIs.
+
+Verified live on pi 0.84.2 (tmux TUI, commandcode provider): a 580KB file read (22.6% of 400k) rewound mid-loop to 1.0% of 400k with the very next LLM call at the rewound cache prefix (cacheRead 90,368 → 2,944). 125 tests pass; CI green.
+<!-- USER-EDITABLE SECTION END -->
+
+### 🐛 Bug Fixes
+
+- *(rewind)* Route summarization through provider streamSimple (public API) (closes #13)
+
+### 🚜 Refactor
+
+- Eliminate 3 of 5 reflection points via public context event (closes #14)
+
+### 📚 Documentation
+
+- Update reflection field count/versions and dev commands for v0.1.1 reality ([#9](https://github.com/cad0p/pi-tree-navigator/pull/9))
+- Port AGENTS.md bootstrap instructions from pi-napkin ([#11](https://github.com/cad0p/pi-tree-navigator/pull/11))
+
+
 ## [0.1.1] - 2026-07-31
 
 <!-- USER-EDITABLE SECTION START -->
