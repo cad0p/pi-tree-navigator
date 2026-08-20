@@ -34,12 +34,12 @@ This repo uses [`cad0p/semver-calver-release`](https://github.com/cad0p/semver-c
 
 ### Requirements
 
-- **pi 0.74+** with at least one model provider configured.
+- **pi 0.81+** (node ≥22.19, which pi 0.81+ itself requires) with at least one model provider configured.
 - Peer dependencies (the source of truth is `package.json` `peerDependencies`):
-  - `@earendil-works/pi-coding-agent >=0.74.0`
-  - `@earendil-works/pi-agent-core >=0.74.0`
+  - `@earendil-works/pi-coding-agent >=0.81.0`
+  - `@earendil-works/pi-agent-core >=0.81.0`
   - `typebox ^1.0.0` (used to declare the tool's parameter schema; bundled with pi but listed explicitly so a standalone install resolves correctly).
-- The reflection bootstrap depends on six plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, `agent.prepareNextTurn` (pi ≤0.80.2), and `agent.prepareNextTurnWithContext` (preferred by pi ≥0.80.3). Verified against pi 0.75.5 and pi 0.83.0.
+- The reflection bootstrap depends on two plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt` (patched for session capture) and `agent.state.messages` (refreshed after a rewind so the next prompt snapshots the rewound chain). Per-turn in-loop context refresh runs through the **public** `context` extension event (see “In-loop context refresh” below) — no `agent.prepareNextTurn*` reflection. Verified against pi 0.81.0 / 0.83.0 / 0.84.2.
 
 ## What you get
 
@@ -81,7 +81,7 @@ Why this is more involved than just calling pi's `branchWithSummary`:
 
 1. **Anthropic's tool_use ↔ tool_result pairing.** When a tool call rewinds the session tree, the tool's own `tool_use` lives in the assistant message that issued it — which `branchWithSummary` puts on the abandoned branch. Pi unconditionally writes the tool's `tool_result` to the new branch, leaving the result orphaned. Anthropic 400s the next API call with `Improperly formed request`. The fix is to inject a synthetic assistant message whose single `tool_call` has the same id as the in-flight call, *after* `branchWithSummary` but *before* the tool returns. Pi then writes the real `tool_result` as a child of that synthetic assistant — and the chain stays structurally valid.
 
-2. **In-loop context refresh.** Pi's `Agent` class snapshots `state.messages` once at the start of `prompt()` and pushes new messages onto its own array. A rewind issued mid-loop wouldn't reduce the next API call's size until the user sent a fresh prompt. We wire `agent.prepareNextTurn` from a prototype patch on `AgentSession.prototype.prompt`, returning a fresh context built from `sessionManager.buildSessionContext()` between every turn boundary. After a rewind, the very next assistant turn within the same `prompt()` sees the rewound chain.
+2. **In-loop context refresh.** Pi's `Agent` class snapshots `state.messages` once at the start of `prompt()` and pushes new messages onto its own array. A rewind issued mid-loop wouldn't reduce the next API call's size until the user sent a fresh prompt. We register a handler on pi's **public `context` extension event** — fired via `Agent.transformContext` → `runner.emitContext` before *every* LLM call, including the turn right after a mid-loop rewind — that replaces the wire messages with the session-tree projection (`sessionManager.buildContextEntries()` → `sessionEntryToContextMessages`). After a rewind, the very next assistant turn within the same `prompt()` sees the rewound chain. (This replaced the earlier `agent.prepareNextTurnWithContext` reflection wrapper.)
 
 3. **Reflection bootstrap.** Pi's slash-command `navigateTree` has access to `commandCtx.navigateTree`, which mutates `agent.state.messages`. Tool executes don't get that ctx, so we capture every `AgentSession` instance via the prompt patch and replicate the mutation manually. Without it, the on-disk leaf moves but `agent.state.messages` stays stale.
 
@@ -93,7 +93,9 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 ## Limitations
 
-- **Brittle to pi version bumps.** The fix uses six independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt`, `agent.state.messages`, `agent.state.systemPrompt`, `agent.state.tools`, `agent.prepareNextTurn`, and `agent.prepareNextTurnWithContext`. This is not hypothetical: pi 0.80.3 added `prepareNextTurnWithContext` and made the loop prefer it, silently dead-ending the `prepareNextTurn`-only hook until v0.1.1. If a future pi release renames any of these, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
+- **Brittle to pi version bumps.** The fix uses two independent reflection points on internals that aren't part of pi's public API: `AgentSession.prototype.prompt` (session capture) and `agent.state.messages` (refreshed after a rewind). A third reflection point (`agent.prepareNextTurn*`) was eliminated in v0.2.0 via the public `context` extension event; the per-turn systemPrompt/tools/model/thinkingLevel refreshes come from pi's own `_installAgentNextTurnRefresh` (construction-installed since 0.80.3). If a future pi release renames the two remaining fields, switches them to private (`#`) fields, or restructures the class hierarchy, this breaks. The extension fails loudly: `anchor` still works, `rewind` reports `⚠ reflection bootstrap missing — the rewind landed on disk but the next assistant turn may still see the pre-rewind context. Run \`/reload\` (or restart pi) to recover.`, and you'd see context corruption return on the next prompt.
+
+  **Audited against pi 0.81.0 / 0.83.0 / 0.84.2 (2026-08):** three of the five reflection points have been eliminated — `agent.state.systemPrompt` and `agent.state.tools` reads (deleted with the `prepareNextTurn` double-wrap; no longer needed since pi's own per-turn wrapper and the public `ctx.getSystemPrompt()` / `pi.getAllTools()` cover them) and `agent.prepareNextTurnWithContext` (replaced by the public `context` extension event, which fires via `transformContext` before **every** LLM call). The remaining two are NOT eliminable for the tool-based design: `AgentSession.prototype.prompt` (no public per-prompt hook for tool executes — the `context` event fires too late to install hooks before `createLoopConfig`) and `agent.state.messages` (pi's own `navigateTree` refresh is only reachable via `ctx.navigateTree()`, which exists solely on `ExtensionCommandContext`, not the `ExtensionContext` a `tool.execute` receives).
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 
@@ -116,7 +118,7 @@ pnpm run lint      # biome check extensions/
 pnpm run typecheck # tsc --noEmit
 ```
 
-Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against the current pi release (0.83.x at time of writing) is recommended for any pi version bump (the reflection bootstrap depends on internal field shapes).
+Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, context-event projection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against the current pi release (0.84.x at time of writing) is recommended for any pi version bump (the reflection bootstrap depends on `AgentSession.prototype.prompt` / `agent.state.messages` field shapes).
 
 ## License
 

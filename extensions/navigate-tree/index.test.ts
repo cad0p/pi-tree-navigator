@@ -67,6 +67,8 @@ interface FakePi {
   pi: ExtensionAPI;
   setLabelCalls: Array<[string, string | undefined]>;
   registered: CapturedTool[];
+  /** Captured `on(event, handler)` registrations, keyed by event name. */
+  onCalls: Map<string, Array<(e: never, c: never) => unknown>>;
 }
 
 /**
@@ -79,6 +81,7 @@ interface FakePi {
 function makeFakePi(sm: SessionManager): FakePi {
   const setLabelCalls: Array<[string, string | undefined]> = [];
   const registered: CapturedTool[] = [];
+  const onCalls = new Map<string, Array<(e: never, c: never) => unknown>>();
   const pi = {
     registerTool(tool: CapturedTool) {
       registered.push(tool);
@@ -90,8 +93,13 @@ function makeFakePi(sm: SessionManager): FakePi {
       // pi does this via the ExtensionRunner; in tests we shortcut.
       sm.appendLabelChange(entryId, label);
     },
+    on(event: string, handler: (e: never, c: never) => unknown) {
+      const list = onCalls.get(event) ?? [];
+      list.push(handler);
+      onCalls.set(event, list);
+    },
   } as unknown as ExtensionAPI;
-  return { pi, setLabelCalls, registered };
+  return { pi, setLabelCalls, registered, onCalls };
 }
 
 interface FakeCtx {
@@ -278,6 +286,157 @@ function setupRewindable(
   }
   return {};
 }
+
+// =============================================================================
+// context event handler
+//
+// The public `context` extension event (wired to pi's `Agent.transformContext`
+// → `runner.emitContext`) is the replacement for the deleted
+// `prepareNextTurn` double-wrap. It fires before EVERY LLM call with the
+// session-tree projection; these pins cover the registration, the projection
+// shape, and the post-rewind invariant (the README's headline feature).
+// =============================================================================
+
+describe("context event handler", () => {
+  it("registers exactly one context handler via pi.on", () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("context");
+    assert.ok(handlers, "factory must register a context handler");
+    assert.equal(handlers.length, 1);
+  });
+
+  it("buildContextMessages projects the active branch (leaf-relative, no args)", () => {
+    // The deleted wrapper rebuilt messages from buildSessionContext() every
+    // turn; the context handler must produce the same projection from the
+    // PUBLIC ReadonlySessionManager surface (buildContextEntries is exposed,
+    // buildSessionContext is not). Pin the projection equals the session
+    // context's messages on a plain chain.
+    const { sm } = setup();
+    appendTurn(sm, "u1", "a1", 100);
+    appendTurn(sm, "u2", "a2", 200);
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.deepEqual(projected, sm.buildSessionContext().messages);
+  });
+
+  it("handler returns messages = tree projection on every call (no leaf-gating)", () => {
+    // R7: every appendMessage advances the leaf, so a "leaf changed since
+    // last turn" heuristic would fire on essentially every call. Always-
+    // replace degenerates to exactly what the deleted wrapper did. Fire the
+    // captured handler twice with no tree change in between — both must
+    // return the same projection (no pass-through case exists to pin, but
+    // this guards against a future conditional reintroducing gating).
+    const { sm, pi } = setup();
+    appendTurn(sm, "u1", "a1", 100);
+    const handlers = pi.onCalls.get("context");
+    assert.ok(handlers, "factory must register a context handler");
+    const first = handlers[0](
+      { type: "context", messages: [] } as never,
+      { sessionManager: sm } as never,
+    );
+    const second = handlers[0](
+      { type: "context", messages: [] } as never,
+      { sessionManager: sm } as never,
+    );
+    assert.deepEqual(first, second);
+    assert.deepEqual(
+      (first as { messages: unknown[] }).messages,
+      sm.buildSessionContext().messages,
+    );
+  });
+
+  it("post-rewind: handler returns rewound chain with synthetic + tool_result, no abandoned tool_use", async () => {
+    // The headline invariant: after a mid-loop rewind, the next assistant
+    // turn (the very next context event) must see the rewound chain — the
+    // branch_summary message, the synthetic assistant (toolCall id == the
+    // in-flight id), and the real tool_result — and NOT the abandoned
+    // branch's assistant tool_use. This is the public-API replacement for
+    // the delete-wrappper per-turn refresh; a regression here re-opens the
+    // "next API call stays pre-rewind" bug.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 200);
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the user instruction and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+
+    // In production, pi appends the tool_result as message_end AFTER the
+    // rewind's synthetic (emitted by agent-loop's emitToolResultMessage).
+    // Replicate that append so the projection under test is the state a
+    // real next-turn context event would see.
+    const toolResultMsg = {
+      role: "toolResult" as const,
+      toolCallId: "tc-rewind",
+      toolName: "navigate_tree",
+      content: [],
+      details: result.details,
+      isError: false,
+      timestamp: Date.now(),
+    };
+    sm.appendMessage(toolResultMsg as never);
+
+    const handlers = pi.onCalls.get("context");
+    assert.ok(handlers, "factory must register a context handler");
+    const outcome = handlers[0](
+      { type: "context", messages: [] } as never,
+      { sessionManager: sm } as never,
+    ) as {
+      messages: Array<{
+        role: string;
+        content?: Array<{ type?: string; id?: string; name?: string }>;
+      }>;
+    };
+    const messages = outcome.messages;
+
+    // Contains the branch_summary (user-role projection) and the synthetic
+    // assistant with the in-flight toolCall id.
+    const synthetic = messages.find(
+      (m) => m.role === "assistant" && m.content?.[0]?.type === "toolCall",
+    );
+    assert.ok(synthetic, "projection must contain the synthetic assistant");
+    assert.equal(synthetic.content?.[0]?.id, "tc-rewind");
+    assert.equal(synthetic.content?.[0]?.name, "navigate_tree");
+
+    // Ends with the tool_result (pairing contract).
+    const last = messages[messages.length - 1];
+    assert.equal(last.role, "toolResult");
+    assert.equal(last.content?.[0]?.type, undefined);
+
+    // The abandoned branch's original assistant tool_use is gone: the only
+    // assistant-with-toolCall is the synthetic.
+    const toolCallAssistants = messages.filter(
+      (m) =>
+        m.role === "assistant" && m.content?.some((c) => c.type === "toolCall"),
+    );
+    assert.equal(toolCallAssistants.length, 1);
+
+    // The rewound chain is strictly shorter than the pre-rewind chain.
+    assert.ok(
+      messages.length < sm.getEntries().length,
+      "rewound projection must be shorter than the raw entry list",
+    );
+
+    // idempotent: a second invocation with no tree change returns the same.
+    const again = handlers[0](
+      { type: "context", messages: [] } as never,
+      { sessionManager: sm } as never,
+    );
+    assert.deepEqual(again, outcome);
+  });
+});
 
 // =============================================================================
 // Schema shape (Kiro compatibility)
@@ -783,6 +942,10 @@ describe("dispatch: anchor action", () => {
     const setLabelCalls: Array<[string, string | undefined]> = [];
     const inPlacePi = {
       registerTool() {},
+      on() {
+        // Factory registers the context handler via on; this test only
+        // exercises anchor semantics, so a no-op collector suffices.
+      },
       setLabel(entryId: string, label: string | undefined) {
         setLabelCalls.push([entryId, label]);
         // Reach into the SM's internal map to set the label without
@@ -1471,424 +1634,338 @@ describe("dispatch: rewind happy path", () => {
       );
     }
   });
-});
 
-// =============================================================================
-// installPrepareNextTurn
-// =============================================================================
-
-describe("installPrepareNextTurn", () => {
-  it("basic: returns a context whose messages match buildSessionContext()", async () => {
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const fn = fake.agent.prepareNextTurn as (
-      signal?: AbortSignal,
-    ) => Promise<{ context?: { messages: unknown[] } }>;
-    const result = await fn();
-    assert.deepEqual(
-      result.context?.messages,
-      sm.buildSessionContext().messages,
-    );
-    // Marker symbol is set so /reload re-installs unwrap correctly.
-    const marked = fake.agent.prepareNextTurn as Record<symbol, unknown>;
-    assert.equal(marked[__testHooks.PNT_MARKER], true);
-  });
-
-  it("chains over a prior non-marker prepareNextTurn from another extension", async () => {
-    const sm = SessionManager.inMemory("/tmp");
-    const fake = makeFakeSession(sm);
-    let priorRan = false;
-    fake.agent.prepareNextTurn = async () => {
-      priorRan = true;
-      return { model: "from-prior", thinkingLevel: "high" };
-    };
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const fn = fake.agent.prepareNextTurn as (
-      signal?: AbortSignal,
-    ) => Promise<{ model?: unknown; thinkingLevel?: unknown }>;
-    const result = await fn();
-    assert.equal(priorRan, true);
-    assert.equal(result.model, "from-prior");
-    assert.equal(result.thinkingLevel, "high");
-  });
-
-  it("re-install (/reload) unwraps __prior; doesn't capture self as prior", async () => {
-    const sm = SessionManager.inMemory("/tmp");
-    const fake = makeFakeSession(sm);
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const after1 = fake.agent.prepareNextTurn;
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const after2 = fake.agent.prepareNextTurn as Record<
-      string | symbol,
-      unknown
-    >;
-    // New wrapper installed (different function reference).
-    assert.notEqual(after2, after1);
-    // The new wrapper's __prior is undefined: we recovered after1's
-    // own __prior (which was undefined), not after1 itself.
-    assert.equal(after2.__prior, undefined);
-  });
-});
-
-// =============================================================================
-// installPrepareNextTurn — prepareNextTurnWithContext path (pi ≥0.80.3)
-//
-// Since pi-coding-agent 0.80.3, AgentSession's constructor installs its own
-// `agent.prepareNextTurnWithContext` (`_installAgentNextTurnRefresh`) and
-// pi-agent-core's `createLoopConfig` prefers it over `prepareNextTurn`:
-//
-//   prepareNextTurn: this.prepareNextTurnWithContext || this.prepareNextTurn
-//     ? async (context) => {
-//         if (this.prepareNextTurnWithContext) {
-//           return await this.prepareNextTurnWithContext(context, this.signal);
-//         }
-//         return await this.prepareNextTurn?.(this.signal);
-//       } : undefined,
-//
-// Pi's own wrapper refreshes systemPrompt/tools/model/thinkingLevel but
-// leaves `messages` stale — so our in-loop refresh must live on the
-// WithContext field on new pi. These tests pin that wrapper; a regression
-// here re-opens the "footer % and wire context stay pre-rewind for the
-// rest of the loop" bug.
-// =============================================================================
-
-describe("installPrepareNextTurn — prepareNextTurnWithContext (pi ≥0.80.3)", () => {
-  it("installs wrappers on BOTH hook fields in one call", () => {
-    // One install must cover both eras: old pi reads prepareNextTurn,
-    // new pi prefers prepareNextTurnWithContext. Installing the
-    // WithContext wrapper unconditionally is harmless on old pi (the
-    // field is never read there).
-    const sm = SessionManager.inMemory("/tmp");
-    const fake = makeFakeSession(sm);
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    assert.equal(typeof fake.agent.prepareNextTurn, "function");
-    assert.equal(typeof fake.agent.prepareNextTurnWithContext, "function");
-    const markedWc = fake.agent.prepareNextTurnWithContext as Record<
-      symbol,
-      unknown
-    >;
-    assert.equal(markedWc[__testHooks.PNTWC_MARKER], true);
-  });
-
-  it("basic: returns a context whose messages match buildSessionContext()", async () => {
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const fn = fake.agent.prepareNextTurnWithContext as (
-      turn?: unknown,
-      signal?: AbortSignal,
-    ) => Promise<{ context?: { messages: unknown[] } }>;
-    const result = await fn({ context: {} });
-    assert.deepEqual(
-      result.context?.messages,
-      sm.buildSessionContext().messages,
-    );
-  });
-
-  it("chains pi's own _installAgentNextTurnRefresh-style prior: its per-turn refreshes survive, messages overridden", async () => {
-    // Replicates pi 0.83.0's own wrapper shape: returns prior context
-    // fields + refreshed systemPrompt/tools/model/thinkingLevel, with
-    // STALE messages (turn.context.messages). Our wrapper must keep all
-    // of pi's refreshes and override only `messages`.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    let priorRan = false;
-    // Pi-style prior: (turn, signal) => snapshot.
-    fake.agent.prepareNextTurnWithContext = async (turn: {
-      context?: Record<string, unknown>;
-    }) => {
-      priorRan = true;
-      const previousContext = turn?.context;
+  it("passes the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
+    // Regression: rewind failed with "No API provider registered for api:
+    // commandcode-custom" for providers registered via
+    // pi.registerProvider(name, { api: <custom-id>, streamSimple }) because
+    // generateBranchSummary was called WITHOUT streamFn, making
+    // completeSummarization fall back to the pi-ai compat registry (which
+    // only knows builtin apis). The fix forwards the composed provider's
+    // `streamSimple` via the public modelRegistry.getProvider() API — the
+    // same routing pi's own branchWithSummary uses.
+    // A regression that drops the forwarding re-introduces the failure for
+    // commandcode 0.5.x and every other custom-api provider.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
       return {
-        context: {
-          ...previousContext,
-          systemPrompt: "PI_REFRESHED_PROMPT",
-          tools: ["pi-refreshed-tool"],
-          // stale messages, as pi leaves them:
-          messages: [{ role: "user", content: "STALE" }],
-        },
-        model: "pi-state-model",
-        thinkingLevel: "high",
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
       };
-    };
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pntwc = (...args: unknown[]) => Promise<{
-      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
-      model?: unknown;
-      thinkingLevel?: unknown;
-    }>;
-    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
-    const r = await fn(
-      { context: { messages: [] } },
-      new AbortController().signal,
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Simulate a custom-api provider (e.g. commandcode 0.5.x with
+    // api "commandcode-custom"): the composed provider exposes
+    // `streamSimple` via the public modelRegistry.getProvider().
+    const providerStreamSimple = async () => ({}) as never;
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: providerStreamSimple });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "custom-api stream routing regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
     );
-    assert.equal(priorRan, true);
-    // pi's per-turn refreshes propagate.
-    assert.equal(r.context?.systemPrompt, "PI_REFRESHED_PROMPT");
-    assert.deepEqual(r.context?.tools, ["pi-refreshed-tool"]);
-    assert.equal(r.model, "pi-state-model");
-    assert.equal(r.thinkingLevel, "high");
-    // messages is overridden from the session tree — NOT pi's stale ones.
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      providerStreamSimple,
+      "summarize must receive the provider's streamSimple as streamFn",
+    );
   });
 
-  it("no prior: falls back to the turn's live context for systemPrompt/tools (mirrors pi's own wrapper)", async () => {
-    // Pi's own wrapper does `previousSnapshot?.context ?? turn.context`.
-    // If our wrapper is ever installed without a prior (e.g. a future pi
-    // that reads the field but doesn't pre-install its own), dropping
-    // the turn context would blank systemPrompt/tools for the next LLM
-    // call. Pin the fallback.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pntwc = (...args: unknown[]) => Promise<{
-      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
-    }>;
-    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
-    const turn = {
-      message: { role: "assistant" },
-      toolResults: [],
-      context: {
-        systemPrompt: "TURN_PROMPT",
-        tools: ["turn-tool"],
-        messages: [{ role: "user", content: "STALE" }],
+  it("omits streamFn when the provider has no streamSimple (builtin-compat fallback)", async () => {
+    // A provider whose composed entry lacks `streamSimple` (or a
+    // modelRegistry without getProvider, e.g. pre-0.81 hosts) must fall
+    // back to the previous behavior: no streamFn → pi-ai compat dispatch.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Provider exists but has no streamSimple.
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({});
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "no-streamSimple fallback regression focus",
       },
-      newMessages: [],
-    };
-    const r = await fn(turn, new AbortController().signal);
-    assert.equal(r.context?.systemPrompt, "TURN_PROMPT");
-    assert.deepEqual(r.context?.tools, ["turn-tool"]);
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when provider has no streamSimple",
+    );
   });
 
-  it("partial prior context: missing tools is filled from agent.state.tools", async () => {
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.state.tools = ["agent-state-tool"];
-    fake.agent.prepareNextTurnWithContext = async () => ({
-      context: { systemPrompt: "FOREIGN_PROMPT" },
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pntwc = (...args: unknown[]) => Promise<{
-      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
-    }>;
-    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
-    const r = await fn({ context: {} });
-    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
-    assert.deepEqual(r.context?.tools, ["agent-state-tool"]);
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
-  });
+  it("omits streamFn when getProvider returns undefined", async () => {
+    // modelRegistry.getProvider(providerId) can return undefined (unknown
+    // provider, or a host where the provider isn't composed yet). Must fall
+    // back to the previous behavior (no streamFn).
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
 
-  it("re-install (/reload) unwraps __prior on the WithContext field; pi's own wrapper runs exactly once", async () => {
-    // Mirror of the prepareNextTurn /reload test: pi's own wrapper is
-    // the "foreign" hook here. Two installs (load + /reload) must not
-    // strand it (wrap B capturing wrap A) nor double-chain it.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    let piPriorRan = 0;
-    fake.agent.prepareNextTurnWithContext = async () => {
-      piPriorRan++;
-      return { model: "pi-state-model" };
-    };
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const after1 = fake.agent.prepareNextTurnWithContext;
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const after2 = fake.agent.prepareNextTurnWithContext as Record<
-      string | symbol,
-      unknown
-    >;
-    assert.notEqual(after2, after1);
-    type Pntwc = (...args: unknown[]) => Promise<{
-      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
-      model?: unknown;
-      thinkingLevel?: unknown;
-    }>;
-    const r = await (after2 as unknown as Pntwc)({ context: {} });
-    assert.equal(piPriorRan, 1);
-    assert.equal(r.model, "pi-state-model");
-    // after2's __prior is pi's own wrapper, NOT after1 (no self-capture).
-    assert.equal(typeof after2.__prior, "function");
-    assert.notEqual(after2.__prior, after1);
-  });
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
 
-  it("partial prior context: missing systemPrompt is filled from agent.state.systemPrompt", async () => {
-    // Symmetric to the tools-fill test above (and to the prepareNextTurn
-    // twin). A foreign WithContext wrapper that returns only `tools`
-    // must have systemPrompt filled from agent.state.systemPrompt.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
-    fake.agent.prepareNextTurnWithContext = async () => ({
-      context: { tools: ["foreign-tool"] },
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pntwc = (...args: unknown[]) => Promise<{
-      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
-    }>;
-    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
-    const r = await fn({ context: {} });
-    assert.deepEqual(r.context?.tools, ["foreign-tool"]);
-    assert.equal(r.context?.systemPrompt, "AGENT_STATE_PROMPT");
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
-  });
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => undefined;
 
-  it("explicit-undefined prior context: tools=undefined still falls back to agent.state.tools", async () => {
-    // Regression pin mirroring the prepareNextTurn twin: when the prior
-    // returns `{ context: { systemPrompt: 'X', tools: undefined } }`
-    // (key present, value explicitly undefined), the merged context
-    // must still fall back to `agent.state.tools`. The spread-first /
-    // fallback-overlay order is what protects this; flipping it would
-    // ship `tools: undefined` to pi's loop.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.state.tools = ["agent-state-tool"];
-    fake.agent.prepareNextTurnWithContext = async () => ({
-      context: {
-        systemPrompt: "FOREIGN_PROMPT",
-        tools: undefined,
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "undefined-provider fallback regression focus",
       },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when getProvider returns undefined",
+    );
+  });
+
+  it("omits streamFn when getProvider throws (defensive catch)", async () => {
+    // A hostile/older modelRegistry may throw from getProvider. The
+    // resolveProviderStreamFn try/catch must degrade to no streamFn rather
+    // than failing the rewind.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => {
+        throw new Error("registry exploded");
+      };
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "throwing-provider fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when getProvider throws",
+    );
+  });
+
+  it("forwards streamSimple when it is not a function (truthy but invalid)", async () => {
+    // `provider?.streamSimple` truthiness is the only guard; a truthy
+    // non-function would previously be forwarded. Pin the current behavior
+    // (forwarded as-is) so a future hardening (typeof check) is a visible
+    // change, not a silent fix.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    const notAFunction = "not-a-function";
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: notAFunction });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "non-function streamSimple pin focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      notAFunction,
+      "summarize receives the truthy streamSimple verbatim (current behavior pin)",
+    );
+  });
+
+  it("strips null header-deletion markers before passing headers", async () => {
+    // pi 0.84+ ProviderHeaders can carry string|null; null marks a header
+    // deletion. generateBranchSummary expects Record<string, string>, and
+    // pi's own withoutDeletedHeaders drops nulls — mirror that.
+    let capturedHeaders: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedHeaders = (opts as { headers?: unknown }).headers;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Auth headers with a null deletion marker + a real header.
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: { "x-real": "value", "x-deleted": null },
     });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pntwc = (...args: unknown[]) => Promise<{
-      context?: { systemPrompt?: unknown; tools?: unknown; messages?: unknown };
-    }>;
-    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
-    const r = await fn({ context: {} });
-    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
+    // Provider present so the rewind path reaches summarize.
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: async () => ({}) as never });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "null-header stripping regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
     assert.deepEqual(
-      r.context?.tools,
-      ["agent-state-tool"],
-      "tools=undefined from prior must fall back to agent.state.tools",
+      capturedHeaders,
+      { "x-real": "value" },
+      "null-marked headers must be stripped before summarize",
     );
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
   });
 
-  it("prior throwing in prepareNextTurnWithContext: error propagates verbatim (no swallow)", async () => {
-    // Mirror of the prepareNextTurn twin: a throwing prior (pi's own
-    // wrapper or a foreign extension) must surface at the pi loop
-    // boundary, not be swallowed behind our context-refresh.
-    const sm = SessionManager.inMemory("/tmp");
-    const fake = makeFakeSession(sm);
-    fake.agent.prepareNextTurnWithContext = async () => {
-      throw new Error("foreign boom");
-    };
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pntwc = (...args: unknown[]) => Promise<unknown>;
-    const fn = fake.agent.prepareNextTurnWithContext as Pntwc;
-    let thrown: unknown;
-    try {
-      await fn({ context: {} });
-    } catch (e) {
-      thrown = e;
-    }
-    assert.ok(thrown instanceof Error);
-    if (thrown instanceof Error) assert.equal(thrown.message, "foreign boom");
-  });
+  it("forwards auth.baseUrl onto the model and auth.env (OAuth-derived endpoints)", async () => {
+    // pi's own _getSummarizationRequestAuth applies `result.auth.baseUrl`
+    // onto the model (OAuth/credential-derived endpoints, e.g.
+    // githubCopilotOAuth) and forwards `env`. The extension must mirror
+    // that — dropping baseUrl would hit the catalog default endpoint.
+    let capturedModel: unknown;
+    let capturedEnv: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedModel = (opts as { model?: unknown }).model;
+      capturedEnv = (opts as { env?: unknown }).env;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
 
-  it("end-to-end through pi's createLoopConfig preference: WithContext wins and carries the refreshed messages", async () => {
-    // Simulate pi ≥0.80.3's Agent.createLoopConfig bridge verbatim: it
-    // prefers prepareNextTurnWithContext whenever set (always, since
-    // pi's constructor installs one) and only falls back to
-    // prepareNextTurn otherwise. The regression this guards: a fix that
-    // only refreshes messages in the prepareNextTurn wrapper is dead
-    // code on pi ≥0.80.3.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    // Pi's constructor-time own wrapper (the reason the gate always
-    // prefers the WithContext field).
-    fake.agent.prepareNextTurnWithContext = async (turn: {
-      context?: Record<string, unknown>;
-    }) => ({
-      context: {
-        ...turn?.context,
-        systemPrompt: "PI_REFRESHED_PROMPT",
-        tools: ["pi-tool"],
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      baseUrl: "https://oauth-derived.example.com",
+      env: { FOO: "bar" },
+    });
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: async () => ({}) as never });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "oauth baseUrl/env forwarding regression focus",
       },
-      model: "pi-model",
-      thinkingLevel: "high",
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    const agent = fake.agent as {
-      prepareNextTurn?: (signal?: AbortSignal) => Promise<unknown>;
-      prepareNextTurnWithContext?: (
-        turn: unknown,
-        signal?: AbortSignal,
-      ) => Promise<{ context?: { messages?: unknown[] } }>;
-    };
-    // Verbatim bridge shape from pi-agent-core 0.83.0 createLoopConfig.
-    const signal = new AbortController().signal;
-    const bridge =
-      agent.prepareNextTurnWithContext || agent.prepareNextTurn
-        ? async (context: unknown) => {
-            if (agent.prepareNextTurnWithContext) {
-              return await agent.prepareNextTurnWithContext(context, signal);
-            }
-            return (await agent.prepareNextTurn?.(signal)) as {
-              context?: { messages?: unknown[] };
-            };
-          }
-        : undefined;
-    assert.ok(bridge, "bridge must be installed when either field is set");
-    const snapshot = await bridge({
-      context: { messages: [{ role: "user", content: "STALE" }] },
-    });
-    // The whole point: messages come from the session tree, not the
-    // loop's stale array.
-    assert.deepEqual(
-      snapshot?.context?.messages,
-      sm.buildSessionContext().messages,
+      undefined,
+      undefined,
+      ctx,
     );
-    // And pi's own per-turn refreshes survive the bridge end-to-end
-    // (not just in the isolated chaining test above): the loop reads
-    // these straight off the snapshot, so dropping them here would
-    // revert the system prompt / tool set / model / thinking level
-    // to prompt-start values on every turn after a rewind.
-    const full = snapshot as {
-      context?: { systemPrompt?: unknown; tools?: unknown };
-      model?: unknown;
-      thinkingLevel?: unknown;
-    };
-    assert.equal(full.context?.systemPrompt, "PI_REFRESHED_PROMPT");
-    assert.deepEqual(full.context?.tools, ["pi-tool"]);
-    assert.equal(full.model, "pi-model");
-    assert.equal(full.thinkingLevel, "high");
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (capturedModel as { baseUrl?: string } | undefined)?.baseUrl,
+      "https://oauth-derived.example.com",
+      "auth.baseUrl must be applied onto the summarization model",
+    );
+    assert.deepEqual(
+      capturedEnv,
+      { FOO: "bar" },
+      "auth.env must be forwarded to summarize",
+    );
   });
 });
 
@@ -2011,6 +2088,26 @@ describe("captureSession reaping", () => {
     // Re-capturing the SAME identity must succeed (count goes from 0 → 1).
     __testHooks.captureSession(fake as unknown as AgentSession);
     assert.equal(__testHooks.sessionRefCount(), 1);
+  });
+
+  it("captureSession tolerates a session with no agent internals", () => {
+    // The deleted installPrepareNextTurn hook (which read agent.state.*
+    // at prompt time) had an early-exit for sessions with no agent; the
+    // replacement context-event refresh captures sessions for
+    // refreshAgentMessages only, so a session without agent internals
+    // must be capturable without throwing — findOwningSession just won't
+    // match it.
+    const sm = SessionManager.inMemory("/tmp");
+    const ghost = { sessionManager: sm }; // no `agent` field at all
+    const before = __testHooks.sessionRefCount();
+    assert.doesNotThrow(() =>
+      __testHooks.captureSession(ghost as unknown as AgentSession),
+    );
+    // The ghost is captured (ref count advanced) but findOwningSession
+    // still resolves nothing for it (it has no agent.state.messages to
+    // refresh — refreshAgentMessages returns false).
+    assert.equal(__testHooks.sessionRefCount(), before + 1);
+    assert.equal(__testHooks.refreshAgentMessages(sm), false);
   });
 });
 
@@ -3298,244 +3395,6 @@ describe("dispatch: rewind error branches", () => {
       true,
       "summarize must run when the lone intervening message is a non-navigate_tree toolCall",
     );
-  });
-});
-
-// =============================================================================
-// installPrepareNextTurn cross-extension preservation
-// =============================================================================
-
-describe("installPrepareNextTurn cross-extension preservation", () => {
-  it("foreign extension's prepareNextTurn survives /reload re-install", async () => {
-    // A foreign extension installs first (no marker). We install our
-    // wrapper (wrap A); we install AGAIN simulating /reload (wrap B). The
-    // foreign hook should still run and its `model` should propagate
-    // through both wrappers \u2014 catching a regression where wrap B captures
-    // wrap A as `__prior` instead of unwrapping to recover the foreign
-    // function.
-    const sm = SessionManager.inMemory("/tmp");
-    const fake = makeFakeSession(sm);
-    let priorRan = 0;
-    fake.agent.prepareNextTurn = async () => {
-      priorRan++;
-      return { model: "from-foreign", thinkingLevel: "high" };
-    };
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-
-    type Pnt = (
-      ...args: unknown[]
-    ) => Promise<{ model?: unknown; thinkingLevel?: unknown }>;
-    const fn = fake.agent.prepareNextTurn as Pnt;
-    const r = await fn();
-    // Foreign ran exactly once \u2014 not zero (which would signal that
-    // wrap B captured wrap A as prior and the foreign got stranded), and
-    // not twice (which would signal both A and B chained over the foreign).
-    assert.equal(priorRan, 1);
-    assert.equal(r.model, "from-foreign");
-    assert.equal(r.thinkingLevel, "high");
-  });
-
-  it("prior wrapper's context.systemPrompt + tools propagate through the chain", async () => {
-    // A foreign prepareNextTurn that returns a context with a custom
-    // systemPrompt and tools. Our wrapper should preserve those fields and
-    // override only `messages`.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.prepareNextTurn = async () => ({
-      context: {
-        systemPrompt: "FOREIGN_PROMPT",
-        messages: [{ role: "user", content: "should be overwritten" }],
-        tools: ["foreign-tool"],
-      },
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pnt = (...args: unknown[]) => Promise<{
-      context?: {
-        systemPrompt?: unknown;
-        messages?: unknown;
-        tools?: unknown;
-      };
-    }>;
-    const fn = fake.agent.prepareNextTurn as Pnt;
-    const r = await fn();
-    // systemPrompt + tools survive from the foreign wrapper.
-    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
-    assert.deepEqual(r.context?.tools, ["foreign-tool"]);
-    // messages is overridden by sm.buildSessionContext().messages.
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
-  });
-
-  it("partial prior context: missing tools is filled from agent.state.tools", async () => {
-    // A foreign wrapper that returns a partial `context` (only
-    // systemPrompt; no tools). Pi's loop wholesale-replaces context
-    // (`currentContext = ctx ?? currentContext`), so without our
-    // defensive fill the next turn's context.tools would be undefined.
-    // Pin: our wrapper falls back to agent.state.tools when the prior
-    // didn't supply one.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.state.tools = ["agent-state-tool"];
-    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
-    fake.agent.prepareNextTurn = async () => ({
-      // Partial: only systemPrompt; no tools, no messages.
-      context: {
-        systemPrompt: "FOREIGN_PROMPT",
-      },
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pnt = (...args: unknown[]) => Promise<{
-      context?: {
-        systemPrompt?: unknown;
-        tools?: unknown;
-        messages?: unknown;
-      };
-    }>;
-    const fn = fake.agent.prepareNextTurn as Pnt;
-    const r = await fn();
-    // Foreign systemPrompt wins (it was set explicitly).
-    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
-    // tools fell back to agent.state.tools — the defensive fill.
-    assert.deepEqual(r.context?.tools, ["agent-state-tool"]);
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
-  });
-
-  it("partial prior context: missing systemPrompt is filled from agent.state.systemPrompt", async () => {
-    // Symmetric to the tools-fill test above. A foreign wrapper that
-    // returns only `tools` (no systemPrompt) must have systemPrompt
-    // filled from agent.state.systemPrompt by our defensive merge.
-    // Pin: a regression that drops the systemPrompt fallback line
-    // (keeping only the tools fill) would let the next turn's context
-    // ship with `systemPrompt: undefined` and lose the agent's prompt.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.state.tools = ["agent-state-tool"];
-    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
-    fake.agent.prepareNextTurn = async () => ({
-      // Partial: only tools; no systemPrompt, no messages.
-      context: {
-        tools: ["foreign-tool"],
-      },
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pnt = (...args: unknown[]) => Promise<{
-      context?: {
-        systemPrompt?: unknown;
-        tools?: unknown;
-        messages?: unknown;
-      };
-    }>;
-    const fn = fake.agent.prepareNextTurn as Pnt;
-    const r = await fn();
-    // Foreign tools wins (it was set explicitly).
-    assert.deepEqual(r.context?.tools, ["foreign-tool"]);
-    // systemPrompt fell back to agent.state.systemPrompt \u2014 the defensive fill.
-    assert.equal(r.context?.systemPrompt, "AGENT_STATE_PROMPT");
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
-  });
-
-  it("explicit-undefined prior context: tools=undefined still falls back to agent.state.tools", async () => {
-    // Regression pin for the merge-order bug: when the prior wrapper
-    // returns `{ context: { systemPrompt: 'X', tools: undefined } }`
-    // (key present, value explicitly undefined), the merged context
-    // must still fall back to `agent.state.tools` rather than
-    // ship `tools: undefined` to pi's loop. The pre-fix shape
-    // (defaults written first, `...priorContext` spread after) silently
-    // re-introduced `undefined` because the trailing spread overwrote
-    // the fallback. Post-fix the spread runs first and the explicit
-    // fallbacks overlay any `undefined` value the spread brought back.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.state.tools = ["agent-state-tool"];
-    fake.agent.state.systemPrompt = "AGENT_STATE_PROMPT";
-    fake.agent.prepareNextTurn = async () => ({
-      context: {
-        systemPrompt: "FOREIGN_PROMPT",
-        tools: undefined,
-      },
-    });
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pnt = (...args: unknown[]) => Promise<{
-      context?: {
-        systemPrompt?: unknown;
-        tools?: unknown;
-        messages?: unknown;
-      };
-    }>;
-    const fn = fake.agent.prepareNextTurn as Pnt;
-    const r = await fn();
-    // Foreign systemPrompt wins (set to a real value).
-    assert.equal(r.context?.systemPrompt, "FOREIGN_PROMPT");
-    // The critical pin: tools must NOT be undefined \u2014 the explicit
-    // fallback overlays the spread's undefined re-introduction.
-    assert.deepEqual(
-      r.context?.tools,
-      ["agent-state-tool"],
-      "tools=undefined from prior must fall back to agent.state.tools",
-    );
-    assert.deepEqual(r.context?.messages, sm.buildSessionContext().messages);
-  });
-
-  it("prior throwing in prepareNextTurn: error propagates verbatim (no swallow)", async () => {
-    // If a foreign extension's prepareNextTurn throws, our wrapper
-    // re-throws — we don't swallow + log + fall through, because that
-    // would mask the foreign extension's bug behind our context-refresh.
-    // Pin: the throw escapes verbatim so the failure surfaces at the
-    // pi loop boundary where it's actionable. A future change to catch
-    // + best-effort recover would surface here.
-    const sm = SessionManager.inMemory("/tmp");
-    sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    } as never);
-    const fake = makeFakeSession(sm);
-    fake.agent.prepareNextTurn = async () => {
-      throw new Error("foreign boom");
-    };
-    __testHooks.installPrepareNextTurn(fake as unknown as AgentSession);
-    type Pnt = (...args: unknown[]) => Promise<unknown>;
-    const fn = fake.agent.prepareNextTurn as Pnt;
-    let thrown: unknown;
-    try {
-      await fn();
-    } catch (e) {
-      thrown = e;
-    }
-    assert.ok(thrown instanceof Error);
-    if (thrown instanceof Error) assert.equal(thrown.message, "foreign boom");
-  });
-
-  it("returns without throwing when agent is missing", () => {
-    // Pin the `if (!agent) return` early-exit in installPrepareNextTurn:
-    // a session-shaped object that lacks an `agent` field must not throw
-    // when the patch's wrapper runs `installPrepareNextTurn(this)`. This
-    // protects against pi internals shape changes that drop the field
-    // or rename it — the bootstrap degrades to no-op rather than
-    // crashing the prompt patch (which would prevent any session from
-    // calling prompt() at all).
-    const sm = SessionManager.inMemory("/tmp");
-    const fakeMissingAgent = { sessionManager: sm };
-    assert.doesNotThrow(() => {
-      __testHooks.installPrepareNextTurn(
-        fakeMissingAgent as unknown as AgentSession,
-      );
-    });
   });
 });
 
