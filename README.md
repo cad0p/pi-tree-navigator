@@ -34,7 +34,7 @@ This repo uses [`cad0p/semver-calver-release`](https://github.com/cad0p/semver-c
 
 ### Requirements
 
-- **pi 0.81+** with at least one model provider configured.
+- **pi 0.81+** (node ≥22.19, which pi 0.81+ itself requires) with at least one model provider configured.
 - Peer dependencies (the source of truth is `package.json` `peerDependencies`):
   - `@earendil-works/pi-coding-agent >=0.81.0`
   - `@earendil-works/pi-agent-core >=0.81.0`
@@ -118,7 +118,7 @@ pnpm run lint      # biome check extensions/
 pnpm run typecheck # tsc --noEmit
 ```
 
-Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against the current pi release (0.83.x at time of writing) is recommended for any pi version bump (the reflection bootstrap depends on internal field shapes).
+Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`) and `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, reflection bootstrap, salvage path — in `index.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests. Additional manual e2e validation against the current pi release (0.84.x at time of writing) is recommended for any pi version bump (the reflection bootstrap depends on internal field shapes).
 
 ## License
 

@@ -1565,6 +1565,185 @@ describe("dispatch: rewind happy path", () => {
       "summarize must NOT receive streamFn when provider has no streamSimple",
     );
   });
+
+  it("omits streamFn when getProvider returns undefined", async () => {
+    // modelRegistry.getProvider(providerId) can return undefined (unknown
+    // provider, or a host where the provider isn't composed yet). Must fall
+    // back to the previous behavior (no streamFn).
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => undefined;
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "undefined-provider fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when getProvider returns undefined",
+    );
+  });
+
+  it("omits streamFn when getProvider throws (defensive catch)", async () => {
+    // A hostile/older modelRegistry may throw from getProvider. The
+    // resolveProviderStreamFn try/catch must degrade to no streamFn rather
+    // than failing the rewind.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => {
+        throw new Error("registry exploded");
+      };
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "throwing-provider fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when getProvider throws",
+    );
+  });
+
+  it("forwards streamSimple when it is not a function (truthy but invalid)", async () => {
+    // `provider?.streamSimple` truthiness is the only guard; a truthy
+    // non-function would previously be forwarded. Pin the current behavior
+    // (forwarded as-is) so a future hardening (typeof check) is a visible
+    // change, not a silent fix.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    const notAFunction = "not-a-function";
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: notAFunction });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "non-function streamSimple pin focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      notAFunction,
+      "summarize receives the truthy streamSimple verbatim (current behavior pin)",
+    );
+  });
+
+  it("strips null header-deletion markers before passing headers", async () => {
+    // pi 0.84+ ProviderHeaders can carry string|null; null marks a header
+    // deletion. generateBranchSummary expects Record<string, string>, and
+    // pi's own withoutDeletedHeaders drops nulls — mirror that.
+    let capturedHeaders: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedHeaders = (opts as { headers?: unknown }).headers;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Auth headers with a null deletion marker + a real header.
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: { "x-real": "value", "x-deleted": null },
+    });
+    // Provider present so the rewind path reaches summarize.
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: async () => ({}) as never });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "null-header stripping regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(
+      capturedHeaders,
+      { "x-real": "value" },
+      "null-marked headers must be stripped before summarize",
+    );
+  });
 });
 
 // =============================================================================
