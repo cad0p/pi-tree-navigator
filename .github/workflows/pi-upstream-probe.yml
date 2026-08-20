@@ -85,7 +85,7 @@ jobs:
       # Dedupe: an OPEN issue with the same title already exists → comment
       # the run URL instead of creating a duplicate (vvterm pattern).
       - name: Alarm on probe failure
-        if: failure() && steps.probe.outcome == 'failure'
+        if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -93,9 +93,9 @@ jobs:
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           STEP="$(cat "$RUNNER_TEMP/pi-probe-step" 2>/dev/null || echo unknown)"
-          VERSION="${{ steps.resolve.outputs.version }}"
+          VERSION="${{ steps.resolve.outputs.version || 'unknown' }}"
 
-          TITLE="pi-upstream-probe ALARM: ${STEP} breaks navigate-tree reflection (pi-coding-agent ${VERSION})"
+          TITLE="pi-upstream-probe ALARM: ${STEP} breaks navigate-tree reflection"
           EXISTING="$(gh issue list --repo "$REPO" --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
           if [[ -n "$EXISTING" ]]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "Repeat occurrence — probe run: ${RUN_URL}" >/dev/null

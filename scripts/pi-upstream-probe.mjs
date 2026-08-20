@@ -26,7 +26,7 @@
  */
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 import path from "node:path";
 
 const require = createRequire(import.meta.url);
@@ -111,6 +111,26 @@ try {
     typeof SessionManager?.prototype?.buildSessionContext === "function",
     typeof SessionManager?.prototype?.buildSessionContext,
   );
+  // The extension calls it with NO args and expects { messages } back
+  // (index.ts: refreshAgentMessages). A signature change (required param)
+  // or a return-shape change would pass the existence check above but
+  // throw/break at runtime — so call it for real.
+  let bscResult = null;
+  let bscThrew = null;
+  try {
+    bscResult = SessionManager.prototype.buildSessionContext.call({
+      getEntries: () => [],
+      leafId: null,
+      byId: new Map(),
+    });
+  } catch (e) {
+    bscThrew = e instanceof Error ? e.message : String(e);
+  }
+  check(
+    "buildSessionContext callable with no args → { messages }",
+    !bscThrew && bscResult && Array.isArray(bscResult.messages),
+    bscThrew ? `threw: ${bscThrew}` : Array.isArray(bscResult?.messages) ? "returns messages array" : "no messages array",
+  );
 
   // --- 4. Agent.state accessor + messages writable ---
   check("Agent exported (pi-agent-core)", typeof Agent === "function", typeof Agent);
@@ -122,25 +142,28 @@ try {
   );
 
   // agent.state.messages: the extension ASSIGNS it. In pi-agent-core the
-  // state setter copies the array (see agent.js: "Assigning state.tools or
-  // state.messages copies the provided top-level array"). Verify the setter
-  // accepts messages assignment — the state accessor returns an object with
-  // settable messages. Source check on agent.js:
+  // state setter copies the array (see agent.js createMutableAgentState:
+  // `set messages(nextMessages) { messages = nextMessages.slice() }`).
+  // Verify the accessor pair exists in source (stronger than a bare
+  // `includes("messages")` — catches getter-only messages, which would
+  // make the assignment throw in strict mode / silently no-op).
   const agentSrc = readFileSync(
     path.join(path.dirname(coreDist), "agent.js"),
     "utf8",
   );
   check(
-    "state.messages writable (source: setter copies)",
-    /messages/.test(agentSrc) && !agentSrc.includes("this.#state"),
-    agentSrc.includes("this.#state") ? "#-private state" : "plain state field",
+    "state.messages writable (source: set messages accessor)",
+    /set\s+messages\s*\(/.test(agentSrc) &&
+      /get\s+messages\s*\(/.test(agentSrc) &&
+      !agentSrc.includes("this.#state"),
+    agentSrc.includes("this.#state")
+      ? "#-private state"
+      : /set\s+messages\s*\(/.test(agentSrc)
+        ? "set messages accessor found"
+        : "set messages accessor MISSING",
   );
 } catch (e) {
   check("probe crashed", false, String(e.stack || e.message));
-}
-
-function pathToFileURL(p) {
-  return new URL(`file://${p}`);
 }
 
 console.log(`\n${failures.length} of ${results.length} checks failed`);
