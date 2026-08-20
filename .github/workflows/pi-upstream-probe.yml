@@ -1,0 +1,113 @@
+# Pi upstream reflection probe — daily check that the two remaining
+# reflection points in navigate-tree still work against the latest
+# @earendil-works/pi-coding-agent / @earendil-works/pi-agent-core.
+#
+# Why (issue #17): the extension patches `AgentSession.prototype.prompt`
+# and assigns `agent.state.messages` (pi internals, not public API). Pi
+# has broken these before without a version bump surfacing it (0.80.3
+# added prepareNextTurnWithContext and silently dead-ended the
+# prepareNextTurn-only hook until v0.1.1). This probe fails LOUDLY the
+# day upstream changes shape, instead of the extension silently
+# degrading in production.
+#
+# How: every day (or on workflow_dispatch) the probe job installs the
+# LATEST pi-coding-agent + pi-agent-core into a temp dir and runs
+# scripts/pi-upstream-probe.mjs against them. The probe checks:
+#   1. AgentSession.prototype.prompt — writable plain data property
+#   2. sessionManager plain-field assignment in AgentSession ctor
+#   3. SessionManager.prototype.buildSessionContext exists
+#   4. Agent.prototype.state readable + state.messages writable
+# Any FAIL → exit 1 → the alarm step files an issue (deduped by title,
+# label `pi-upstream-probe`). A repeat occurrence comments on the
+# existing open issue instead of creating a duplicate.
+#
+# Precedent: cad0p/vvterm `.github/workflows/ghostty-upstream-probe.yml`
+# (same alarm/dedupe pattern for upstream ghostty drift).
+
+name: Pi Upstream Probe
+
+on:
+  schedule:
+    - cron: '30 5 * * *'   # Daily 05:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write   # alarm issues
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Track failing step (resolve version)
+        run: echo "resolve-version" > "$RUNNER_TEMP/pi-probe-step"
+
+      - name: Resolve latest pi-coding-agent version
+        id: resolve
+        run: |
+          VERSION="$(npm view @earendil-works/pi-coding-agent version)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest @earendil-works/pi-coding-agent: $VERSION"
+
+      - name: Track failing step (install deps)
+        run: echo "install-deps" > "$RUNNER_TEMP/pi-probe-step"
+
+      - name: Install latest pi-coding-agent + pi-agent-core
+        run: |
+          mkdir -p /tmp/pi-probe
+          cd /tmp/pi-probe
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund @earendil-works/pi-coding-agent@latest @earendil-works/pi-agent-core@latest >/dev/null 2>&1
+          echo "installed:"
+          node -e "const fs=require('fs'); for (const p of ['@earendil-works/pi-coding-agent','@earendil-works/pi-agent-core']) { try { console.log('  ' + p + ' ' + JSON.parse(fs.readFileSync('node_modules/' + p + '/package.json','utf8')).version) } catch (e) { console.log('  ' + p + ' MISSING') } }"
+
+      - name: Track failing step (run probe)
+        run: echo "run-probe" > "$RUNNER_TEMP/pi-probe-step"
+
+      - name: Run reflection probe against latest
+        id: probe
+        env:
+          PROBE_NODE_MODULES: /tmp/pi-probe/node_modules
+        run: node "$GITHUB_WORKSPACE/scripts/pi-upstream-probe.mjs"
+
+      # If the probe step failed (non-zero exit), file an alarm issue.
+      # Dedupe: an OPEN issue with the same title already exists → comment
+      # the run URL instead of creating a duplicate (vvterm pattern).
+      - name: Alarm on probe failure
+        if: failure() && steps.probe.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          STEP="$(cat "$RUNNER_TEMP/pi-probe-step" 2>/dev/null || echo unknown)"
+          VERSION="${{ steps.resolve.outputs.version }}"
+
+          TITLE="pi-upstream-probe ALARM: ${STEP} breaks navigate-tree reflection (pi-coding-agent ${VERSION})"
+          EXISTING="$(gh issue list --repo "$REPO" --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [[ -n "$EXISTING" ]]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "Repeat occurrence — probe run: ${RUN_URL}" >/dev/null
+            echo "Updated existing alarm issue #${EXISTING} (${TITLE})"
+          else
+            cp "$GITHUB_WORKSPACE/scripts/alarm-body.md" "$RUNNER_TEMP/alarm-body.md"
+            sed -i "s|STEP_PLACEHOLDER|${STEP}|g; s|RUN_URL_PLACEHOLDER|${RUN_URL}|g; s|VERSION_PLACEHOLDER|${VERSION}|g" "$RUNNER_TEMP/alarm-body.md"
+            gh label create pi-upstream-probe --repo "$REPO" --description "Pi upstream probe alarm — navigate-tree reflection broken" --color b60205 >/dev/null 2>&1 || true
+            if gh label view pi-upstream-probe --repo "$REPO" >/dev/null 2>&1; then
+              gh issue create --repo "$REPO" --title "$TITLE" --label pi-upstream-probe --body-file "$RUNNER_TEMP/alarm-body.md"
+            else
+              echo "::warning::pi-upstream-probe label unavailable — creating issue without label."
+              gh issue create --repo "$REPO" --title "$TITLE" --body-file "$RUNNER_TEMP/alarm-body.md"
+            fi
+          fi
