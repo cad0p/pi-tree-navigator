@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.1.2] - 2026-08-20
 
 <!-- USER-EDITABLE SECTION START -->
 Patch release: fixes rewind summarization for custom-api providers and eliminates 3 of the 5 reflection points via public APIs.
