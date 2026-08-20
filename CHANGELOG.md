@@ -2,18 +2,6 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
-
-<!-- USER-EDITABLE SECTION START -->
-### 🐛 Bug Fixes
-
-- **Rewind failed for custom-api providers** (e.g. pi-commandcode-provider 0.5.x with `api: "commandcode-custom"`): `generateBranchSummary` was called without `streamFn`, so summarization fell back to the pi-ai compat registry, which only knows builtin apis and threw `No API provider registered for api: <custom-id>`. Rewind now passes the composed provider's `streamSimple` (via the public `ctx.modelRegistry.getProvider()` API, pi ≥0.81.0) as `streamFn`, mirroring pi's own `branchWithSummary`.
-
-### ⚠️ Breaking-ish
-
-- Peer floor bumped to `@earendil-works/pi-coding-agent >=0.81.0` / `@earendil-works/pi-agent-core >=0.81.0` (requires `ModelRegistry.getProvider`, added in pi 0.81.0). Requires node ≥22.19.
-<!-- USER-EDITABLE SECTION END -->
-
 ## [0.1.1] - 2026-07-31
 
 <!-- USER-EDITABLE SECTION START -->
