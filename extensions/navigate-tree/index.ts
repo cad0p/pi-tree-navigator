@@ -22,10 +22,10 @@
  *   this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
  *
  * Risks of the reflection approach:
- *   • If pi switches any of the six fields this extension reads —
+ *   • If pi switches any of the five fields this extension reads —
  *     `AgentSession.prototype.prompt`, `agent.state.messages`,
- *     `agent.state.systemPrompt`, `agent.state.tools`,
- *     `agent.prepareNextTurn`, or `agent.prepareNextTurnWithContext` —
+ *     `agent.state.systemPrompt`, `agent.state.tools`, or
+ *     `agent.prepareNextTurnWithContext` —
  *     to ES `#` private fields, this breaks fundamentally.
  *   • If pi renames or restructures any of these fields, this breaks.
  *   • Patches `AgentSession.prototype.prompt` globally on import; not
@@ -33,18 +33,21 @@
  *     the pi process, including sessions that never call
  *     `navigate_tree`.
  *
- * Verified against pi 0.75.5 (`prepareNextTurn` path) and pi 0.83.0
- * (`prepareNextTurnWithContext` path — required since pi 0.80.3, see
- * `installPrepareNextTurn`).
+ * Verified against pi 0.81.0 (`prepareNextTurnWithContext` path —
+ * required since pi 0.80.3, see `installPrepareNextTurn`).
  */
 
-import { estimateContextTokens } from "@earendil-works/pi-agent-core";
+import {
+  estimateContextTokens,
+  type StreamFn,
+} from "@earendil-works/pi-agent-core";
 import {
   AgentSession,
   buildSessionContext,
   collectEntriesForBranchSummary,
   type ExtensionAPI,
   generateBranchSummary,
+  type ModelRegistry,
   type SessionEntry,
   type SessionManager,
 } from "@earendil-works/pi-coding-agent";
@@ -169,7 +172,7 @@ type PntResult = {
   model?: unknown;
   thinkingLevel?: unknown;
 };
-// pi 0.75.5 invokes `agent.prepareNextTurn(signal)` from
+// pi ≤0.80.2 invokes `agent.prepareNextTurn(signal)` from
 // `Agent.createLoopConfig` — a single AbortSignal argument. Since pi
 // 0.80.3 the loop instead invokes
 // `agent.prepareNextTurnWithContext(nextTurnContext, signal)` (and only
@@ -178,7 +181,7 @@ type PntResult = {
 // `AgentLoopConfig.prepareNextTurn(context: PrepareNextTurnContext)`
 // shape, which `Agent` is bridging. We accept whatever pi passes and
 // forward it verbatim to the prior wrapper so we don't fight a future
-// signature alignment. Verified against pi-coding-agent 0.75.5 and
+// signature alignment. Verified against pi-coding-agent 0.81.0 and
 // 0.83.0; revisit if the call site changes.
 type PntFn = (...args: unknown[]) => Promise<PntResult> | PntResult;
 type MarkedPntFn = PntFn & {
@@ -354,6 +357,47 @@ function findOwningSession(sm: SessionManager): AgentSession | null {
     }
   }
   return null;
+}
+
+/**
+ * Resolve the provider's `streamSimple` for summarization routing via the
+ * PUBLIC modelRegistry API (no reflection).
+ *
+ * Custom providers registered via `pi.registerProvider(name, { api:
+ * <custom-id>, streamSimple })` are composed into the ModelRuntime provider
+ * returned by `ctx.modelRegistry.getProvider(...)` — its `streamSimple`
+ * dispatches to the extension handler (provider-composer `streamWith`).
+ * Without passing it as `streamFn` to `generateBranchSummary`,
+ * completeSummarization falls back to the pi-ai compat registry (builtin
+ * apis only) and throws "No API provider registered for api: <custom-id>".
+ */
+function resolveProviderStreamFn(
+  modelRegistry: ModelRegistry,
+  providerId: string,
+): { streamFn: StreamFn } | undefined {
+  try {
+    const provider = modelRegistry.getProvider(providerId);
+    return provider?.streamSimple
+      ? { streamFn: provider.streamSimple as StreamFn }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Drop `null` header-deletion markers (pi 0.84+ `ProviderHeaders` can carry
+ * `string | null` values). Mirrors pi's own `withoutDeletedHeaders` in
+ * agent-session.js — `generateBranchSummary` expects `Record<string, string>`.
+ */
+function stripNullHeaders(
+  headers: Record<string, string | null> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const entries = Object.entries(headers).filter((entry) => entry[1] !== null);
+  return entries.length > 0
+    ? (Object.fromEntries(entries) as Record<string, string>)
+    : undefined;
 }
 
 function refreshAgentMessages(sm: SessionManager): boolean {
@@ -787,11 +831,28 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       }
 
       const result = await summarize(entries, {
-        model: ctx.model,
+        // `auth.baseUrl` (OAuth/credential-derived endpoint, e.g.
+        // githubCopilotOAuth) must be applied to the model, mirroring pi's
+        // own `_getSummarizationRequestAuth` (`result.auth.baseUrl ?
+        // { ...model, baseUrl: result.auth.baseUrl } : model`).
+        model: auth.baseUrl
+          ? { ...ctx.model, baseUrl: auth.baseUrl }
+          : ctx.model,
         apiKey: auth.apiKey ?? "",
-        headers: auth.headers,
+        headers: stripNullHeaders(auth.headers),
+        ...(auth.env ? { env: auth.env } : {}),
         signal: signal ?? new AbortController().signal,
         customInstructions: p.summaryFocus,
+        // Route through the composed provider's `streamSimple` (public
+        // modelRegistry API) instead of the pi-ai compat registry.
+        // Custom providers registered via `pi.registerProvider(name,
+        // { api: <custom-id>, streamSimple })` are NOT visible to the
+        // compat registry (which only knows builtin apis) — without this,
+        // rewind fails with "No API provider registered for api:
+        // <custom-id>" for any custom-api provider (e.g. commandcode 0.5.x
+        // with api "commandcode-custom").
+        ...(resolveProviderStreamFn(ctx.modelRegistry, ctx.model.provider) ??
+          {}),
       });
       if (result.aborted) {
         return toolError("Summarization aborted.");

@@ -1471,6 +1471,339 @@ describe("dispatch: rewind happy path", () => {
       );
     }
   });
+
+  it("passes the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
+    // Regression: rewind failed with "No API provider registered for api:
+    // commandcode-custom" for providers registered via
+    // pi.registerProvider(name, { api: <custom-id>, streamSimple }) because
+    // generateBranchSummary was called WITHOUT streamFn, making
+    // completeSummarization fall back to the pi-ai compat registry (which
+    // only knows builtin apis). The fix forwards the composed provider's
+    // `streamSimple` via the public modelRegistry.getProvider() API — the
+    // same routing pi's own branchWithSummary uses.
+    // A regression that drops the forwarding re-introduces the failure for
+    // commandcode 0.5.x and every other custom-api provider.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Simulate a custom-api provider (e.g. commandcode 0.5.x with
+    // api "commandcode-custom"): the composed provider exposes
+    // `streamSimple` via the public modelRegistry.getProvider().
+    const providerStreamSimple = async () => ({}) as never;
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: providerStreamSimple });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "custom-api stream routing regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      providerStreamSimple,
+      "summarize must receive the provider's streamSimple as streamFn",
+    );
+  });
+
+  it("omits streamFn when the provider has no streamSimple (builtin-compat fallback)", async () => {
+    // A provider whose composed entry lacks `streamSimple` (or a
+    // modelRegistry without getProvider, e.g. pre-0.81 hosts) must fall
+    // back to the previous behavior: no streamFn → pi-ai compat dispatch.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Provider exists but has no streamSimple.
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({});
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "no-streamSimple fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when provider has no streamSimple",
+    );
+  });
+
+  it("omits streamFn when getProvider returns undefined", async () => {
+    // modelRegistry.getProvider(providerId) can return undefined (unknown
+    // provider, or a host where the provider isn't composed yet). Must fall
+    // back to the previous behavior (no streamFn).
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => undefined;
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "undefined-provider fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when getProvider returns undefined",
+    );
+  });
+
+  it("omits streamFn when getProvider throws (defensive catch)", async () => {
+    // A hostile/older modelRegistry may throw from getProvider. The
+    // resolveProviderStreamFn try/catch must degrade to no streamFn rather
+    // than failing the rewind.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => {
+        throw new Error("registry exploded");
+      };
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "throwing-provider fallback regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      undefined,
+      "summarize must NOT receive streamFn when getProvider throws",
+    );
+  });
+
+  it("forwards streamSimple when it is not a function (truthy but invalid)", async () => {
+    // `provider?.streamSimple` truthiness is the only guard; a truthy
+    // non-function would previously be forwarded. Pin the current behavior
+    // (forwarded as-is) so a future hardening (typeof check) is a visible
+    // change, not a silent fix.
+    let capturedStreamFn: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    const notAFunction = "not-a-function";
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: notAFunction });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "non-function streamSimple pin focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      capturedStreamFn,
+      notAFunction,
+      "summarize receives the truthy streamSimple verbatim (current behavior pin)",
+    );
+  });
+
+  it("strips null header-deletion markers before passing headers", async () => {
+    // pi 0.84+ ProviderHeaders can carry string|null; null marks a header
+    // deletion. generateBranchSummary expects Record<string, string>, and
+    // pi's own withoutDeletedHeaders drops nulls — mirror that.
+    let capturedHeaders: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedHeaders = (opts as { headers?: unknown }).headers;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    // Auth headers with a null deletion marker + a real header.
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: { "x-real": "value", "x-deleted": null },
+    });
+    // Provider present so the rewind path reaches summarize.
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: async () => ({}) as never });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "null-header stripping regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(
+      capturedHeaders,
+      { "x-real": "value" },
+      "null-marked headers must be stripped before summarize",
+    );
+  });
+
+  it("forwards auth.baseUrl onto the model and auth.env (OAuth-derived endpoints)", async () => {
+    // pi's own _getSummarizationRequestAuth applies `result.auth.baseUrl`
+    // onto the model (OAuth/credential-derived endpoints, e.g.
+    // githubCopilotOAuth) and forwards `env`. The extension must mirror
+    // that — dropping baseUrl would hit the catalog default endpoint.
+    let capturedModel: unknown;
+    let capturedEnv: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedModel = (opts as { model?: unknown }).model;
+      capturedEnv = (opts as { env?: unknown }).env;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      baseUrl: "https://oauth-derived.example.com",
+      env: { FOO: "bar" },
+    });
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({ streamSimple: async () => ({}) as never });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "oauth baseUrl/env forwarding regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (capturedModel as { baseUrl?: string } | undefined)?.baseUrl,
+      "https://oauth-derived.example.com",
+      "auth.baseUrl must be applied onto the summarization model",
+    );
+    assert.deepEqual(
+      capturedEnv,
+      { FOO: "bar" },
+      "auth.env must be forwarded to summarize",
+    );
+  });
 });
 
 // =============================================================================
