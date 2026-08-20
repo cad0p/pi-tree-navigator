@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 
 - *(rewind)* Route summarization through provider streamSimple (public API) (closes #13)
 
+### 🚜 Refactor
+
+- Eliminate 3 of 5 reflection points via public context event (closes #14)
+
 ### 📚 Documentation
 
 - Update reflection field count/versions and dev commands for v0.1.1 reality ([#9](https://github.com/cad0p/pi-tree-navigator/pull/9))
