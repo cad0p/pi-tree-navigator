@@ -41,18 +41,16 @@ function check(name, ok, detail = "") {
 
 // Resolve the package dist paths (ESM-only packages).
 function resolveDist(pkgName, entry = "dist/index.js") {
-  // 1. try require.resolve on package.json (CJS packages)
-  try {
-    const pkgJson = require.resolve(`${pkgName}/package.json`);
-    const dir = path.dirname(pkgJson);
-    return path.join(dir, entry);
-  } catch {}
-  // 2. walk node_modules for the package dir (pnpm/ESM-only)
-  for (const base of [
-    path.join(process.cwd(), "node_modules"),
-    path.resolve(process.cwd(), "../node_modules"),
-    ...(process.env.PROBE_NODE_MODULES ? [process.env.PROBE_NODE_MODULES] : []),
-  ]) {
+  // PROBE_NODE_MODULES, when set, is authoritative: the workflow installs the
+  // LATEST packages there, and the probe must inspect those — NOT the repo's
+  // own node_modules (dev-deps) or anything require.resolve finds via cwd.
+  // require.resolve from cwd can also short-circuit to the repo's version for
+  // packages that DO export package.json (e.g. pi-agent-core), which would
+  // make the probe pass trivially against a stale version.
+  const bases = process.env.PROBE_NODE_MODULES
+    ? [process.env.PROBE_NODE_MODULES]
+    : [path.join(process.cwd(), "node_modules"), path.resolve(process.cwd(), "../node_modules")];
+  for (const base of bases) {
     try {
       const scoped = pkgName.startsWith("@")
         ? path.join(base, ...pkgName.split("/"), "package.json")
