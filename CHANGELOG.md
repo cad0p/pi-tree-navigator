@@ -16,6 +16,10 @@ All notable changes to this project will be documented in this file.
 
 - *(rewind)* Reject degenerate rewinds below a min-savings floor (closes #21, closes #20)
 
+### ⚙️ Miscellaneous Tasks
+
+- *(tooldef)* Trim navigate_tree tool definition (~848 → ~470 tok/request) (closes #22)
+
 
 ## [0.1.2] - 2026-08-20
 
