@@ -518,16 +518,15 @@ export default function (
     promptGuidelines: [
       "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
     ],
-    description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, \`rewind\` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.
+    description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
+\`rewind\` does not restore prior state: it forks a sibling branch from the anchor and continues forward from a model-generated summary.
 
-Operations (set the \`action\` parameter):
-  • action='anchor', name='<milestone-name>': label the current point so a later rewind can target it. Use at the start of a stage you'll summarize (e.g. 'design-start', 'impl-start'). If the same name already exists on the active branch, the prior label is moved to the new leaf (no duplicates).
-  • action='rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary. The new summary entry is itself labeled with labelEnd, so you can chain rewinds.
-  • action='list': show all named anchors on the active branch in chronological order, with cumulative context % at each anchor.
+Operations (set \`action\`):
+  • 'anchor', name='<milestone-name>': label the current point. Anchor at the start of a stage you'll summarize (e.g. 'impl-start').
+  • 'rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary labeled labelEnd, so rewinds can chain.
+  • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
 
-Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor namespace — either becomes addressable as a future \`labelStart\`. \`list\` shows every anchor under the \`anchor:\` prefix, regardless of which action wrote it. Pi labels written via \`/label anchor:foo\` (manually or by other extensions) are also addressable here. Avoid the \`anchor:\` prefix in manually-set labels.
-
-\`summaryFocus\` is required when \`action='rewind'\` (≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim). Calls without it are rejected. It's passed to pi's \`generateBranchSummary\` as \`customInstructions\`, biasing the summarizer LLM toward the agent's specified focus while it rewrites the collapsed work into pi's structured summary format. To preserve continuity, instruct the summarizer to keep: (1) the user's most recent message verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.`,
+\`name\` (anchor) and \`labelEnd\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`labelStart\`. Avoid the reserved \`anchor:\` prefix.`,
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
@@ -541,28 +540,27 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       action: Type.Union(
         [Type.Literal("anchor"), Type.Literal("rewind"), Type.Literal("list")],
         {
-          description:
-            "Which operation to perform. 'anchor' labels the current point, 'rewind' collapses work between an anchor and the current leaf into a branch_summary, 'list' shows every anchor on the active branch.",
+          description: "Which operation to perform.",
         },
       ),
       name: Type.Optional(
         Type.String({
-          description: `Required when action='anchor'. Kebab-case label (max ${MAX_NAME_LENGTH} chars) for the milestone. If a label with this name already exists on the active branch, it is moved to the new leaf.`,
+          description: `Required when action='anchor'. Kebab-case milestone label, max ${MAX_NAME_LENGTH} chars.`,
         }),
       ),
       labelStart: Type.Optional(
         Type.String({
-          description: `Required when action='rewind'. Kebab-case name (max ${MAX_NAME_LENGTH} chars) of an existing anchor on the active branch — work between this anchor and the current leaf is summarized.`,
+          description: `Required when action='rewind'. Kebab-case name of an existing anchor on the active branch to rewind to.`,
         }),
       ),
       labelEnd: Type.Optional(
         Type.String({
-          description: `Required when action='rewind'. Kebab-case name (max ${MAX_NAME_LENGTH} chars) for the resulting branch_summary entry. If a label with this name already exists on the active branch, it is moved to the new entry (mirrors anchor's move-on-collision). Becomes addressable as a future labelStart.`,
+          description: `Required when action='rewind'. Kebab-case label for the resulting branch_summary entry; reusable as a future labelStart.`,
         }),
       ),
       summaryFocus: Type.Optional(
         Type.String({
-          description: `Required when action='rewind'. ≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim. Should encode (1) the user's most recent instruction verbatim, (2) what was done in the collapsed segment, (3) what's left to do as a next action.`,
+          description: `Required when action='rewind'; ≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim. Encode: (1) the user's most recent instruction verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.`,
         }),
       ),
     }),

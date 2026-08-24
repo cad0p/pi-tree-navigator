@@ -533,6 +533,85 @@ describe("schema shape \u2014 Kiro compatibility", () => {
 });
 
 // =============================================================================
+// Tool definition text — issue #22 token-trim pins
+// =============================================================================
+
+describe("tool definition \u2014 #22 token-trim pins", () => {
+  // Owner-approved copy from issue #22 (~848 → ~470 tok/request). The
+  // expectations are reconstructed with the SAME template literals the
+  // source interpolates (${MAX_NAME_LENGTH}, ${MIN_SUMMARY_FOCUS_LENGTH})
+  // so constant re-tunes stay honest — hardcoding 40/20 here would let a
+  // schema/expectation desync slip through.
+  const expectedDescription = `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
+\`rewind\` does not restore prior state: it forks a sibling branch from the anchor and continues forward from a model-generated summary.
+
+Operations (set \`action\`):
+  • 'anchor', name='<milestone-name>': label the current point. Anchor at the start of a stage you'll summarize (e.g. 'impl-start').
+  • 'rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary labeled labelEnd, so rewinds can chain.
+  • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
+
+\`name\` (anchor) and \`labelEnd\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`labelStart\`. Avoid the reserved \`anchor:\` prefix.`;
+
+  it("description byte-equals the issue-approved trimmed string", () => {
+    // Byte-exact snapshot: any wording change to the tool description must
+    // land consciously through these pins, not by silent drift.
+    const { tool } = setup();
+    assert.equal(tool.description, expectedDescription);
+  });
+
+  it("each parameter description byte-equals its issue-approved string", () => {
+    const { tool } = setup();
+    const props = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties;
+    assert.equal(props.action.description, "Which operation to perform.");
+    assert.equal(
+      props.name.description,
+      `Required when action='anchor'. Kebab-case milestone label, max ${MAX_NAME_LENGTH} chars.`,
+    );
+    assert.equal(
+      props.labelStart.description,
+      `Required when action='rewind'. Kebab-case name of an existing anchor on the active branch to rewind to.`,
+    );
+    assert.equal(
+      props.labelEnd.description,
+      `Required when action='rewind'. Kebab-case label for the resulting branch_summary entry; reusable as a future labelStart.`,
+    );
+    assert.equal(
+      props.summaryFocus.description,
+      `Required when action='rewind'; ≥${MIN_SUMMARY_FOCUS_LENGTH} chars after trim. Encode: (1) the user's most recent instruction verbatim, (2) what's done in the collapsed segment, (3) what's left to do as a next action.`,
+    );
+  });
+
+  it("re-bloat tripwire: description + param descriptions stay ≤400 tok at chars/4", () => {
+    // Every character of the tool definition is paid per request. The #22
+    // trim lands at 1485 chars = 371.25 tok; this bound guards against
+    // silently regrowing the schema — a future legit edit that needs more
+    // room must raise this number consciously, not bleed past it.
+    const { tool } = setup();
+    const props = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties;
+    const all = [
+      tool.description,
+      props.action.description ?? "",
+      props.name.description ?? "",
+      props.labelStart.description ?? "",
+      props.labelEnd.description ?? "",
+      props.summaryFocus.description ?? "",
+    ].join("");
+    assert.ok(
+      all.length / 4 <= 400,
+      `tool definition re-bloated: ${all.length} chars = ${(all.length / 4).toFixed(2)} tok > 400`,
+    );
+  });
+});
+
+// =============================================================================
 // production-default `summarize` resolution
 // =============================================================================
 
