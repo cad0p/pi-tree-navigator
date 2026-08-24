@@ -99,6 +99,8 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 
+- **Tiny rewinds are rejected by a minimum-savings floor.** A `rewind` whose measured savings falls below an internal floor (~4k tokens of apparent context freed) is refused with guidance listing the active anchors instead of executing — collapsing a near-empty segment burns a summarizer LLM call and can even grow live context once the summary and its synthetic assistant land on the kept chain. This pairs with anchoring early: anchor at the start of a stage, then rewind only once real work has accumulated above the anchor.
+
 - **Abandoned branches grow the JSONL forever.** Each rewind preserves the abandoned subtree on disk. Session files get bigger over time even as live context shrinks. For very long autonomous runs (days), session files can hit hundreds of MB.
 
 - **Tested against Anthropic and Kiro providers.** The synthetic-tool_use trick is specifically for Anthropic's strict tool_use/tool_result pairing; the synthetic's `stopReason: "toolUse"` survives Kiro's `normalizeMessages` filter. Other providers may have different validation rules — untested.

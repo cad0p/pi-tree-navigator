@@ -33,6 +33,7 @@ import navigateTree, {
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
   MAX_SYNTHETIC_FOCUS_LENGTH,
+  MIN_REWIND_SAVINGS_TOKENS,
   MIN_SUMMARY_FOCUS_LENGTH,
 } from "./index.ts";
 
@@ -254,8 +255,11 @@ function makeFakeSession(sm: SessionManager): FakeAgentSession {
 
 /**
  * Build the canonical rewindable fixture: an anchored first assistant turn
- * plus N follow-up turns (default 1), optionally with a captured
- * AgentSession so the reflection bootstrap finds it.
+ * plus N follow-up turns (default 3) whose cumulative usage totals grow well
+ * past MIN_REWIND_SAVINGS_TOKENS above the anchor (the #21 floor rejects
+ * sub-floor rewinds, so every successful-rewind fixture must clear it),
+ * optionally with a captured AgentSession so the reflection bootstrap finds
+ * it.
  *
  * Companion to `rewindFixture()` (which additionally drives the rewind);
  * use this helper when the test needs to control the rewind invocation
@@ -272,8 +276,10 @@ function setupRewindable(
   } = {},
 ): { fake?: FakeAgentSession } {
   const labelStartName = opts.labelStartName ?? "start";
-  const turnsAfter = opts.turnsAfter ?? 1;
-  const tokenCounts = opts.tokenCounts ?? [100, 200, 300, 400, 500];
+  const turnsAfter = opts.turnsAfter ?? 3;
+  const tokenCounts = opts.tokenCounts ?? [
+    6_000, 12_000, 18_000, 24_000, 30_000,
+  ];
   const t1 = appendTurn(sm, "u1", "a1", tokenCounts[0]);
   pi.pi.setLabel(t1.assistantId, `anchor:${labelStartName}`);
   for (let i = 0; i < turnsAfter; i++) {
@@ -353,9 +359,10 @@ describe("context event handler", () => {
     // the delete-wrappper per-turn refresh; a regression here re-opens the
     // "next API call stays pre-rewind" bug.
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
+    appendTurn(sm, "u2", "a2", 14_000);
+    appendTurn(sm, "u3", "a3", 22_000);
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
 
@@ -1179,10 +1186,10 @@ describe("dispatch: rewind happy path", () => {
    */
   async function rewindFixture() {
     const { sm, pi, tool, ctx } = setup();
-    const t1 = appendTurn(sm, "u1", "a1", 100);
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 200);
-    appendTurn(sm, "u3", "a3", 300);
+    appendTurn(sm, "u2", "a2", 15_000);
+    appendTurn(sm, "u3", "a3", 26_000);
 
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
@@ -1309,10 +1316,10 @@ describe("dispatch: rewind happy path", () => {
     // the labeled branch_summary. The next rewind B\u2192C must find the
     // labeled summary (via getBranch walk-up), not the synthetic leaf.
     const { sm, pi, tool, ctx } = setup();
-    const tA = appendTurn(sm, "u1", "a1", 100);
+    const tA = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u2", "a2", 200);
-    appendTurn(sm, "u3", "a3", 300);
+    appendTurn(sm, "u2", "a2", 12_000);
+    appendTurn(sm, "u3", "a3", 18_000);
 
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
@@ -1333,8 +1340,8 @@ describe("dispatch: rewind happy path", () => {
     const sumB = r1.details.summaryId as string;
 
     // Append more turns post-rewind.
-    appendTurn(sm, "u4", "a4", 400);
-    appendTurn(sm, "u5", "a5", 500);
+    appendTurn(sm, "u4", "a4", 24_000);
+    appendTurn(sm, "u5", "a5", 30_000);
 
     const r2 = await tool.execute(
       "tc-2",
@@ -1401,11 +1408,12 @@ describe("dispatch: rewind happy path", () => {
     // — anchor:b lives on both tB and summaryId on the active branch.
     // The move-on-collision clears tB's label.
     const { sm, pi, tool, ctx } = setup();
-    const tB = appendTurn(sm, "u1", "a1", 100);
+    const tB = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(tB.assistantId, "anchor:b");
-    const tA = appendTurn(sm, "u2", "a2", 200);
+    const tA = appendTurn(sm, "u2", "a2", 16_000);
     pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u3", "a3", 300);
+    appendTurn(sm, "u3", "a3", 22_000);
+    appendTurn(sm, "u4", "a4", 28_000);
 
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
@@ -2390,7 +2398,7 @@ describe("dispatch: rewind salvage path", () => {
     const { fake } = setupRewindable(sm, pi, {
       capture: true,
       turnsAfter: 2,
-      tokenCounts: [100, 200, 300],
+      tokenCounts: [6_000, 14_000, 22_000],
     });
     if (!fake) throw new Error("capture: true must return fake");
 
@@ -2709,7 +2717,7 @@ describe("dispatch: rewind salvage path", () => {
     setupRewindable(sm, pi, {
       capture: true,
       turnsAfter: 2,
-      tokenCounts: [100, 200, 300],
+      tokenCounts: [6_000, 14_000, 22_000],
     });
 
     // Trip `getBranch` ONLY after a `branch_summary` entry exists on
@@ -2793,11 +2801,12 @@ describe("dispatch: rewind salvage path", () => {
     // off tB. We arm setLabel to throw on call #2 (B) only — #1 (A)
     // succeeds, #3 (the salvage retry of B) succeeds.
     const { sm, pi, tool, ctx } = setup();
-    const tB = appendTurn(sm, "u1", "a1", 100);
+    const tB = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(tB.assistantId, "anchor:b");
-    const tA = appendTurn(sm, "u2", "a2", 200);
+    const tA = appendTurn(sm, "u2", "a2", 16_000);
     pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u3", "a3", 300);
+    appendTurn(sm, "u3", "a3", 22_000);
+    appendTurn(sm, "u4", "a4", 28_000);
 
     // Patch AFTER the pre-anchor writes so the counter starts at 0.
     // Call #1 inside execute = (A) the new labelEnd write; call #2 = (B)
@@ -2895,11 +2904,12 @@ describe("dispatch: rewind salvage path", () => {
     // either retry (A) (silently succeeding, no detail) or surface
     // the wrong salvage-detail string.
     const { sm, pi, tool, ctx } = setup();
-    const tB = appendTurn(sm, "u1", "a1", 100);
+    const tB = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(tB.assistantId, "anchor:b");
-    const tA = appendTurn(sm, "u2", "a2", 200);
+    const tA = appendTurn(sm, "u2", "a2", 16_000);
     pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u3", "a3", 300);
+    appendTurn(sm, "u3", "a3", 22_000);
+    appendTurn(sm, "u4", "a4", 28_000);
 
     // Patch after pre-anchors. Throw on call #2 onward (B and the
     // retry of B). Call #1 (A) succeeds.
@@ -3110,9 +3120,10 @@ describe("dispatch: rewind error branches", () => {
 
   it("chained-rewind no-turns: synthetic-only intervening trips the boundary guard", async () => {
     const { sm, pi, tool, ctx } = setup();
-    const tA = appendTurn(sm, "u1", "a1", 100);
+    const tA = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u2", "a2", 200);
+    appendTurn(sm, "u2", "a2", 14_000);
+    appendTurn(sm, "u3", "a3", 20_000);
 
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
@@ -3166,6 +3177,14 @@ describe("dispatch: rewind error branches", () => {
     // discriminator ("just check the toolCall name") would re-classify
     // this as a synthetic and trip a spurious 'Already at synthetic
     // boundary' error \u2014 catching that here.
+    // Synthetic-discriminator fall-through pin, scoped post-#21: a lone
+    // intervening message shaped like anything other than our synthetic
+    // must fall through the synthetic-shape check — but a chain whose ONLY
+    // content above the anchor is one message is structurally sub-floor
+    // (measured savings ≈ 0), so the min-savings floor rejects it instead
+    // of reaching summarize. The discriminator assertion survives as a
+    // NEGATIVE pin: the error must be the floor rejection, NEVER the
+    // 'Already at synthetic boundary' misfire.
     let summarizeCalled = false;
     const spySummarize = (async () => {
       summarizeCalled = true;
@@ -3228,26 +3247,35 @@ describe("dispatch: rewind error branches", () => {
       undefined,
       ctx,
     );
-    // Pin: rewind proceeded (no boundary-guard error), summarize fired.
+    // Post-#21 scoping: fall-through from the boundary guard lands on the
+    // min-savings floor (the lone-message chain measures ≈0 savings), so
+    // the rewind errors — but with the FLOOR diagnostic, never the
+    // synthetic-boundary misfire this discriminator exists to prevent.
+    assert.equal(r.isError, true);
     assert.equal(
-      r.isError,
-      undefined,
+      (r.details as { rejected?: string }).rejected,
+      "min-savings",
+      "fall-through must land on the min-savings floor, not the boundary guard",
+    );
+    assert.ok(
+      !/synthetic boundary/.test(r.content[0].text),
       "rewind must NOT trip the synthetic-boundary guard on a real navigate_tree call with nonzero usage",
     );
     assert.equal(
       summarizeCalled,
-      true,
-      "summarize must run when the lone intervening message is a real (nonzero-usage) navigate_tree call",
+      false,
+      "sub-floor chains are rejected before summarize",
     );
   });
 
   it("chained-rewind discriminator: lone intervening text-only assistant does NOT trip the guard", async () => {
-    // Synthetic-discriminator fall-through: a text-only assistant message
-    // (no toolCall block) must fall through the guard's first check
-    // (`block.type === 'toolCall'`) so the rewind proceeds normally and
-    // summarize is invoked. A regression that drops the block-shape gate
-    // would mis-classify any assistant turn as 'synthetic' and trip a
-    // spurious 'Already at synthetic boundary' error — catching that here.
+    // Synthetic-discriminator fall-through pin, scoped post-#21: a lone
+    // TEXT-ONLY assistant (no toolCall block) must fall through the guard's
+    // first check (`block.type === 'toolCall'`) — but a chain whose only
+    // content above the anchor is one message is structurally sub-floor, so
+    // the min-savings floor rejects instead of reaching summarize. The
+    // block-shape gate stays pinned negatively: never a synthetic-boundary
+    // misfire.
     let summarizeCalled = false;
     const spySummarize = (async () => {
       summarizeCalled = true;
@@ -3301,26 +3329,32 @@ describe("dispatch: rewind error branches", () => {
       undefined,
       ctx,
     );
+    // Post-#21 scoping: see the sibling nonzero-usage discriminator above.
+    assert.equal(r.isError, true);
     assert.equal(
-      r.isError,
-      undefined,
+      (r.details as { rejected?: string }).rejected,
+      "min-savings",
+      "fall-through must land on the min-savings floor, not the boundary guard",
+    );
+    assert.ok(
+      !/synthetic boundary/.test(r.content[0].text),
       "rewind must NOT trip the synthetic-boundary guard on a text-only assistant",
     );
     assert.equal(
       summarizeCalled,
-      true,
-      "summarize must run when the lone intervening message is a text-only assistant",
+      false,
+      "sub-floor chains are rejected before summarize",
     );
   });
 
   it("chained-rewind discriminator: lone intervening non-navigate_tree toolCall does NOT trip the guard", async () => {
-    // Synthetic-discriminator fall-through: a synthetic-shaped
-    // (zero-usage, stopReason 'toolUse') assistant whose toolCall is for
-    // a DIFFERENT tool (e.g. `bash`) must fall through the
-    // `name === 'navigate_tree'` predicate so the rewind proceeds. A
-    // regression that drops the name gate would mis-classify any
-    // zero-usage toolCall as our synthetic and trip a spurious
-    // 'Already at synthetic boundary' error — catching that here.
+    // Synthetic-discriminator fall-through pin, scoped post-#21: a
+    // synthetic-SHAPED assistant (zero usage + stopReason 'toolUse') whose
+    // toolCall is for a DIFFERENT tool (`bash`) must fall through the
+    // `name === 'navigate_tree'` predicate. The name gate is load-bearing:
+    // without it this chain would trip 'Already at synthetic boundary';
+    // with it, fall-through lands on the min-savings floor (structurally
+    // ≈0 savings) — pinned negatively below.
     let summarizeCalled = false;
     const spySummarize = (async () => {
       summarizeCalled = true;
@@ -3385,15 +3419,351 @@ describe("dispatch: rewind error branches", () => {
       undefined,
       ctx,
     );
+    // Post-#21 scoping: see the sibling nonzero-usage discriminator above.
+    assert.equal(r.isError, true);
     assert.equal(
-      r.isError,
-      undefined,
+      (r.details as { rejected?: string }).rejected,
+      "min-savings",
+      "fall-through must land on the min-savings floor, not the boundary guard",
+    );
+    assert.ok(
+      !/synthetic boundary/.test(r.content[0].text),
       "rewind must NOT trip the synthetic-boundary guard on a non-navigate_tree toolCall",
     );
     assert.equal(
       summarizeCalled,
-      true,
-      "summarize must run when the lone intervening message is a non-navigate_tree toolCall",
+      false,
+      "sub-floor chains are rejected before summarize",
+    );
+  });
+});
+
+// =============================================================================
+// dispatch: rewind min-savings floor (#21)
+//
+// Scenario pins from the issue-#20 repro, hermetic:
+//   A — anchor→immediate rewind (zero/negligible work above the anchor)
+//       must be REJECTED by the min-savings floor, never summarized;
+//   B — healthy stages (≥20k apparent savings) must still succeed;
+//   C — chained rewind→immediate-rewind keeps its existing
+//       synthetic-boundary diagnostic (the floor sits AFTER that guard).
+// =============================================================================
+
+describe("dispatch: rewind min-savings floor (#21)", () => {
+  /** Summarize stub that counts invocations so pins can assert call counts. */
+  function countingSummarize() {
+    let calls = 0;
+    const stub = (async () => {
+      calls++;
+      return {
+        summary:
+          "## Goal\nfloor pin.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+    return { stub, count: () => calls };
+  }
+
+  /** No labelEnd may survive a rejected rewind — the label isn't consumed. */
+  function assertLabelAbsent(sm: SessionManager, label: string): void {
+    for (const e of sm.getBranch()) {
+      assert.notEqual(sm.getLabel(e.id), label);
+    }
+  }
+
+  it("A-pin variant A: anchor→immediate rewind with an earlier anchor present is rejected with the active-anchor list", async () => {
+    const { stub, count } = countingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: stub });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:kickoff");
+    const t2 = appendTurn(sm, "u2", "a2", 12_000);
+    pi.pi.setLabel(t2.assistantId, "anchor:impl-start");
+
+    // setLabel advances the leaf (label-change entry), so the leaf here is
+    // the impl-start label entry — exactly the issue-#20 repro shape:
+    // anchor, then immediately rewind with zero work above.
+    const branchBefore = sm.getBranch().map((e) => e.id);
+    const leafBefore = sm.getLeafId();
+
+    const r = await tool.execute(
+      "tc-floor-a",
+      {
+        action: "rewind",
+        labelStart: "impl-start",
+        labelEnd: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(r.isError, true);
+    assert.equal(r.details.rejected, "min-savings");
+    assert.ok(typeof r.details.apparentSavings === "number");
+    const text = r.content[0].text;
+    assert.match(text, /would free only/);
+    // Variant A guidance + the full chronological anchor list, including
+    // labelStart itself.
+    assert.match(text, /Rewind further back to actually free context/);
+    assert.match(text, /'kickoff'/);
+    assert.match(text, /'impl-start'/);
+    // The numeric bar itself is NEVER printed agent-visible.
+    assert.ok(
+      !text.includes(String(MIN_REWIND_SAVINGS_TOKENS)),
+      "rejection copy must not print the floor value",
+    );
+    // Zero summarizer calls; labelEnd not consumed; tree untouched.
+    assert.equal(count(), 0);
+    assertLabelAbsent(sm, "anchor:done");
+    assert.deepEqual(
+      sm.getBranch().map((e) => e.id),
+      branchBefore,
+    );
+    assert.equal(sm.getLeafId(), leafBefore);
+  });
+
+  it("A-pin variant B: rewinding the OLDEST anchor is rejected with 'No earlier anchors'", async () => {
+    const { stub, count } = countingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: stub });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    // One tiny turn above the anchor: measured savings ≈ 1 token.
+    appendTurn(sm, "u2", "a2", 6_001);
+
+    const r = await tool.execute(
+      "tc-floor-b",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(r.isError, true);
+    assert.equal(r.details.rejected, "min-savings");
+    const text = r.content[0].text;
+    assert.match(text, /would free only/);
+    assert.match(
+      text,
+      /No earlier anchors — keep working and rewind later once more has accumulated above it\./,
+    );
+    assert.match(text, /'start'/);
+    assert.ok(!text.includes(String(MIN_REWIND_SAVINGS_TOKENS)));
+    assert.equal(count(), 0);
+    assertLabelAbsent(sm, "anchor:done");
+  });
+
+  it("B-pin: healthy stage (≥20k apparent savings) succeeds and calls summarize exactly once", async () => {
+    const { stub, count } = countingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: stub });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 27_000);
+    appendTurn(sm, "u3", "a3", 28_000);
+
+    const r = await tool.execute(
+      "tc-floor-bpin",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(r.isError, undefined);
+    assert.match(r.content[0].text, /\[rewind 'start' \u2192 'end'\]/);
+    // Apparent savings = contextBefore − anchor-time total (6_000).
+    const before = r.details.contextBefore as number;
+    assert.ok(
+      before - 6_000 >= 20_000,
+      `expected ≥20k apparent savings; got ${before - 6_000}`,
+    );
+    assert.equal(count(), 1);
+  });
+
+  it("C-pin: chained rewind→immediate-rewind keeps the synthetic-boundary message verbatim (floor must not preempt it)", async () => {
+    const { stub, count } = countingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: stub });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:a");
+    appendTurn(sm, "u2", "a2", 14_000);
+    appendTurn(sm, "u3", "a3", 20_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const r1 = await tool.execute(
+      "tc-1",
+      {
+        action: "rewind",
+        labelStart: "a",
+        labelEnd: "b",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r1.isError, undefined);
+
+    // Immediate second rewind: the lone intervening entry is the synthetic,
+    // so the EXISTING boundary guard fires — before the floor.
+    const r2 = await tool.execute(
+      "tc-2",
+      {
+        action: "rewind",
+        labelStart: "b",
+        labelEnd: "c",
+        summaryFocus: "Preserve user instructions across the second rewind.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r2.isError, true);
+    assert.equal(
+      r2.content[0].text,
+      "Already at synthetic boundary — no work to summarize. Append at least one turn between rewinds.",
+      "synthetic-boundary wording must stay verbatim and keep precedence over the floor",
+    );
+    assert.notEqual(r2.details.rejected, "min-savings");
+    // Exactly one summarizer call total: the first rewind only.
+    assert.equal(count(), 1);
+  });
+
+  it("boundary: apparent savings just under the floor rejects; exactly at the floor accepts", async () => {
+    // Deterministic measurement math: with 'u*'/'a*' texts (2 chars → 1
+    // estimated trailing token each), a chain anchored at a1(T1) with leaf
+    // a3(T3) measures beforeTokens = T2 + 1 and tokensAtTarget = T1, i.e.
+    //   apparentSavings = T2 + 1 − T1.
+    async function floorFixture(t2Total: number) {
+      const { stub, count } = countingSummarize();
+      const { sm, pi, tool, ctx } = setup({ summarize: stub });
+      const t1 = appendTurn(sm, "u1", "a1", 5_000);
+      pi.pi.setLabel(t1.assistantId, "anchor:start");
+      appendTurn(sm, "u2", "a2", t2Total);
+      appendTurn(sm, "u3", "a3", t2Total + 1_000);
+      return { tool, ctx, count };
+    }
+    const rewindArgs = {
+      action: "rewind",
+      labelStart: "start",
+      labelEnd: "end",
+      summaryFocus: "Preserve user instructions and continue.",
+    } as const;
+
+    // Just UNDER: T2 = 5000 + MIN − 999 → savings = MIN − 998.
+    const under = await floorFixture(5_000 + MIN_REWIND_SAVINGS_TOKENS - 999);
+    const ru = await under.tool.execute(
+      "tc-under",
+      rewindArgs,
+      undefined,
+      undefined,
+      under.ctx,
+    );
+    assert.equal(ru.isError, true);
+    assert.equal(ru.details.rejected, "min-savings");
+    assert.ok(
+      (ru.details.apparentSavings as number) < MIN_REWIND_SAVINGS_TOKENS,
+    );
+    assert.equal(under.count(), 0);
+
+    // AT the floor: T2 = 5000 + MIN − 1 → savings = MIN exactly (the guard
+    // is strict `<`, so this accepts).
+    const at = await floorFixture(5_000 + MIN_REWIND_SAVINGS_TOKENS - 1);
+    const ra = await at.tool.execute(
+      "tc-at",
+      rewindArgs,
+      undefined,
+      undefined,
+      at.ctx,
+    );
+    assert.equal(ra.isError, undefined);
+    // Success details carry contextBefore (= T2 + 1); savings = that minus
+    // the anchor-time total (5_000).
+    const before = ra.details.contextBefore as number;
+    assert.equal(
+      before - 5_000,
+      MIN_REWIND_SAVINGS_TOKENS,
+      "savings exactly at the floor must be accepted (strict < comparison)",
+    );
+    assert.equal(at.count(), 1);
+  });
+
+  it("guard-order: sub-floor rejection fires BEFORE the model check ('No model configured')", async () => {
+    const { stub, count } = countingSummarize();
+    const { sm, pi, tool, ctx } = setup({ noModel: true, summarize: stub });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 6_001);
+
+    const r = await tool.execute(
+      "tc-order",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(r.isError, true);
+    assert.equal(r.details.rejected, "min-savings");
+    assert.match(r.content[0].text, /would free only/);
+    assert.ok(
+      !/No model configured/.test(r.content[0].text),
+      "the floor must reject before the model check runs",
+    );
+    assert.equal(count(), 0);
+  });
+
+  it("anchor response tells the agent to wait for accumulated work (#21 copy)", async () => {
+    const { sm, tool, ctx } = setup();
+    appendTurn(sm, "u1", "a1", 100);
+
+    const r = await tool.execute(
+      "tc-anchor-copy",
+      { action: "anchor", name: "impl-start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r.isError, undefined);
+    const text = r.content[0].text;
+    assert.ok(
+      text.includes("Once real work has accumulated after this anchor"),
+      `anchor copy must steer toward accumulating work; got: ${text}`,
+    );
+    assert.ok(
+      !text.includes("When you finish this stage"),
+      "pre-#21 anchor copy must be gone",
+    );
+    // The focus-length constant stays interpolated (no hardcoded 20).
+    assert.ok(text.includes(`≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus`));
+  });
+
+  it("registers promptGuidelines steering agents toward earliest-useful rewinds", () => {
+    const { tool } = setup();
+    const guidelines = tool.promptGuidelines as string[] | undefined;
+    assert.ok(Array.isArray(guidelines), "promptGuidelines must be registered");
+    assert.equal(guidelines?.length, 1);
+    assert.ok(
+      guidelines?.[0].includes("the further back you rewind"),
+      `guideline must carry the earliest-useful-rewind steering; got: ${guidelines?.[0]}`,
     );
   });
 });

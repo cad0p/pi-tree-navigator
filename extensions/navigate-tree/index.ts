@@ -67,7 +67,8 @@ const LABEL_PREFIX = "anchor:";
 
 // ---------------------------------------------------------------------------
 // Exported boundary constants below (MAX_SESSION_REFS, MAX_HINT_WALK_DEPTH,
-// MIN_SUMMARY_FOCUS_LENGTH, MAX_SYNTHETIC_FOCUS_LENGTH).
+// MIN_SUMMARY_FOCUS_LENGTH, MIN_REWIND_SAVINGS_TOKENS,
+// MAX_SYNTHETIC_FOCUS_LENGTH).
 //
 // Stability: these are internal tunables. Exported only so the test suite
 // can pin boundary cases by constant rather than literal. Re-tuning is
@@ -95,6 +96,19 @@ export const MAX_HINT_WALK_DEPTH = 50;
 // reliably loses continuity — raising it forces more useful focus text
 // without inviting verbosity.
 export const MIN_SUMMARY_FOCUS_LENGTH = 20;
+// Floor on the *apparent* token savings (`beforeTokens − tokensAtTarget`) a
+// `rewind` must clear to execute. Absolute threshold, deliberately NOT
+// window-relative: % semantics drift with window size, so a fixed token bar
+// is the only stable shape. Every rewind carries ≈350–900 tokens of fixed
+// overhead (the branch_summary adds ~300–800 permanent tokens on the kept
+// chain; the synthetic assistant re-emits ~50 on every subsequent turn), so
+// apparent savings OVERSTATES true freed context. Empirically the degenerate
+// anchor→immediate-rewind case measures ~100 apparent tokens while a healthy
+// stage measures ~20k — 4k separates them cleanly (~200×) and roughly equals
+// one 300-line source-file read (~5.9k tokens measured). Below the floor a
+// rewind burns a summarizer LLM call, forks a junk branch_summary, consumes
+// a milestone label, and GROWS live context.
+export const MIN_REWIND_SAVINGS_TOKENS = 4000;
 // Cap on the `summaryFocus` length stored in the synthetic assistant's
 // arguments. The full focus is passed live to `generateBranchSummary`, so
 // the summarizer always sees the original; we only need a trimmed copy in
@@ -328,6 +342,49 @@ function estimateAtEntry(
 }
 
 /**
+ * Rejection copy for the rewind min-savings floor (#21). Reports the
+ * apparent savings plus every active anchor — chronological root→leaf,
+ * same walk order as `list`, including labelStart itself — with its
+ * cumulative context percentage, so the agent can pick a genuinely earlier
+ * anchor or keep working. Move-on-collision means the tool itself never
+ * creates duplicate anchor names; a manual `/label anchor:x` CAN put the
+ * same name on two entries — duplicates print twice here, exactly as
+ * `list` prints them today.
+ *
+ * Deliberately does NOT print the floor value anywhere: an agent-visible
+ * numeric bar invites grinding up to it instead of doing real work.
+ */
+function buildMinSavingsRejection(
+  labelStart: string,
+  labelEnd: string,
+  apparentSavings: number,
+  sm: SessionManager,
+  cw: number,
+  allEntries: SessionEntry[],
+  byId: Map<string, SessionEntry>,
+): string {
+  const anchors: string[] = [];
+  let oldestAnchorName: string | null = null;
+  for (const e of sm.getBranch()) {
+    const lbl = sm.getLabel(e.id);
+    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
+    const name = lbl.slice(LABEL_PREFIX.length);
+    if (!oldestAnchorName) oldestAnchorName = name;
+    anchors.push(
+      `'${name}' ${formatPct1(estimateAtEntry(allEntries, e.id, byId), cw)}`,
+    );
+  }
+  // cw=0 → percents fall back to formatPct1's k-format and the window
+  // suffix is omitted, mirroring `list`'s header behavior.
+  const suffix = cw > 0 ? ` of ${formatWindow(cw)}` : "";
+  const guidance =
+    oldestAnchorName === labelStart
+      ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
+      : "Rewind further back to actually free context, or keep working.";
+  return `Rewinding '${labelStart}' → '${labelEnd}' would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.join(" · ")}${suffix}`;
+}
+
+/**
  * Walk parentId chain back from `fromId` and return a one-line preview of
  * the first entry that has meaningful text content. Branch summaries are
  * prefixed with `summary:` so the source is clear; user/assistant text is
@@ -458,6 +515,9 @@ export default function (
     // Stateful: every action mutates SessionManager; concurrent calls would
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
+    promptGuidelines: [
+      "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
+    ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary while preserving the full history on a sibling branch. Despite the verb, \`rewind\` does not restore prior state — it forks a sibling branch from the anchor and continues forward from a model-generated summary; the abandoned subtree is preserved on disk but no longer on the active path.
 
 Operations (set the \`action\` parameter):
@@ -595,7 +655,7 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
               type: "text",
               text:
                 `[anchor '${p.name}'] set at ${positionLine}${hintLine}\n\n` +
-                `When you finish this stage, call: navigate_tree(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
+                `Once real work has accumulated after this anchor, collapse it into a summary with: navigate_tree(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
             },
           ],
           details: {
@@ -647,15 +707,13 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
         );
       }
 
-      if (!ctx.model) {
-        return toolError("No model configured for summarization.");
-      }
-
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-      if (!auth.ok) {
-        return toolError(`Auth resolution failed: ${auth.error}`);
-      }
-
+      // Token math hoisted ABOVE the model check / auth await (#21): these
+      // are pure SessionManager reads, and the min-savings floor below must
+      // be evaluable — and able to reject — before any auth resolution.
+      // `allEntries`/`byId` are hoisted out of the parented-assistant branch
+      // because the floor rejection copy reports per-anchor percentages from
+      // the same maps.
+      //
       // The leaf at execute time is the assistant that just streamed the
       // rewind tool call. Its `usage.input` is the *minimum* of recent API
       // calls in this turn, so estimating from it understates what the
@@ -663,6 +721,9 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
       // assistant's usage as baseline) so beforeTokens matches the value
       // `list` would have reported on the previous turn.
       const oldLeafEntry = sm.getEntry(oldLeaf);
+      const allEntries = sm.getEntries();
+      const byId = new Map<string, SessionEntry>();
+      for (const e of allEntries) byId.set(e.id, e);
       let beforeTokens: number;
       if (
         oldLeafEntry &&
@@ -670,14 +731,12 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
         oldLeafEntry.message.role === "assistant" &&
         oldLeafEntry.parentId
       ) {
-        const allEntries = sm.getEntries();
-        const byId = new Map<string, SessionEntry>();
-        for (const e of allEntries) byId.set(e.id, e);
         beforeTokens = estimateAtEntry(allEntries, oldLeafEntry.parentId, byId);
       } else {
         beforeTokens = estimateActiveBranchTokens(sm);
       }
-      const contextWindow = ctx.model.contextWindow ?? 0;
+      const tokensAtTarget = estimateAtEntry(allEntries, target, byId);
+      const contextWindow = ctx.model?.contextWindow ?? 0;
 
       const { entries } = collectEntriesForBranchSummary(sm, oldLeaf, target);
       if (entries.length === 0) {
@@ -718,6 +777,38 @@ Both \`name\` (anchor) and \`labelEnd\` (rewind) write into the same anchor name
             );
           }
         }
+      }
+
+      // Minimum-savings floor (#21): refuse rewinds whose apparent savings
+      // is below MIN_REWIND_SAVINGS_TOKENS — collapsing a near-empty segment
+      // burns a summarizer LLM call, forks a junk branch_summary, consumes
+      // a milestone label, and grows live context. Placed AFTER the
+      // synthetic-boundary guard so the chained rewind-with-no-turns case
+      // keeps its specific diagnostic, and BEFORE the model/auth checks so
+      // the rejection fires without touching provider config.
+      const apparentSavings = beforeTokens - tokensAtTarget;
+      if (apparentSavings < MIN_REWIND_SAVINGS_TOKENS) {
+        return toolError(
+          buildMinSavingsRejection(
+            p.labelStart,
+            p.labelEnd,
+            apparentSavings,
+            sm,
+            contextWindow,
+            allEntries,
+            byId,
+          ),
+          { rejected: "min-savings", apparentSavings },
+        );
+      }
+
+      if (!ctx.model) {
+        return toolError("No model configured for summarization.");
+      }
+
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+      if (!auth.ok) {
+        return toolError(`Auth resolution failed: ${auth.error}`);
       }
 
       const result = await summarize(entries, {
