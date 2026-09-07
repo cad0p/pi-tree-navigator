@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(rewind)* Reject degenerate rewinds below a min-savings floor (closes #21, closes #20)
+- *(rewind)* Inject opencode session headers for summarization (closes #26)
 
 ### ⚙️ Miscellaneous Tasks
 
