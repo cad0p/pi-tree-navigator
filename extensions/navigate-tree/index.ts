@@ -36,6 +36,7 @@
  * `buildContextMessages`), not `agent.prepareNextTurn*` reflection.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   estimateContextTokens,
   type StreamFn,
@@ -260,6 +261,53 @@ function stripNullHeaders(
   return entries.length > 0
     ? (Object.fromEntries(entries) as Record<string, string>)
     : undefined;
+}
+
+/**
+ * Session-routing headers for the summarization request.
+ *
+ * Pi's live turns merge these in `sdk.ts` via `mergeProviderAttributionHeaders`
+ * (session headers + install-telemetry attribution). Out-of-loop summarization
+ * callers — pi's own `agent-session.navigateTree` and this extension — pass only
+ * auth headers, so providers that REQUIRE the session header 400 the request
+ * (`MissingSessionID`; observed on opencode-go 2026-09-07: every rewind and every
+ * native `/tree` summary fails deterministically).
+ *
+ * The tool-execute ctx exposes neither `settingsManager` (telemetry attribution)
+ * nor the live routing `sessionId`, so this replicates only the session half of
+ * pi's merge (`getSessionHeaders` in `provider-attribution.ts`): for
+ * opencode-family providers, inject `x-opencode-session` + `x-opencode-client`.
+ * The value is a fresh UUID per rewind — upstream does the same for routing
+ * (`completeSummarization` falls back to `uuidv7()` when the caller passes no
+ * session id), and one-off summaries have no continuation to route. Proven by
+ * the branch-summary eval harness, whose identical injection succeeds on
+ * opencode-go where the bare call 400s. Never overrides a header the auth layer
+ * already set.
+ */
+function withSessionHeaders(
+  model: { provider?: string; baseUrl?: string } | undefined,
+  headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  const provider = model?.provider ?? "";
+  let host = "";
+  try {
+    host = model?.baseUrl ? new URL(model.baseUrl).hostname : "";
+  } catch {
+    host = "";
+  }
+  const needsSession =
+    provider === "opencode" ||
+    provider === "opencode-go" ||
+    host === "opencode.ai";
+  if (!needsSession) return headers;
+  const merged = { ...(headers ?? {}) };
+  if (!merged["x-opencode-session"]) {
+    merged["x-opencode-session"] = randomUUID();
+  }
+  if (!merged["x-opencode-client"]) {
+    merged["x-opencode-client"] = "pi";
+  }
+  return merged;
 }
 
 /**
@@ -818,7 +866,7 @@ Operations (set \`action\`):
           ? { ...ctx.model, baseUrl: auth.baseUrl }
           : ctx.model,
         apiKey: auth.apiKey ?? "",
-        headers: stripNullHeaders(auth.headers),
+        headers: withSessionHeaders(ctx.model, stripNullHeaders(auth.headers)),
         ...(auth.env ? { env: auth.env } : {}),
         signal: signal ?? new AbortController().signal,
         customInstructions: p.summaryFocus,

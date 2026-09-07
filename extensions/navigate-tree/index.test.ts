@@ -1995,6 +1995,130 @@ describe("dispatch: rewind happy path", () => {
     );
   });
 
+  it("injects opencode session headers for the summarization request", async () => {
+    // Regression (2026-09-07): every rewind on opencode-go 400d with
+    // MissingSessionID. Pi's live turns merge attribution headers in sdk.ts
+    // (`mergeProviderAttributionHeaders`), but out-of-loop summarization
+    // callers pass auth headers only — so the gateway never sees
+    // x-opencode-session. The extension replicates pi's `getSessionHeaders`
+    // half (fresh UUID per rewind; one-off summaries have no continuation).
+    // The null-headers test above (default `claude` provider) doubles as the
+    // negative case: no injection for non-opencode providers.
+    let capturedHeaders: unknown = "__not_called__";
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      capturedHeaders = (opts as { headers?: unknown }).headers;
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+    setupRewindable(sm, pi, {});
+    (ctx as unknown as { model: unknown }).model = {
+      api: "openai-responses",
+      provider: "opencode-go",
+      id: "muse-spark-1.3-contributor",
+    };
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      // Pre-set session header must survive (never overridden).
+      headers: { "x-real": "value", "x-opencode-session": "keep-me" },
+    });
+    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+      () => ({});
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "opencode session header regression focus",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const headers = capturedHeaders as Record<string, string>;
+    assert.equal(headers["x-real"], "value");
+    assert.equal(
+      headers["x-opencode-session"],
+      "keep-me",
+      "auth-provided session header must not be overridden",
+    );
+    assert.equal(headers["x-opencode-client"], "pi");
+  });
+
+  it("generates a fresh x-opencode-session per rewind when auth sets none", async () => {
+    const seen: string[] = [];
+    const spySummarize = (async (_entries: unknown, opts: unknown) => {
+      seen.push(
+        (opts as { headers?: Record<string, string> }).headers?.[
+          "x-opencode-session"
+        ] ?? "__missing__",
+      );
+      return {
+        summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+
+    const uuidRe =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    for (const tc of ["tc-rewind-1", "tc-rewind-2"]) {
+      const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
+      setupRewindable(sm, pi, {});
+      (ctx as unknown as { model: unknown }).model = {
+        api: "openai-responses",
+        provider: "opencode-go",
+        id: "muse-spark-1.3-contributor",
+      };
+      (
+        ctx.modelRegistry as unknown as {
+          getApiKeyAndHeaders: () => Promise<unknown>;
+        }
+      ).getApiKeyAndHeaders = async () => ({
+        ok: true,
+        apiKey: "test-key",
+        headers: {},
+      });
+      (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+        () => ({});
+      const result = await tool.execute(
+        tc,
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "fresh session id regression focus",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, undefined);
+    }
+    assert.equal(seen.length, 2);
+    assert.match(seen[0], uuidRe, "first rewind needs a uuid session id");
+    assert.match(seen[1], uuidRe, "second rewind needs a uuid session id");
+    assert.notEqual(
+      seen[0],
+      seen[1],
+      "each rewind mints its own session id (one-off summaries have no continuation)",
+    );
+  });
+
   it("forwards auth.baseUrl onto the model and auth.env (OAuth-derived endpoints)", async () => {
     // pi's own _getSummarizationRequestAuth applies `result.auth.baseUrl`
     // onto the model (OAuth/credential-derived endpoints, e.g.
