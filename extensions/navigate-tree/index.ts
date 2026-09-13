@@ -571,9 +571,9 @@ export default function (
 
   // Anchor mandate (#31): a before_agent_start append lands at the END of
   // the system prompt — stronger than the mid-prompt Guidelines block, and
-  // rebuilt every turn instead of living in the conversation. Skip only
-  // when the tool is verifiably absent from the active set; fail-open when
-  // `selectedTools` is undefined (this extension always registers it).
+  // re-applied on every prompt instead of living in the conversation. Skip
+  // only when the tool is verifiably absent from the active set; fail-open
+  // when `selectedTools` is undefined (this extension always registers it).
   pi.on("before_agent_start", async (event) => {
     const selected = event.systemPromptOptions?.selectedTools;
     if (Array.isArray(selected) && !selected.includes(TOOL_NAME)) return {};
