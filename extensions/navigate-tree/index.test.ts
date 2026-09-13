@@ -3959,14 +3959,24 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.ok(text.includes(`≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus`));
   });
 
-  it("registers promptGuidelines steering agents toward earliest-useful rewinds", () => {
+  it("registers promptGuidelines steering agents to anchor early and rewind from the earliest useful anchor", () => {
     const { tool } = setup();
     const guidelines = tool.promptGuidelines as string[] | undefined;
     assert.ok(Array.isArray(guidelines), "promptGuidelines must be registered");
-    assert.equal(guidelines?.length, 1);
-    assert.ok(
-      guidelines?.[0].includes("the further back you rewind"),
-      `guideline must carry the earliest-useful-rewind steering; got: ${guidelines?.[0]}`,
+    assert.equal(
+      guidelines?.length,
+      2,
+      `promptGuidelines must carry exactly two bullets; got: ${guidelines?.length}`,
+    );
+    assert.equal(
+      guidelines?.[0],
+      "navigate_tree: anchor early at `context-gathered`, so that you can list anchors and rewind after every milestone or rabbit hole / dead end",
+      `guidelines[0] must be the byte-exact anchor-early bullet; got: ${guidelines?.[0]}`,
+    );
+    assert.equal(
+      guidelines?.[1],
+      "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
+      `guidelines[1] must be the byte-exact earliest-useful-rewind bullet; got: ${guidelines?.[1]}`,
     );
   });
 });
