@@ -564,6 +564,7 @@ export default function (
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
     promptGuidelines: [
+      "navigate_tree: anchor early at `context-gathered`, so that you can list anchors and rewind after every milestone or rabbit hole / dead end",
       "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
     ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
