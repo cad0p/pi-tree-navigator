@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 - *(ci)* Daily pi-upstream reflection probe (closes #17)
 - *(guidelines)* Steer agents to anchor early at context-gathered (closes #29)
+- Mandate anchoring via before_agent_start system prompt (closes #31)
 
 ### 🐛 Bug Fixes
 
