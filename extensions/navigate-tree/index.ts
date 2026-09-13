@@ -73,10 +73,9 @@ const TOOL_NAME = "navigate_tree";
  * mandate: `promptGuidelines` bullets land mid-prompt; this append lands
  * at the very end of the system prompt, after <project_context> and
  * skills, and is re-applied on every prompt (never compacted). Byte-stable
- * (constant, no interpolation) for provider prompt caching.
+ * (module constant, no per-session interpolation) for provider caching.
  */
-export const ANCHOR_MANDATE =
-  "navigate_tree: gather all context, then anchor `context-gathered`; list anchors and rewind after every milestone or rabbit hole / dead end.";
+export const ANCHOR_MANDATE = `${TOOL_NAME}: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end.`;
 
 // ---------------------------------------------------------------------------
 // Exported boundary constants below (MAX_SESSION_REFS, MAX_HINT_WALK_DEPTH,
@@ -587,7 +586,7 @@ export default function (
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
     promptGuidelines: [
-      "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
+      `${TOOL_NAME}: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.`,
     ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
 \`rewind\` does not restore prior state: it forks a sibling branch from the anchor and continues forward from a model-generated summary.
@@ -724,7 +723,7 @@ Operations (set \`action\`):
               type: "text",
               text:
                 `[anchor '${p.name}'] set at ${positionLine}${hintLine}\n\n` +
-                `Once real work has accumulated after this anchor, collapse it into a summary with: navigate_tree(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
+                `Once real work has accumulated after this anchor, collapse it into a summary with: ${TOOL_NAME}(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
             },
           ],
           details: {
@@ -838,7 +837,7 @@ Operations (set \`action\`):
           if (
             block &&
             block.type === "toolCall" &&
-            block.name === "navigate_tree" &&
+            block.name === TOOL_NAME &&
             isSyntheticShape
           ) {
             return toolError(
@@ -1008,7 +1007,7 @@ Operations (set \`action\`):
       }
       const syntheticMsg = buildSyntheticAssistant(
         toolCallId,
-        "navigate_tree",
+        TOOL_NAME,
         syntheticArgs,
         ctx.model as
           | { api?: string; provider?: string; id?: string }
