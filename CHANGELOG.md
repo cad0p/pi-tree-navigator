@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - *(ci)* Daily pi-upstream reflection probe (closes #17)
+- *(guidelines)* Steer agents to anchor early at context-gathered (closes #29)
 
 ### 🐛 Bug Fixes
 
