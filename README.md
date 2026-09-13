@@ -53,6 +53,8 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 
 `name` (written by `anchor`) and `labelEnd` (written by `rewind`) both share the reserved `anchor:` label prefix; `labelStart` resolves against that same namespace. Every label written by `anchor` and every `labelEnd` written by `rewind` is referenceable by any subsequent `rewind`'s `labelStart`, and `list` shows all of them.
 
+**Anchoring is mandated, not suggested.** On every agent start the extension appends a one-line mandate to the end of the system prompt (`before_agent_start`), gated on the tool being active: `navigate_tree: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end.` The append lands after project context and skills, is re-applied on every prompt, and survives compaction — unlike the `promptGuidelines` bullet it replaced. ~35 tokens, constant for prompt caching.
+
 ## How it works
 
 A typical autonomous-loop pattern:

@@ -30,6 +30,7 @@ import {
 import { MAX_NAME_LENGTH } from "./helpers.ts";
 import navigateTree, {
   __testHooks,
+  ANCHOR_MANDATE,
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
   MAX_SYNTHETIC_FOCUS_LENGTH,
@@ -442,6 +443,102 @@ describe("context event handler", () => {
       { sessionManager: sm } as never,
     );
     assert.deepEqual(again, outcome);
+  });
+});
+
+// =============================================================================
+// before_agent_start anchor mandate (#31)
+//
+// The #29 `promptGuidelines` bullet landed mid-prompt (inside the Guidelines
+// section) and did not move behavior. #31 moves the policy to a
+// `before_agent_start` append, which lands at the very END of the system
+// prompt (after <project_context> and skills), is re-applied on every prompt,
+// and survives compaction. These pins cover registration, the append shape
+// (with the approved mandate spelled as a literal), the active-tool gate,
+// fail-open semantics, and byte-stability for prompt caching.
+// =============================================================================
+
+describe("before_agent_start anchor mandate", () => {
+  it("registers exactly one before_agent_start handler via pi.on", () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("before_agent_start");
+    assert.ok(handlers, "factory must register a before_agent_start handler");
+    assert.equal(handlers.length, 1);
+  });
+
+  it("appends the approved mandate to the system prompt when the tool is active", async () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("before_agent_start");
+    assert.ok(handlers, "factory must register a before_agent_start handler");
+    const out = await handlers[0](
+      {
+        type: "before_agent_start",
+        prompt: "do the thing",
+        systemPrompt: "BASE",
+        systemPromptOptions: {
+          selectedTools: ["read", "bash", "navigate_tree"],
+        },
+      } as never,
+      {} as never,
+    );
+    assert.deepEqual(out, {
+      systemPrompt:
+        "BASE\n\nnavigate_tree: gather all context, then anchor `context-gathered`; list anchors and rewind after every milestone or rabbit hole / dead end.",
+    });
+  });
+
+  it("skips the append when the tool is verifiably absent from selectedTools", async () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("before_agent_start");
+    assert.ok(handlers, "factory must register a before_agent_start handler");
+    const out = await handlers[0](
+      {
+        type: "before_agent_start",
+        prompt: "do the thing",
+        systemPrompt: "BASE",
+        systemPromptOptions: { selectedTools: ["read", "bash"] },
+      } as never,
+      {} as never,
+    );
+    assert.deepEqual(out, {});
+  });
+
+  it("fails open when selectedTools is undefined (mandate still appended)", async () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("before_agent_start");
+    assert.ok(handlers, "factory must register a before_agent_start handler");
+    const out = await handlers[0](
+      {
+        type: "before_agent_start",
+        prompt: "do the thing",
+        systemPrompt: "BASE",
+        systemPromptOptions: {},
+      } as never,
+      {} as never,
+    );
+    assert.deepEqual(out, { systemPrompt: `BASE\n\n${ANCHOR_MANDATE}` });
+  });
+
+  it("is byte-stable across identical calls (prompt-caching contract)", async () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("before_agent_start");
+    assert.ok(handlers, "factory must register a before_agent_start handler");
+    const event = {
+      type: "before_agent_start",
+      prompt: "do the thing",
+      systemPrompt: "BASE",
+      systemPromptOptions: {
+        selectedTools: ["read", "bash", "navigate_tree"],
+      },
+    } as never;
+    const first = (await handlers[0](event, {} as never)) as {
+      systemPrompt: string;
+    };
+    const second = (await handlers[0](event, {} as never)) as {
+      systemPrompt: string;
+    };
+    assert.deepEqual(first, second);
+    assert.equal(first.systemPrompt, second.systemPrompt);
   });
 });
 
@@ -3959,24 +4056,19 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.ok(text.includes(`≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus`));
   });
 
-  it("registers promptGuidelines steering agents to anchor early and rewind from the earliest useful anchor", () => {
+  it("registers promptGuidelines steering agents toward earliest-useful rewinds", () => {
     const { tool } = setup();
     const guidelines = tool.promptGuidelines as string[] | undefined;
     assert.ok(Array.isArray(guidelines), "promptGuidelines must be registered");
     assert.equal(
       guidelines?.length,
-      2,
-      `promptGuidelines must carry exactly two bullets; got: ${guidelines?.length}`,
+      1,
+      `promptGuidelines must carry exactly one bullet; got: ${guidelines?.length}`,
     );
     assert.equal(
       guidelines?.[0],
-      "navigate_tree: anchor early at `context-gathered`, so that you can list anchors and rewind after every milestone or rabbit hole / dead end",
-      `guidelines[0] must be the byte-exact anchor-early bullet; got: ${guidelines?.[0]}`,
-    );
-    assert.equal(
-      guidelines?.[1],
       "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
-      `guidelines[1] must be the byte-exact earliest-useful-rewind bullet; got: ${guidelines?.[1]}`,
+      `guidelines[0] must be the byte-exact earliest-useful-rewind bullet; got: ${guidelines?.[0]}`,
     );
   });
 });
