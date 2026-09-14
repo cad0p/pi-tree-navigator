@@ -20,11 +20,12 @@
  */
 
 import * as assert from "node:assert/strict";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, before, describe, it } from "node:test";
 import {
   type AgentSession,
   type ExtensionAPI,
   generateBranchSummary,
+  initTheme,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { MAX_NAME_LENGTH } from "./helpers.ts";
@@ -130,14 +131,6 @@ interface FakeCtx {
   };
   /** Public system-prompt accessor (0.81+); override per test as needed. */
   getSystemPrompt(): string;
-  /** Whether dialog-capable UI is available (TUI / RPC). */
-  hasUI: boolean;
-  /** UI surface; `notify` is spied on by `notifications`. */
-  ui: {
-    notify(message: string, type?: "info" | "warning" | "error"): void;
-  };
-  /** Every `ui.notify` call, in order (TUI-only cache notices). */
-  notifications: Array<{ message: string; type?: string }>;
 }
 
 function makeCtx(
@@ -146,7 +139,6 @@ function makeCtx(
     contextWindow?: number;
     noModel?: boolean;
     authError?: string;
-    hasUI?: boolean;
   } = {},
 ): FakeCtx {
   const model = opts.noModel
@@ -157,20 +149,10 @@ function makeCtx(
         id: "claude-sonnet-4-5",
         contextWindow: opts.contextWindow ?? 1_000_000,
       };
-  const notifications: Array<{ message: string; type?: string }> = [];
   return {
     sessionManager: sm,
     model,
     getSystemPrompt: () => "LIVE SYSTEM PROMPT",
-    hasUI: opts.hasUI ?? true,
-    notifications,
-    ui: {
-      notify(message: string, type?: "info" | "warning" | "error") {
-        notifications.push(
-          type === undefined ? { message } : { message, type },
-        );
-      },
-    },
     modelRegistry: {
       async getApiKeyAndHeaders(_m: unknown) {
         if (opts.authError) return { ok: false, error: opts.authError };
@@ -241,7 +223,6 @@ function setup(
     contextWindow?: number;
     noModel?: boolean;
     authError?: string;
-    hasUI?: boolean;
     summarize?: typeof fakeSummarize;
   } = {},
 ): {
@@ -4330,11 +4311,11 @@ describe("dispatch: rewind beforeTokens fallback", () => {
 //
 // The cache path is built at the rewind call site and injected through the
 // `streamFn` seam. These tests pin the wiring (live inputs read, request
-// assembled, wrapper forwarded) and the TUI-only fallback/miss/hit matrix.
+// assembled, wrapper forwarded) and the fallback/miss/hit matrix.
 // Cache notices never enter the tool-result content (the model must not see
-// them); they go through `ctx.ui.notify` only when `hasUI` and pi's
-// `showCacheMissNotices` setting are both on, and the same numbers always
-// live in `details.summaryCache`.
+// them); when `showCacheMissNotices` is on, the notice string is stored in
+// `details.summaryCache.notice` for the tool's TUI `renderResult`. The same
+// numbers always live in `details.summaryCache`.
 // Provider usage is stubbed; no request leaves the process.
 // =============================================================================
 
@@ -4402,8 +4383,9 @@ const USAGE_COST = {
 /**
  * Cache notices must never reach the model: the rewind tool-result content
  * (the only text the LLM sees) must carry none of the notice copy. The
- * human-readable notice travels through `ctx.ui.notify`; the machine-readable
- * numbers stay in `details.summaryCache`.
+ * human-readable notice travels through `details.summaryCache.notice` and is
+ * rendered by the tool's `renderResult`; the machine-readable numbers stay in
+ * `details.summaryCache`.
  */
 function assertNoCacheNoticeInContent(text: string): void {
   assert.doesNotMatch(text, /summary cache:/);
@@ -4645,17 +4627,17 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    // No owning session => the settings gate is unreadable => no TUI notice
-    // even though a fallback warning was generated.
-    assert.deepEqual(ctx.notifications, []);
+    // No owning session => the settings gate is unreadable => no notice stored.
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string;
       hit: boolean;
+      notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
     assert.equal(cache.fallbackReason, "reflection-missing");
     assert.equal(cache.hit, false);
+    assert.equal(cache.notice, null);
   });
 
   it("falls back when the reflected session has no live tool array", async () => {
@@ -4683,9 +4665,11 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    // The stub reports no usage, so no miss is measured -> no notice even
-    // with the setting on.
-    assert.deepEqual(ctx.notifications, []);
+    // The stub reports no usage, so no miss is measured -> no notice.
+    assert.equal(
+      (result.details.summaryCache as { notice: string | null }).notice,
+      null,
+    );
     assert.equal(
       (result.details.summaryCache as { fallbackReason: string })
         .fallbackReason,
@@ -4714,14 +4698,14 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    // Captured session uses the default (setting off) => no notify.
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string;
+      notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
     assert.equal(cache.fallbackReason, "disabled");
+    assert.equal(cache.notice, null);
   });
 
   it("falls back with no-provider-stream when the registry has no streamSimple", async () => {
@@ -4743,10 +4727,13 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
+    assert.equal(
+      (result.details.summaryCache as { notice: string | null }).notice,
+      null,
+    );
   });
 
-  it("warns with the fork's miss copy when the summary misses a 20k baseline", async () => {
+  it("stores the upstream miss notice when the summary misses a 20k baseline", async () => {
     const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const { fake } = setupRewindable(sm, pi, { capture: true });
@@ -4769,9 +4756,6 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, [
-      { message: SUMMARY_MISS_NOTICE, type: "warning" },
-    ]);
     const cache = result.details.summaryCache as {
       hit: boolean;
       cacheRead: number;
@@ -4779,7 +4763,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       cacheWrite: number;
       missedTokens: number;
       missedCost: number;
-      notified: boolean;
+      notice: string | null;
     };
     assert.equal(cache.hit, false);
     assert.equal(cache.cacheRead, 0);
@@ -4787,7 +4771,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(cache.cacheWrite, 0);
     assert.equal(cache.missedTokens, 20_000);
     assert.equal(cache.missedCost.toFixed(2), "0.20");
-    assert.equal(cache.notified, true);
+    assert.equal(cache.notice, SUMMARY_MISS_NOTICE);
   });
 
   it("stays silent on a cache hit and still reports the measured stats", async () => {
@@ -4827,15 +4811,16 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
     // Hits are silent: session totals cover them, there is no hit notice.
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       hit: boolean;
       fallbackReason: string | null;
       branchStartRetained: boolean;
       cacheRead: number;
+      notice: string | null;
     };
     assert.equal(cache.hit, true);
     assert.equal(cache.cacheRead, 20_000);
+    assert.equal(cache.notice, null);
     // Non-crossing regression: no compaction in the segment, so the request
     // stays live-prefix with no fallback and a retained branch start.
     assert.equal(cache.fallbackReason, null);
@@ -4874,14 +4859,15 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    // Default fake settings (off) => no notify for the fallback warning.
-    assert.deepEqual(ctx.notifications, []);
+    // Default fake settings (off) => no notice stored for the fallback.
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string;
+      notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
     assert.equal(cache.fallbackReason, "branch-crosses-compaction");
+    assert.equal(cache.notice, null);
 
     // `request === null` path: the wrapper delegates the caller's cold
     // context/options verbatim (the raw-evidence legacy request).
@@ -5011,64 +4997,24 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string;
       branchStartRetained: boolean;
+      notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
     assert.equal(cache.fallbackReason, "branch-start-not-retained");
     assert.equal(cache.branchStartRetained, false);
+    assert.equal(cache.notice, null);
   });
 
-  it("never notifies when hasUI is false, even with the setting on (headless)", async () => {
-    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
-    const { sm, pi, tool, ctx } = setup({ summarize: spy, hasUI: false });
-    const { fake } = setupRewindable(sm, pi, { capture: true });
-    if (!fake) throw new Error("capture: true must return fake");
-    fake.settingsManager = { getShowCacheMissNotices: () => true };
-    appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    installProvider(ctx, capturingProvider().streamSimple);
-
-    const result = await tool.execute(
-      "tc-rewind",
-      {
-        action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
-        summaryFocus: "Preserve user instructions and continue.",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.equal(result.isError, undefined);
-    assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
-    // The data still travels in details (the machine-readable surface).
-    const cache = result.details.summaryCache as {
-      mode: string;
-      hit: boolean;
-      cacheRead: number;
-      input: number;
-      missedTokens: number;
-      notified: boolean;
-    };
-    assert.equal(cache.mode, "live-prefix");
-    assert.equal(cache.hit, false);
-    assert.equal(cache.cacheRead, 0);
-    assert.equal(cache.input, 20_000);
-    assert.equal(cache.missedTokens, 20_000);
-    assert.equal(cache.notified, false);
-  });
-
-  it("stays silent when the settings gate is unreadable (hasUI on)", async () => {
+  it("stores no notice when the settings gate is unreadable", async () => {
     const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const { fake } = setupRewindable(sm, pi, { capture: true });
     if (!fake) throw new Error("capture: true must return fake");
-    // Present but throwing: the reflective read must swallow and stay silent.
+    // Present but throwing: the reflective read must swallow and store nothing.
     fake.settingsManager = {
       getShowCacheMissNotices: () => {
         throw new Error("settings unavailable");
@@ -5091,16 +5037,15 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       missedTokens: number;
-      notified: boolean;
+      notice: string | null;
     };
     assert.equal(cache.missedTokens, 20_000);
-    assert.equal(cache.notified, false);
+    assert.equal(cache.notice, null);
   });
 
-  it("stays silent when showCacheMissNotices is off", async () => {
+  it("stores no notice when showCacheMissNotices is off", async () => {
     const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const { fake } = setupRewindable(sm, pi, { capture: true });
@@ -5123,16 +5068,15 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       missedTokens: number;
-      notified: boolean;
+      notice: string | null;
     };
     assert.equal(cache.missedTokens, 20_000);
-    assert.equal(cache.notified, false);
+    assert.equal(cache.notice, null);
   });
 
-  it("stays silent below the 20k-token / $0.10 display floor", async () => {
+  it("stores no notice below the 20k-token / $0.10 display floor", async () => {
     const { spy } = capturingSummarize({
       input: 15_000,
       output: 20,
@@ -5167,16 +5111,15 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       missedTokens: number;
-      notified: boolean;
+      notice: string | null;
     };
     assert.equal(cache.missedTokens, 15_000);
-    assert.equal(cache.notified, false);
+    assert.equal(cache.notice, null);
   });
 
-  it("suppresses a miss after a model switch", async () => {
+  it("stores a model-switch notice (no suppression)", async () => {
     const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const { fake } = setupRewindable(sm, pi, { capture: true });
@@ -5202,13 +5145,17 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, []);
     const cache = result.details.summaryCache as {
       missedTokens: number;
-      notified: boolean;
+      modelChanged: boolean;
+      notice: string | null;
     };
-    assert.equal(cache.missedTokens, 0);
-    assert.equal(cache.notified, false);
+    assert.equal(cache.missedTokens, 20_000);
+    assert.equal(cache.modelChanged, true);
+    assert.equal(
+      cache.notice,
+      "Cache miss after model switch: 20k tokens re-billed (~$0.20)",
+    );
   });
 
   it("labels the miss as idle once the gap spans the cache TTL", async () => {
@@ -5236,18 +5183,15 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.deepEqual(ctx.notifications, [
-      {
-        message: "Cache miss after 6m idle: 20k tokens re-billed (~$0.20)",
-        type: "warning",
-      },
-    ]);
     const cache = result.details.summaryCache as {
       idleMs: number;
-      notified: boolean;
+      notice: string | null;
     };
     assert.ok(cache.idleMs >= 5 * 60 * 1000);
-    assert.equal(cache.notified, true);
+    assert.equal(
+      cache.notice,
+      "Cache miss after 6m idle: 20k tokens re-billed (~$0.20)",
+    );
   });
 
   it("measures the fallback path through the same miss detector", async () => {
@@ -5275,18 +5219,116 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
     // Fallback is NOT special-cased: the cold request measures as a miss.
-    assert.deepEqual(ctx.notifications, [
-      { message: SUMMARY_MISS_NOTICE, type: "warning" },
-    ]);
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string;
       missedTokens: number;
-      notified: boolean;
+      notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
     assert.equal(cache.fallbackReason, "disabled");
     assert.equal(cache.missedTokens, 20_000);
-    assert.equal(cache.notified, true);
+    assert.equal(cache.notice, SUMMARY_MISS_NOTICE);
+  });
+});
+
+// =============================================================================
+// dispatch: cache-notice transcript rendering (#33)
+//
+// Upstream pi renders cache notices as transcript lines via the tool renderer
+// (not toasts). `execute` stores the notice string; `renderResult` reproduces
+// the default result body and appends `new Spacer(1)` + a warning `Text`.
+// =============================================================================
+
+type RenderResultFn = (
+  result: {
+    content: Array<{ type: string; text?: string }>;
+    details: unknown;
+  },
+  options: { expanded: boolean; isPartial: boolean },
+  theme: { fg: (color: string, text: string) => string },
+) => { render(width: number): string[] };
+
+const STUB_THEME = { fg: (_color: string, text: string) => text };
+
+function renderToolResult(
+  tool: CapturedTool,
+  contentText: string,
+  notice: string | null,
+  expanded: boolean,
+): string {
+  const renderResult = (tool as { renderResult?: RenderResultFn }).renderResult;
+  assert.equal(typeof renderResult, "function");
+  const component = (renderResult as RenderResultFn)(
+    {
+      content: [{ type: "text", text: contentText }],
+      details: { summaryCache: { notice } },
+    },
+    { expanded, isPartial: false },
+    STUB_THEME,
+  );
+  // Each rendered line is padded to the width; trim for readable assertions.
+  return component
+    .render(200)
+    .map((line) => line.trim())
+    .join("\n");
+}
+
+describe("dispatch: cache-notice transcript rendering (#33)", () => {
+  before(() => {
+    // `keyHint` reads the module-global pi theme; initialize it once.
+    initTheme();
+  });
+
+  it("renders content only when there is no notice", () => {
+    const { tool } = setup();
+    const out = renderToolResult(tool, "line one\nline two", null, true);
+    assert.equal(out, "line one\nline two");
+    assert.doesNotMatch(out, /Cache miss/);
+  });
+
+  it("appends the warning line when a notice is present", () => {
+    const { tool } = setup();
+    const out = renderToolResult(
+      tool,
+      "body line",
+      "Cache miss: 20k tokens re-billed (~$0.20)",
+      true,
+    );
+    assert.match(out, /body line/);
+    assert.match(out, /Cache miss: 20k tokens re-billed/);
+  });
+
+  it("previews the first 10 lines with an expand hint when collapsed", () => {
+    const { tool } = setup();
+    const content = Array.from({ length: 13 }, (_, i) => `l${i + 1}`).join(
+      "\n",
+    );
+    const out = renderToolResult(tool, content, null, false);
+    assert.match(out, /l10/);
+    assert.doesNotMatch(out, /l11/);
+    assert.match(out, /3 more lines/);
+    assert.match(out, /to expand/);
+  });
+
+  it("renders all lines with no hint when expanded", () => {
+    const { tool } = setup();
+    const content = Array.from({ length: 13 }, (_, i) => `l${i + 1}`).join(
+      "\n",
+    );
+    const out = renderToolResult(tool, content, null, true);
+    assert.match(out, /l13/);
+    assert.doesNotMatch(out, /more lines/);
+  });
+
+  it("adds a Spacer between the body and the warning line", () => {
+    const { tool } = setup();
+    const out = renderToolResult(
+      tool,
+      "body",
+      "Cache miss: 5k tokens re-billed",
+      true,
+    );
+    assert.match(out, /body\n\s*\n\s*Cache miss: 5k tokens re-billed/);
   });
 });

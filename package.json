@@ -49,6 +49,7 @@
   "peerDependencies": {
     "@earendil-works/pi-agent-core": ">=0.81.0",
     "@earendil-works/pi-coding-agent": ">=0.81.0",
+    "@earendil-works/pi-tui": ">=0.81.0",
     "typebox": "^1.0.0"
   },
   "license": "MIT"

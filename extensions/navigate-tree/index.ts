@@ -49,18 +49,20 @@ import {
   collectEntriesForBranchSummary,
   type ExtensionAPI,
   generateBranchSummary,
+  keyHint,
   type ModelRegistry,
   type SessionEntry,
   type SessionManager,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   buildLiveSummaryMessages,
   type CacheRequest,
   createCachePreservingStreamFn,
-  detectBranchSummaryCacheMiss,
-  formatBranchSummaryCacheMissNotice,
+  detectCacheMiss,
+  formatCacheMissNotice,
   measureSummaryCache,
   resolveSummaryCacheRetention,
 } from "./cache-summary.ts";
@@ -1110,61 +1112,54 @@ Operations (set \`action\`):
         result.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 },
       );
 
-      // Fork-faithful miss accounting: scan the entries as they stand (the
+      // Upstream-faithful miss accounting: scan the entries as they stand (the
       // branch_summary is not appended yet) and compare the summary's measured
       // usage against the previous request's baseline. HITS ARE SILENT — the
-      // footer/session totals already cover them; only an actionable miss
-      // warns. The fallback path (cache request not built) is NOT special-
-      // cased: the legacy cold request measures as a miss exactly when the
-      // numbers say so, and `fallbackReason` lives in `details.summaryCache`
-      // only. The warning is TUI-only and NEVER model-visible: the model was
-      // proven to echo the line verbatim, and cache accounting is not part of
-      // the rewind contract it must reason about. Even in the TUI it is gated
-      // by pi's own `showCacheMissNotices` setting (default off), read
+      // footer/session totals already cover them; only an actionable miss is
+      // worth a transcript line. The fallback path (cache request not built) is
+      // NOT special-cased: the legacy cold request measures as a miss exactly
+      // when the numbers say so, and `fallbackReason` lives in
+      // `details.summaryCache` only. Upstream pi renders cache notices as
+      // transcript lines gated by `showCacheMissNotices`; the extension does the
+      // same by storing the notice string and rendering it from the tool's
+      // `renderResult`. The model-visible tool-result content stays cache-free
+      // (the model was proven to echo the line verbatim). The setting is read
       // reflectively off the captured session — the extension ctx does not
-      // expose `settingsManager`. `Date.now()` is the summary timestamp, as
-      // the fork's `navigateTree` call site uses. The notify is best-effort,
-      // like the extension's other ctx calls — a UI throw must not fail the
-      // rewind. Headless runs (`hasUI === false`, e.g. `-p` / RPC without UI)
-      // and setting-off runs surface the same numbers via
-      // `details.summaryCache` in the session entries.
+      // expose `settingsManager`. `Date.now()` is the summary timestamp, as the
+      // upstream `message_end` call site uses. Headless runs and setting-off
+      // runs surface the same numbers via `details.summaryCache`.
       const summaryCacheMiss = result.usage
-        ? detectBranchSummaryCacheMiss(
+        ? detectCacheMiss(
             allEntries,
-            result.usage,
-            requestModel.provider,
-            requestModel.id,
-            Date.now(),
+            {
+              provider: requestModel.provider,
+              model: requestModel.id,
+              usage: result.usage,
+              timestamp: Date.now(),
+            },
             {
               getModel: (provider, model) =>
                 ctx.modelRegistry.find(provider, model),
             },
           )
         : undefined;
-      const summaryCacheNotice = summaryCacheMiss
-        ? formatBranchSummaryCacheMissNotice(summaryCacheMiss)
-        : null;
-      let cacheMissNotified = false;
-      if (summaryCacheNotice !== null && ctx.hasUI === true) {
-        let showCacheNotices = false;
-        try {
-          const owning = findOwningSession(sm);
-          showCacheNotices =
-            (owning
-              ? asInternals(owning).settingsManager
-              : undefined
-            )?.getShowCacheMissNotices?.() ?? false;
-        } catch {
-          // Unreadable settings -> stay silent (mirror pi's default off).
-          showCacheNotices = false;
-        }
-        if (showCacheNotices) {
+      let summaryCacheNotice: string | null = null;
+      if (summaryCacheMiss) {
+        const notice = formatCacheMissNotice(summaryCacheMiss);
+        if (notice !== null) {
+          let showCacheNotices = false;
           try {
-            ctx.ui.notify(summaryCacheNotice, "warning");
-            cacheMissNotified = true;
+            const owning = findOwningSession(sm);
+            showCacheNotices =
+              (owning
+                ? asInternals(owning).settingsManager
+                : undefined
+              )?.getShowCacheMissNotices?.() ?? false;
           } catch {
-            // Best-effort TUI notice; ignore UI failures.
+            // Unreadable settings -> stay silent (mirror pi's default off).
+            showCacheNotices = false;
           }
+          if (showCacheNotices) summaryCacheNotice = notice;
         }
       }
 
@@ -1333,12 +1328,47 @@ Operations (set \`action\`):
             missedCost: summaryCacheMiss?.missedCost ?? 0,
             idleMs: summaryCacheMiss?.idleMs ?? 0,
             modelChanged: summaryCacheMiss?.modelChanged ?? false,
-            notified: cacheMissNotified,
+            notice: summaryCacheNotice,
           },
           readFiles: result.readFiles ?? [],
           modifiedFiles: result.modifiedFiles ?? [],
         },
       };
+    },
+    // Upstream pi renders cache notices as transcript lines (its
+    // `maybeShowCacheMissNotice` + `createResultFallback`), not toasts.
+    // Reproduce the default tool-result rendering and append the notice that
+    // `execute` stored. `showCacheMissNotices` gating already happened in
+    // `execute`; this renderer only runs in the TUI.
+    renderResult(result, { expanded }, theme) {
+      const output = result.content
+        .filter((block) => block.type === "text")
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("\n");
+      const lines = output.split("\n");
+      const displayLines = expanded ? lines : lines.slice(0, 10);
+      const remaining = lines.length - displayLines.length;
+      let text = displayLines
+        .map((line) => theme.fg("toolOutput", line))
+        .join("\n");
+      if (remaining > 0) {
+        text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint(
+          "app.tools.expand",
+          "to expand",
+        )}${theme.fg("muted", ")")}`;
+      }
+      const container = new Container();
+      container.addChild(new Text(text, 0, 0));
+      const notice = (
+        result.details as
+          | { summaryCache?: { notice?: string | null } }
+          | undefined
+      )?.summaryCache?.notice;
+      if (typeof notice === "string" && notice.length > 0) {
+        container.addChild(new Spacer(1));
+        container.addChild(new Text(theme.fg("warning", notice), 1, 0));
+      }
+      return container;
     },
   });
 }
