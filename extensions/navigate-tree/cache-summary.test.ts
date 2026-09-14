@@ -23,13 +23,15 @@ import {
   BRANCH_SUMMARY_CACHE_PROMPT,
   buildLiveSummaryMessages,
   buildSummaryInstruction,
+  CACHE_MISS_DISPLAY_COST,
+  CACHE_MISS_DISPLAY_TOKENS,
+  CACHE_TTL_MS,
   type CacheRequest,
   createCachePreservingStreamFn,
-  formatSummaryCacheNotice,
+  detectBranchSummaryCacheMiss,
+  formatBranchSummaryCacheMissNotice,
   measureSummaryCache,
   resolveSummaryCacheRetention,
-  SUMMARY_CACHE_NOISE_FLOOR,
-  type SummaryCacheStats,
   stripBoundaryOrphanToolResults,
   type WireMessage,
 } from "./cache-summary.ts";
@@ -672,7 +674,7 @@ describe("resolveSummaryCacheRetention", () => {
 });
 
 // =============================================================================
-// measureSummaryCache + notice
+// measureSummaryCache + branch-summary cache-miss detection
 // =============================================================================
 
 describe("measureSummaryCache", () => {
@@ -688,62 +690,241 @@ describe("measureSummaryCache", () => {
   });
 });
 
-describe("formatSummaryCacheNotice", () => {
-  const stats = (over: Partial<SummaryCacheStats> = {}): SummaryCacheStats => ({
+describe("detectBranchSummaryCacheMiss + formatBranchSummaryCacheMissNotice", () => {
+  const COST = (over: Record<string, number> = {}) => ({
+    input: 0,
+    output: 0,
     cacheRead: 0,
-    fresh: 0,
     cacheWrite: 0,
-    hit: false,
+    total: 0,
     ...over,
   });
 
-  it("renders the fallback warning with the reason", () => {
+  /** Price source with a fixed cache-read $/MTok (used only when cacheRead=0). */
+  const priceSource = (cacheReadPerMillion = 0) => ({
+    getModel: () => ({ cost: { cacheRead: cacheReadPerMillion } }),
+  });
+
+  function usageEntry(
+    usage: Record<string, unknown>,
+    {
+      provider = "claude",
+      model = "claude-sonnet-4-5",
+      timestamp = 1_700_000_000_000,
+    }: { provider?: string; model?: string; timestamp?: number } = {},
+  ): SessionEntry {
+    return messageEntry({
+      role: "assistant",
+      content: [{ type: "text", text: "baseline" }],
+      api: "anthropic",
+      provider,
+      model,
+      stopReason: "stop",
+      timestamp,
+      usage: { output: 0, totalTokens: 0, ...usage },
+    });
+  }
+
+  function branchSummaryEntry(): SessionEntry {
+    return {
+      type: "branch_summary",
+      id: nextId(),
+      parentId: null,
+      timestamp: new Date(1_700_000_000_000).toISOString(),
+      fromId: "root",
+      summary: "earlier segment",
+    } as unknown as SessionEntry;
+  }
+
+  const response = (over: Record<string, unknown> = {}) => ({
+    input: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: COST(),
+    ...over,
+  });
+
+  it("counts a miss and renders the default label with cost", () => {
+    const entries = [
+      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
+    ];
+    const miss = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.ok(miss);
+    assert.equal(miss.missedTokens, 20_000);
+    assert.equal(miss.idleMs, 1000);
+    assert.equal(miss.modelChanged, false);
     assert.equal(
-      formatSummaryCacheNotice(stats(), {
-        mode: "fallback",
-        fallbackReason: "reflection-missing",
-      }),
-      "⚠ cache-preserving summary unavailable (reflection-missing) — the branch input was re-billed in full.",
+      formatBranchSummaryCacheMissNotice(miss),
+      "Cache miss: 20k tokens re-billed (~$0.20)",
     );
   });
 
-  it("renders 'unknown' when the fallback reason is absent", () => {
+  it("uses the model price source when the response reports no cache read", () => {
+    const entries = [
+      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
+    ];
+    const miss = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(3),
+    );
+    assert.ok(miss);
+    // paidPerToken = 1e-5, readPerToken = 3e-6 -> 20k * 7e-6 = 0.14
+    assert.equal(miss.missedCost.toFixed(2), "0.14");
     assert.equal(
-      formatSummaryCacheNotice(stats(), { mode: "fallback" }),
-      "⚠ cache-preserving summary unavailable (unknown) — the branch input was re-billed in full.",
+      formatBranchSummaryCacheMissNotice(miss),
+      "Cache miss: 20k tokens re-billed (~$0.14)",
     );
   });
 
-  it("renders the read/fresh line on a live-prefix hit", () => {
-    assert.equal(
-      formatSummaryCacheNotice(
-        stats({ cacheRead: 77_000, fresh: 420, hit: true }),
-        { mode: "live-prefix" },
+  it("suppresses a miss after a model switch", () => {
+    const entries = [
+      usageEntry(
+        { input: 0, cacheRead: 20_000, cacheWrite: 0 },
+        { provider: "openai", model: "gpt-5" },
       ),
-      "summary cache: 77.0k read / 420 fresh.",
+    ];
+    const miss = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
+    assert.equal(miss, undefined);
   });
 
-  it("renders the miss warning when re-billed tokens exceed the noise floor", () => {
-    assert.equal(
-      formatSummaryCacheNotice(
-        stats({ cacheRead: 0, fresh: 3000, cacheWrite: 500 }),
-        { mode: "live-prefix" },
+  it("suppresses hits and noise-floor misses", () => {
+    // Warm read: no missed tokens.
+    const warm = detectBranchSummaryCacheMiss(
+      [usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 })],
+      response({ input: 100, cacheRead: 20_000, cost: COST({ input: 0.001 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.equal(warm, undefined);
+    // Miss at/below the 1024-token noise floor.
+    const tiny = detectBranchSummaryCacheMiss(
+      [usageEntry({ input: 0, cacheRead: 50_000, cacheWrite: 0 })],
+      response({ input: 1030, cacheRead: 49_000, cost: COST({ input: 0.01 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.equal(tiny, undefined);
+  });
+
+  it("returns undefined with no baseline request", () => {
+    const miss = detectBranchSummaryCacheMiss(
+      [userEntry("hi")],
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.equal(miss, undefined);
+  });
+
+  it("keeps the baseline across branch_summary entries", () => {
+    const entries = [
+      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
+      branchSummaryEntry(),
+    ];
+    const miss = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.ok(miss, "branch_summary must not reset the baseline");
+  });
+
+  it("renders the idle label once the gap spans the cache TTL", () => {
+    const base = 1_700_000_000_000;
+    const entries = [
+      usageEntry(
+        { input: 0, cacheRead: 20_000, cacheWrite: 0 },
+        { timestamp: base },
       ),
-      "⚠ summary cache miss: 3.5k tokens re-billed.",
+    ];
+    const miss = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      base + CACHE_TTL_MS + 60_000,
+      priceSource(),
+    );
+    assert.ok(miss);
+    assert.equal(
+      formatBranchSummaryCacheMissNotice(miss),
+      "Cache miss after 6m idle: 20k tokens re-billed (~$0.20)",
     );
   });
 
-  it("stays silent below the noise floor or on aborted/empty usage", () => {
-    assert.equal(
-      formatSummaryCacheNotice(stats({ fresh: SUMMARY_CACHE_NOISE_FLOOR }), {
-        mode: "live-prefix",
-      }),
-      null,
+  it("omits the cost below one cent and stays silent below the display floor", () => {
+    const entries = [
+      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
+    ];
+    const noCost = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.001 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
+    assert.ok(noCost);
     assert.equal(
-      formatSummaryCacheNotice(stats(), { mode: "live-prefix" }),
-      null,
+      formatBranchSummaryCacheMissNotice(noCost),
+      "Cache miss: 20k tokens re-billed",
+    );
+
+    // Below the 20k-token floor and below $0.10 -> no notice.
+    const below = detectBranchSummaryCacheMiss(
+      [usageEntry({ input: 0, cacheRead: 50_000, cacheWrite: 0 })],
+      response({ input: 15_000, cost: COST() }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.ok(below);
+    assert.equal(formatBranchSummaryCacheMissNotice(below), null);
+  });
+
+  it("shows a cost-only miss above the dollar floor", () => {
+    const miss = detectBranchSummaryCacheMiss(
+      [usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 })],
+      response({ input: 10_000, cost: COST({ input: 0.5 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.ok(miss);
+    assert.ok(miss.missedTokens < CACHE_MISS_DISPLAY_TOKENS);
+    assert.ok(miss.missedCost >= CACHE_MISS_DISPLAY_COST);
+    assert.equal(
+      formatBranchSummaryCacheMissNotice(miss),
+      "Cache miss: 10k tokens re-billed (~$0.50)",
     );
   });
 });

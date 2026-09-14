@@ -59,7 +59,8 @@ import {
   buildLiveSummaryMessages,
   type CacheRequest,
   createCachePreservingStreamFn,
-  formatSummaryCacheNotice,
+  detectBranchSummaryCacheMiss,
+  formatBranchSummaryCacheMissNotice,
   measureSummaryCache,
   resolveSummaryCacheRetention,
 } from "./cache-summary.ts";
@@ -187,6 +188,14 @@ interface PiInternals {
     };
     /** Live thinking token budgets (plain field on pi-agent-core's Agent). */
     thinkingBudgets?: unknown;
+  };
+  /**
+   * Plain field on `AgentSession`; the extension ctx does not expose
+   * settings. Used only to gate the TUI cache notice on pi's own
+   * `showCacheMissNotices` setting (default off).
+   */
+  settingsManager?: {
+    getShowCacheMissNotices?: () => boolean;
   };
   sessionManager: SessionManager;
 }
@@ -1095,17 +1104,69 @@ Operations (set \`action\`):
       // Cache outcome measured from provider usage. Mode reflects whether a
       // cache-preserving request was BUILT; `used` reflects whether the
       // wrapper actually delegated it (false when the summarizer is stubbed,
-      // aborted before the wire call, or the fallback path ran). A request
-      // that was built but never delegated produces zero usage, so it emits
-      // no notice — `mode` is informational only.
+      // aborted before the wire call, or the fallback path ran).
       const summaryCacheMode = summaryCacheRequest ? "live-prefix" : "fallback";
       const summaryCacheStats = measureSummaryCache(
         result.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 },
       );
-      const summaryCacheNotice = formatSummaryCacheNotice(summaryCacheStats, {
-        mode: summaryCacheMode,
-        fallbackReason: summaryCacheFallbackReason,
-      });
+
+      // Fork-faithful miss accounting: scan the entries as they stand (the
+      // branch_summary is not appended yet) and compare the summary's measured
+      // usage against the previous request's baseline. HITS ARE SILENT — the
+      // footer/session totals already cover them; only an actionable miss
+      // warns. The fallback path (cache request not built) is NOT special-
+      // cased: the legacy cold request measures as a miss exactly when the
+      // numbers say so, and `fallbackReason` lives in `details.summaryCache`
+      // only. The warning is TUI-only and NEVER model-visible: the model was
+      // proven to echo the line verbatim, and cache accounting is not part of
+      // the rewind contract it must reason about. Even in the TUI it is gated
+      // by pi's own `showCacheMissNotices` setting (default off), read
+      // reflectively off the captured session — the extension ctx does not
+      // expose `settingsManager`. `Date.now()` is the summary timestamp, as
+      // the fork's `navigateTree` call site uses. The notify is best-effort,
+      // like the extension's other ctx calls — a UI throw must not fail the
+      // rewind. Headless runs (`hasUI === false`, e.g. `-p` / RPC without UI)
+      // and setting-off runs surface the same numbers via
+      // `details.summaryCache` in the session entries.
+      const summaryCacheMiss = result.usage
+        ? detectBranchSummaryCacheMiss(
+            allEntries,
+            result.usage,
+            requestModel.provider,
+            requestModel.id,
+            Date.now(),
+            {
+              getModel: (provider, model) =>
+                ctx.modelRegistry.find(provider, model),
+            },
+          )
+        : undefined;
+      const summaryCacheNotice = summaryCacheMiss
+        ? formatBranchSummaryCacheMissNotice(summaryCacheMiss)
+        : null;
+      let cacheMissNotified = false;
+      if (summaryCacheNotice !== null && ctx.hasUI === true) {
+        let showCacheNotices = false;
+        try {
+          const owning = findOwningSession(sm);
+          showCacheNotices =
+            (owning
+              ? asInternals(owning).settingsManager
+              : undefined
+            )?.getShowCacheMissNotices?.() ?? false;
+        } catch {
+          // Unreadable settings -> stay silent (mirror pi's default off).
+          showCacheNotices = false;
+        }
+        if (showCacheNotices) {
+          try {
+            ctx.ui.notify(summaryCacheNotice, "warning");
+            cacheMissNotified = true;
+          } catch {
+            // Best-effort TUI notice; ignore UI failures.
+          }
+        }
+      }
 
       // Move the tree.
       const summaryId = sm.branchWithSummary(target, result.summary, {
@@ -1245,7 +1306,6 @@ Operations (set \`action\`):
             text:
               `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
               `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
-              (summaryCacheNotice ? `\n${summaryCacheNotice}` : "") +
               (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
           },
         ],
@@ -1269,6 +1329,11 @@ Operations (set \`action\`):
             input: summaryCacheStats.fresh,
             cacheWrite: summaryCacheStats.cacheWrite,
             hit: summaryCacheStats.hit,
+            missedTokens: summaryCacheMiss?.missedTokens ?? 0,
+            missedCost: summaryCacheMiss?.missedCost ?? 0,
+            idleMs: summaryCacheMiss?.idleMs ?? 0,
+            modelChanged: summaryCacheMiss?.modelChanged ?? false,
+            notified: cacheMissNotified,
           },
           readFiles: result.readFiles ?? [],
           modifiedFiles: result.modifiedFiles ?? [],

@@ -31,8 +31,11 @@
  *
  *  - Every param this module does not mirror is a silent cache miss:
  *    the summary still runs, just cold (and a cold *structured* request
- *    can bill more than branch-only evidence). The rewind response
- *    surfaces a warning on any miss so this is never invisible.
+ *    can bill more than branch-only evidence). The extension measures the
+ *    summary response with pi's own miss detector and, when it clears the
+ *    display floor, warns through a TUI-only `ctx.ui.notify` (gated by
+ *    `showCacheMissNotices`); the numbers also land in
+ *    `details.summaryCache`. Neither surface reaches the model.
  *  - The request depends on plain (non-`#`-private) pi internals for
  *    `systemPrompt` / `tools`; `index.ts` falls back to the cold request
  *    when any live input is unavailable.
@@ -376,14 +379,270 @@ export function resolveSummaryCacheRetention(
 // ---------------------------------------------------------------------------
 // Measurement + notice
 // ---------------------------------------------------------------------------
+// Branch-summary cache-miss detection (port of pi's `cache-stats.ts`)
+//
+// Byte-for-byte behavioral port of `detectBranchSummaryCacheMiss` from
+// `cad0p/pi@eval/branch-summary-prompt`
+// `packages/coding-agent/src/core/cache-stats.ts`. pi 0.84.2 does not export
+// this symbol, and its public `cache-stats` surface is an older revision, so
+// the extension carries its own copy. The display half (`CacheMiss` copy +
+// thresholds) mirrors `interactive-mode.ts`'s `addCacheMissNotice`.
+// ---------------------------------------------------------------------------
 
 /**
- * Below this many re-billed tokens a miss is indistinguishable from request
- * framing noise (pi-ai uses the same 1024 floor for cache-miss notices);
- * warning at every small miss would train users to ignore the warning.
+ * Prompt-cache TTL: idle gaps longer than this are worth mentioning as the
+ * likely cause of a miss. Anthropic's default cache TTL is 5 minutes.
  */
-export const SUMMARY_CACHE_NOISE_FLOOR = 1024;
+export const CACHE_TTL_MS = 5 * 60 * 1000;
 
+/** Per-turn misses at or below this are cache breakpoint granularity noise. */
+const NOISE_FLOOR_TOKENS = 1024;
+
+/** Display floor: only misses at/above this many tokens warn. */
+export const CACHE_MISS_DISPLAY_TOKENS = 20_000;
+/** Display floor: only misses at/above this many dollars warn. */
+export const CACHE_MISS_DISPLAY_COST = 0.1;
+
+/** A counted cache miss on the just-completed branch-summary request. */
+export interface BranchSummaryCacheMiss {
+  /** Prompt tokens in the previous request's prompt but not read from cache. */
+  missedTokens: number;
+  /** Extra dollars paid vs. a full cache hit; 0 when pricing is unknown. */
+  missedCost: number;
+  /** Milliseconds since the previous request (which last refreshed the cache). */
+  idleMs: number;
+  /** True when the model changed relative to the previous request. */
+  modelChanged: boolean;
+}
+
+/** Minimal pricing lookup; cost is $/million tokens. Satisfied by ModelRegistry. */
+export interface ModelPriceSource {
+  getModel(
+    provider: string,
+    modelId: string,
+  ): { cost?: { cacheRead?: number } } | undefined;
+}
+
+/** The last request seen by the scan; everything in its prompt should be cached. */
+interface PreviousRequest {
+  promptTokens: number;
+  modelKey: string;
+  timestamp: number;
+  /**
+   * Sticky: some earlier request in this session reported cache activity.
+   * Session-scoped (never reset by context boundaries): provider cache
+   * capability does not change across compactions, while the prompt baseline
+   * legitimately does. Distinguishes a total miss on a cache-read-only
+   * provider from a provider that never reports caching at all.
+   */
+  reportedCache: boolean;
+}
+
+interface MissUsage {
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost?: { input?: number; cacheRead?: number; cacheWrite?: number };
+}
+
+interface MissAssistantMessage {
+  provider?: string;
+  model?: string;
+  usage: MissUsage;
+  timestamp: number;
+}
+
+function modelKey(provider: string, model: string): string {
+  return `${provider}/${model}`;
+}
+
+function detectMiss(
+  prev: PreviousRequest | undefined,
+  message: MissAssistantMessage,
+  models: ModelPriceSource,
+): BranchSummaryCacheMiss | undefined {
+  const usage = message.usage;
+  const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  // A zero-cache turn only counts when cache activity was reported before:
+  // on cache-read-only providers that is a total miss, while on providers
+  // that never report caching it means nothing.
+  if (
+    !prev ||
+    promptTokens <= 0 ||
+    (usage.cacheRead + usage.cacheWrite === 0 && !prev.reportedCache)
+  ) {
+    return undefined;
+  }
+
+  const missedTokens =
+    Math.min(prev.promptTokens, promptTokens) - usage.cacheRead;
+  if (missedTokens <= NOISE_FLOOR_TOKENS) return undefined;
+
+  // Extra cost = missed tokens billed at the actual paid rate (input/cacheWrite,
+  // incl. write premium) instead of the cache-read rate. Missed tokens can only
+  // land in the input or cacheWrite buckets, so the paid rate comes straight
+  // from this message's own cost breakdown.
+  const cost = usage.cost ?? {};
+  const paidTokens = usage.input + usage.cacheWrite;
+  const paidPerToken =
+    paidTokens > 0
+      ? ((cost.input ?? 0) + (cost.cacheWrite ?? 0)) / paidTokens
+      : 0;
+  const readPerToken =
+    usage.cacheRead > 0
+      ? (cost.cacheRead ?? 0) / usage.cacheRead
+      : (models.getModel(message.provider ?? "", message.model ?? "")?.cost
+          ?.cacheRead ?? 0) / 1_000_000;
+
+  return {
+    missedTokens,
+    missedCost: missedTokens * Math.max(0, paidPerToken - readPerToken),
+    idleMs: Math.max(0, message.timestamp - prev.timestamp),
+    modelChanged:
+      modelKey(message.provider ?? "", message.model ?? "") !== prev.modelKey,
+  };
+}
+
+function asPreviousRequest(
+  message: MissAssistantMessage,
+  reportedCache: boolean,
+): PreviousRequest | undefined {
+  const usage = message.usage;
+  const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  if (promptTokens <= 0) return undefined;
+  return {
+    promptTokens,
+    modelKey: modelKey(message.provider ?? "", message.model ?? ""),
+    timestamp: message.timestamp,
+    reportedCache: reportedCache || usage.cacheRead + usage.cacheWrite > 0,
+  };
+}
+
+function scan(
+  entries: SessionEntry[],
+  keepBaselineAcrossBranchSummary: boolean,
+): PreviousRequest | undefined {
+  let prev: PreviousRequest | undefined;
+  // Session-level cache capability: any measured cache activity (assistant
+  // turns AND summary requests) proves the provider reports caching, so a
+  // later zero-read is a real miss even across a context boundary.
+  let everReportedCache = false;
+  for (const entry of entries) {
+    if (
+      entry.type === "compaction" ||
+      (entry.type === "branch_summary" && !keepBaselineAcrossBranchSummary)
+    ) {
+      // The context legitimately changed; the next turn's prompt is new content,
+      // not re-billed content. Model switches are NOT exempt: they re-bill the
+      // full prompt and should be counted.
+      if (entry.usage && entry.usage.cacheRead + entry.usage.cacheWrite > 0) {
+        everReportedCache = true;
+      }
+      prev = undefined;
+      continue;
+    }
+    if (entry.type === "branch_summary") {
+      // Probe-only path (keepBaselineAcrossBranchSummary): the summary request
+      // reuses the live prompt-cache prefix, so the parent baseline survives.
+      // Fold cache activity into the session capability flag but never reset
+      // prev and never become prev (only assistant messages do).
+      if (entry.usage && entry.usage.cacheRead + entry.usage.cacheWrite > 0) {
+        everReportedCache = true;
+      }
+      continue;
+    }
+    if (entry.type === "message" && entry.message.role === "assistant") {
+      const message = entry.message as unknown as MissAssistantMessage;
+      if (
+        message.usage &&
+        message.usage.cacheRead + message.usage.cacheWrite > 0
+      ) {
+        everReportedCache = true;
+      }
+      prev =
+        asPreviousRequest(
+          message,
+          (prev?.reportedCache ?? false) || everReportedCache,
+        ) ?? prev;
+    }
+  }
+  return prev;
+}
+
+/**
+ * Detect a cache miss on a just-completed branch-summary response from its
+ * measured usage. `entries` is the session BEFORE the summary entry is
+ * appended. Live-turn accounting counts model switches as misses; summary
+ * probes suppress them instead — a cold summary right after a switch is
+ * expected re-billing, not an actionable miss.
+ */
+export function detectBranchSummaryCacheMiss(
+  entries: SessionEntry[],
+  responseUsage: MissUsage,
+  provider: string,
+  model: string,
+  timestamp: number,
+  models: ModelPriceSource,
+): BranchSummaryCacheMiss | undefined {
+  const prev = scan(entries, true);
+  if (prev && prev.modelKey !== modelKey(provider, model)) return undefined;
+  return detectMiss(
+    prev,
+    { provider, model, usage: responseUsage, timestamp },
+    models,
+  );
+}
+
+/**
+ * Compact token formatting, byte-for-byte port of the fork's
+ * `interactive-mode/components/footer.ts` `formatTokens` (the same helper the
+ * miss notice uses): 999 → "999", 9999 → "10.0k", 20000 → "20k".
+ */
+function formatTokens(count: number): string {
+  if (count < 1000) return count.toString();
+  if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
+}
+
+/**
+ * TUI warning copy for a counted branch-summary cache miss, or `null` when
+ * the miss is below the display floor. Mirrors the fork's `addCacheMissNotice`
+ * thresholds and label selection verbatim. The caller delivers the non-null
+ * result through `ctx.ui.notify(text, "warning")`; it is NEVER appended to
+ * the rewind tool-result content the model sees.
+ */
+export function formatBranchSummaryCacheMissNotice(
+  miss: BranchSummaryCacheMiss,
+): string | null {
+  if (
+    miss.missedTokens < CACHE_MISS_DISPLAY_TOKENS &&
+    miss.missedCost < CACHE_MISS_DISPLAY_COST
+  ) {
+    return null;
+  }
+  const cost =
+    miss.missedCost >= 0.01 ? ` (~$${miss.missedCost.toFixed(2)})` : "";
+  const reBilled = `${formatTokens(miss.missedTokens)} tokens re-billed${cost}`;
+  let label = "Cache miss";
+  if (miss.modelChanged) {
+    label = "Cache miss after model switch";
+  } else if (miss.idleMs >= CACHE_TTL_MS) {
+    label = `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
+  }
+  return `${label}: ${reBilled}`;
+}
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache accounting for the summary request. `usage.input` counts FRESH
+ * (uncached) tokens only on cache-serving providers, which is why the
+ * cache-hit metric is `cacheRead > 0` rather than `cacheRead/input`. This is
+ * retained purely as the machine-readable `details.summaryCache` surface;
+ * the TUI warning is derived from the miss detector above.
+ */
 export interface SummaryCacheStats {
   /** Fresh (uncached) input tokens billed for this request. */
   cacheRead: number;
@@ -406,51 +665,6 @@ export function measureSummaryCache(
     cacheWrite: usage.cacheWrite,
     hit: usage.cacheRead > 0,
   };
-}
-
-export interface FormatSummaryCacheNoticeOptions {
-  /**
-   * `"live-prefix"` when a cache-preserving request was BUILT (it may not
-   * have been delegated — e.g. the summarizer returned "No content to
-   * summarize" before the wire call; `details.summaryCache.used` records
-   * whether the wrapper actually delegated); `"fallback"` when any live
-   * input was unavailable and today's cold standalone request ran instead.
-   */
-  mode: "live-prefix" | "fallback";
-  /** Why the cache path was skipped (only rendered in `"fallback"` mode). */
-  fallbackReason?: string;
-}
-
-/** 1200 → "1.2k", 980 → "980". Matches the rewind response's compact tone. */
-function formatTokens(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-}
-
-/**
- * One-line, agent-visible cache outcome for the rewind response, or `null`
- * when there is nothing worth saying (cold-path hit with nothing billed).
- *
- *  - fallback            → loud warning: the cold request re-billed the
- *                          whole branch input.
- *  - live-prefix + hit   → quiet informational read/fresh line.
- *  - live-prefix + miss  → loud warning when enough was re-billed to be
- *                          actionable (> noise floor).
- *  - otherwise           → null (tiny request or aborted; not worth noise).
- */
-export function formatSummaryCacheNotice(
-  stats: SummaryCacheStats,
-  opts: FormatSummaryCacheNoticeOptions,
-): string | null {
-  if (opts.mode === "fallback") {
-    return `⚠ cache-preserving summary unavailable (${opts.fallbackReason ?? "unknown"}) — the branch input was re-billed in full.`;
-  }
-  if (stats.cacheRead > 0) {
-    return `summary cache: ${formatTokens(stats.cacheRead)} read / ${formatTokens(stats.fresh)} fresh.`;
-  }
-  if (stats.fresh + stats.cacheWrite > SUMMARY_CACHE_NOISE_FLOOR) {
-    return `⚠ summary cache miss: ${formatTokens(stats.fresh + stats.cacheWrite)} tokens re-billed.`;
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------

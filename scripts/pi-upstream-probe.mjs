@@ -72,7 +72,7 @@ function resolveDist(pkgName, entry = "dist/index.js") {
   return null;
 }
 
-let AgentSession, SessionManager, Agent;
+let AgentSession, SessionManager, Agent, SettingsManager;
 
 try {
   const codingAgentDist = resolveDist("@earendil-works/pi-coding-agent");
@@ -85,6 +85,7 @@ try {
   const codingAgent = await import(pathToFileURL(codingAgentDist));
   AgentSession = codingAgent.AgentSession;
   SessionManager = codingAgent.SessionManager;
+  SettingsManager = codingAgent.SettingsManager;
 
   const core = await import(pathToFileURL(coreDist));
   Agent = core.Agent;
@@ -209,6 +210,21 @@ try {
     "getSessionId is prototype method",
     typeof SessionManager?.prototype?.getSessionId === "function",
     typeof SessionManager?.prototype?.getSessionId,
+  );
+
+  // --- 8. SettingsManager.getShowCacheMissNotices (TUI cache-notice gate) ---
+  // The extension reads this reflectively off the captured AgentSession to
+  // gate the TUI cache-miss warning. pi defaults it to false; absence would
+  // silently disable the notice (or, on a non-optional read, throw).
+  check(
+    "SettingsManager exported",
+    typeof SettingsManager === "function",
+    typeof SettingsManager,
+  );
+  check(
+    "getShowCacheMissNotices is prototype method",
+    typeof SettingsManager?.prototype?.getShowCacheMissNotices === "function",
+    typeof SettingsManager?.prototype?.getShowCacheMissNotices,
   );
 } catch (e) {
   check("probe crashed", false, String(e.stack || e.message));
