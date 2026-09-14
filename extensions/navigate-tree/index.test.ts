@@ -100,6 +100,10 @@ function makeFakePi(sm: SessionManager): FakePi {
       list.push(handler);
       onCalls.set(event, list);
     },
+    // Public since pi 0.81.0; the cache request mirrors it as `reasoning`.
+    getThinkingLevel() {
+      return "medium";
+    },
   } as unknown as ExtensionAPI;
   return { pi, setLabelCalls, registered, onCalls };
 }
@@ -122,6 +126,8 @@ interface FakeCtx {
       | { ok: false; error: string }
     >;
   };
+  /** Public system-prompt accessor (0.81+); override per test as needed. */
+  getSystemPrompt(): string;
 }
 
 function makeCtx(
@@ -143,6 +149,7 @@ function makeCtx(
   return {
     sessionManager: sm,
     model,
+    getSystemPrompt: () => "LIVE SYSTEM PROMPT",
     modelRegistry: {
       async getApiKeyAndHeaders(_m: unknown) {
         if (opts.authError) return { ok: false, error: opts.authError };
@@ -238,6 +245,8 @@ interface FakeAgentSession {
   sessionManager: SessionManager;
   agent: {
     state: { systemPrompt: string; messages: unknown[]; tools: unknown[] };
+    /** Plain field on pi-agent-core's Agent (cache request mirror). */
+    thinkingBudgets?: unknown;
     prepareNextTurn?: unknown;
     prepareNextTurnWithContext?: unknown;
   };
@@ -1819,7 +1828,7 @@ describe("dispatch: rewind happy path", () => {
     }
   });
 
-  it("passes the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
+  it("wraps the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
     // Regression: rewind failed with "No API provider registered for api:
     // commandcode-custom" for providers registered via
     // pi.registerProvider(name, { api: <custom-id>, streamSimple }) because
@@ -1828,8 +1837,12 @@ describe("dispatch: rewind happy path", () => {
     // only knows builtin apis). The fix forwards the composed provider's
     // `streamSimple` via the public modelRegistry.getProvider() API — the
     // same routing pi's own branchWithSummary uses.
-    // A regression that drops the forwarding re-introduces the failure for
-    // commandcode 0.5.x and every other custom-api provider.
+    //
+    // #33 wraps that function (to rewrite the request at the seam), so the
+    // identity changed from "the provider's streamSimple" to "a wrapper that
+    // delegates to it". Pin the delegation, not the identity: a regression
+    // that drops the forwarding still fails here because the delegate is
+    // never called.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -1847,7 +1860,15 @@ describe("dispatch: rewind happy path", () => {
     // Simulate a custom-api provider (e.g. commandcode 0.5.x with
     // api "commandcode-custom"): the composed provider exposes
     // `streamSimple` via the public modelRegistry.getProvider().
-    const providerStreamSimple = async () => ({}) as never;
+    const delegated: unknown[] = [];
+    const providerStreamSimple = async (
+      _m: unknown,
+      context: unknown,
+      options: unknown,
+    ) => {
+      delegated.push({ context, options });
+      return { result: async () => ({}) } as never;
+    };
     (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
       () => ({ streamSimple: providerStreamSimple });
 
@@ -1865,9 +1886,25 @@ describe("dispatch: rewind happy path", () => {
     );
     assert.equal(result.isError, undefined);
     assert.equal(
-      capturedStreamFn,
-      providerStreamSimple,
-      "summarize must receive the provider's streamSimple as streamFn",
+      typeof capturedStreamFn,
+      "function",
+      "summarize must receive a streamFn that delegates to the provider streamSimple",
+    );
+    // No captured session in this fixture ⇒ cold fallback: the wrapper
+    // delegates the caller's context/options verbatim.
+    const coldContext = { systemPrompt: "COLD", messages: [] };
+    await (
+      capturedStreamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, coldContext, { maxTokens: 2048 });
+    assert.equal(delegated.length, 1, "delegate must be invoked");
+    assert.equal(
+      (delegated[0] as { context: unknown }).context,
+      coldContext,
+      "fallback must be byte-identical delegation",
     );
   });
 
@@ -2033,10 +2070,23 @@ describe("dispatch: rewind happy path", () => {
       ctx,
     );
     assert.equal(result.isError, undefined);
+    // #33 always wraps a truthy provider streamSimple, so the option is the
+    // wrapper (a function), not the raw truthy value. Calling it surfaces
+    // the delegate's TypeError — pin that instead of the old identity.
     assert.equal(
-      capturedStreamFn,
-      notAFunction,
-      "summarize receives the truthy streamSimple verbatim (current behavior pin)",
+      typeof capturedStreamFn,
+      "function",
+      "truthy streamSimple is wrapped (function-shaped option)",
+    );
+    assert.throws(
+      () =>
+        (capturedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(
+          {},
+          {},
+          {},
+        ),
+      TypeError,
+      "invoking the wrapper surfaces the non-function delegate error",
     );
   });
 
@@ -2155,14 +2205,21 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(headers["x-opencode-client"], "pi");
   });
 
-  it("generates a fresh x-opencode-session per rewind when auth sets none", async () => {
-    const seen: string[] = [];
+  it("uses the live session id for x-opencode-session when auth sets none", async () => {
+    // #33: the summarization request must route to the same
+    // replica/affinity bucket as the turns it summarizes, so the header uses
+    // the LIVE session id (not a fresh per-rewind uuid). A fresh uuid is
+    // only the no-session fallback. Two distinct sessions must still produce
+    // distinct ids (i.e. it is not a constant).
+    const pairs: Array<{ header: string; live: string }> = [];
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
-      seen.push(
-        (opts as { headers?: Record<string, string> }).headers?.[
-          "x-opencode-session"
-        ] ?? "__missing__",
-      );
+      pairs.push({
+        header:
+          (opts as { headers?: Record<string, string> }).headers?.[
+            "x-opencode-session"
+          ] ?? "__missing__",
+        live: "__pending__",
+      });
       return {
         summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
         readFiles: [] as string[],
@@ -2171,8 +2228,6 @@ describe("dispatch: rewind happy path", () => {
       };
     }) as typeof fakeSummarize;
 
-    const uuidRe =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     for (const tc of ["tc-rewind-1", "tc-rewind-2"]) {
       const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
       setupRewindable(sm, pi, {});
@@ -2198,21 +2253,27 @@ describe("dispatch: rewind happy path", () => {
           action: "rewind",
           labelStart: "start",
           labelEnd: "end",
-          summaryFocus: "fresh session id regression focus",
+          summaryFocus: "live session id header regression focus",
         },
         undefined,
         undefined,
         ctx,
       );
       assert.equal(result.isError, undefined);
+      pairs[pairs.length - 1].live = sm.getSessionId();
     }
-    assert.equal(seen.length, 2);
-    assert.match(seen[0], uuidRe, "first rewind needs a uuid session id");
-    assert.match(seen[1], uuidRe, "second rewind needs a uuid session id");
+    assert.equal(pairs.length, 2);
+    for (const pair of pairs) {
+      assert.equal(
+        pair.header,
+        pair.live,
+        "x-opencode-session must be the live session id, not a fresh uuid",
+      );
+    }
     assert.notEqual(
-      seen[0],
-      seen[1],
-      "each rewind mints its own session id (one-off summaries have no continuation)",
+      pairs[0].header,
+      pairs[1].header,
+      "distinct sessions must yield distinct ids (not a constant)",
     );
   });
 
@@ -4127,5 +4188,411 @@ describe("dispatch: rewind beforeTokens fallback", () => {
       typeof before === "number" && before > 0,
       `expected non-zero contextBefore; got ${before}`,
     );
+  });
+});
+
+// =============================================================================
+// dispatch: rewind cache-preserving summary request (#33)
+//
+// The cache path is built at the rewind call site and injected through the
+// `streamFn` seam. These tests pin the wiring (live inputs read, request
+// assembled, wrapper forwarded) and the user-visible fallback/miss/hit matrix.
+// Provider usage is stubbed; no request leaves the process.
+// =============================================================================
+
+interface CapturedRewindOptions {
+  streamFn?: unknown;
+  headers?: Record<string, string>;
+  customInstructions?: unknown;
+}
+
+/** Summarize stub that captures the options the call site passes downstream. */
+function capturingSummarize(usage?: unknown) {
+  const captured: CapturedRewindOptions = {};
+  const spy = (async (_entries: unknown, opts: unknown) => {
+    const o = opts as CapturedRewindOptions;
+    captured.streamFn = o.streamFn;
+    captured.headers = o.headers;
+    captured.customInstructions = o.customInstructions;
+    return {
+      summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+      readFiles: [] as string[],
+      modifiedFiles: [] as string[],
+      aborted: false,
+      ...(usage ? { usage } : {}),
+    };
+  }) as typeof fakeSummarize;
+  return { spy, captured };
+}
+
+interface ProviderCall {
+  context: {
+    systemPrompt?: string;
+    messages: Array<{ role: string }>;
+    tools?: unknown;
+  };
+  options: Record<string, unknown> | undefined;
+}
+
+/** Fake provider `streamSimple` that records the wire request. */
+function capturingProvider() {
+  const calls: ProviderCall[] = [];
+  const streamSimple = async (
+    _model: unknown,
+    context: ProviderCall["context"],
+    options: Record<string, unknown> | undefined,
+  ) => {
+    calls.push({ context, options });
+    return { result: async () => ({}) } as never;
+  };
+  return { calls, streamSimple };
+}
+
+function installProvider(ctx: FakeCtx, streamSimple: unknown): void {
+  (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+    () => ({ streamSimple });
+}
+
+const USAGE_COST = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  total: 0,
+};
+
+/** Append an assistant entry carrying a single toolCall (the in-flight one). */
+function appendInFlightAssistant(sm: SessionManager, id: string): string {
+  return sm.appendMessage({
+    role: "assistant",
+    content: [
+      {
+        type: "toolCall",
+        id,
+        name: "navigate_tree",
+        arguments: { action: "rewind" },
+      },
+    ],
+    api: "anthropic",
+    provider: "claude",
+    model: "claude-sonnet-4-5",
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 20_000,
+      cost: USAGE_COST,
+    },
+  } as never);
+}
+
+describe("dispatch: rewind cache-preserving summary request (#33)", () => {
+  const ORIGINAL_KILL_SWITCH = process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE;
+  afterEach(() => {
+    if (ORIGINAL_KILL_SWITCH === undefined) {
+      delete process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE;
+    } else {
+      process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE = ORIGINAL_KILL_SWITCH;
+    }
+  });
+
+  it("assembles the live request and delegates it through the wrapper", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    const inFlightId = appendInFlightAssistant(sm, "tc-rewind");
+    assert.equal(sm.getLeafId(), inFlightId);
+
+    const fake = makeFakeSession(sm);
+    const liveTools = [{ name: "read", description: "r", parameters: {} }];
+    fake.agent.state.tools = liveTools;
+    fake.agent.thinkingBudgets = { high: 4242 };
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    (pi.pi as unknown as { getThinkingLevel: () => string }).getThinkingLevel =
+      () => "high";
+
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus:
+          "Preserve the latest instruction, note done work, list what remains.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (result.details.summaryCache as { mode: string }).mode,
+      "live-prefix",
+    );
+    assert.equal(
+      (result.details.summaryCache as { used: boolean }).used,
+      false,
+      "stub summarizer never invokes the wrapper, so `used` stays false",
+    );
+
+    // The wrapper was handed to the summarizer; invoke it the way the real
+    // generateBranchSummary would (cold context/options in, live request out).
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+
+    assert.equal(provider.calls.length, 1);
+    const call = provider.calls[0];
+    assert.equal(call.context.systemPrompt, "LIVE SYSTEM PROMPT");
+    assert.equal(
+      call.context.tools,
+      liveTools,
+      "live tool instances must be reused",
+    );
+    assert.equal(
+      call.options?.maxTokens,
+      undefined,
+      "caller cap must be stripped",
+    );
+    assert.equal(call.options?.cacheRetention, "short");
+    assert.equal(call.options?.sessionId, sm.getSessionId());
+    assert.equal(call.options?.reasoning, "high");
+    assert.deepEqual(call.options?.thinkingBudgets, { high: 4242 });
+
+    // In-flight assistant excluded: the payload ends before the assistant
+    // that carries the triggering toolCall, leaving no unpaired tool_use.
+    const body = call.context.messages.slice(0, -1);
+    assert.ok(
+      !body.some(
+        (m) =>
+          m.role === "assistant" && JSON.stringify(m).includes("tc-rewind"),
+      ),
+      "in-flight assistant toolCall must not appear in the summary payload",
+    );
+    const trailer = call.context.messages[call.context.messages.length - 1] as {
+      role: string;
+      content: Array<{ text: string }>;
+    };
+    assert.equal(trailer.role, "user");
+    assert.match(
+      trailer.content[0].text,
+      /Additional focus: Preserve the latest/,
+    );
+    assert.doesNotMatch(trailer.content[0].text, /\{first\}/);
+  });
+
+  it("falls back with a warning when no owning session can be found", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi);
+    // Provider present so the fallback reason is the reflection miss, not
+    // the missing stream.
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /⚠ cache-preserving summary unavailable \(reflection-missing\) — the branch input was re-billed in full\./,
+    );
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      hit: boolean;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "reflection-missing");
+    assert.equal(cache.hit, false);
+  });
+
+  it("falls back when the reflected session has no live tool array", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi);
+    // Capture a session whose tools field is not an array. (Must be the only
+    // captured session for this sm so findOwningSession resolves it.)
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = undefined as never;
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /cache-preserving summary unavailable \(no-live-tools\)/,
+    );
+    assert.equal(
+      (result.details.summaryCache as { fallbackReason: string })
+        .fallbackReason,
+      "no-live-tools",
+    );
+  });
+
+  it("kill switch PI_NAVIGATE_TREE_SUMMARY_CACHE=0 bypasses the cache path", async () => {
+    process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE = "0";
+    const { spy } = capturingSummarize(undefined);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, { capture: true });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /cache-preserving summary unavailable \(disabled\)/,
+    );
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "disabled");
+  });
+
+  it("falls back with no-provider-stream when the registry has no streamSimple", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, { capture: true });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /cache-preserving summary unavailable \(no-provider-stream\)/,
+    );
+  });
+
+  it("warns on a live-prefix cache miss and reports the measured stats", async () => {
+    const { spy } = capturingSummarize({
+      input: 5000,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 5020,
+      cost: USAGE_COST,
+    });
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, { capture: true });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /⚠ summary cache miss: 5\.0k tokens re-billed\./,
+    );
+    const cache = result.details.summaryCache as {
+      hit: boolean;
+      cacheRead: number;
+      input: number;
+      cacheWrite: number;
+    };
+    assert.equal(cache.hit, false);
+    assert.equal(cache.cacheRead, 0);
+    assert.equal(cache.input, 5000);
+    assert.equal(cache.cacheWrite, 0);
+  });
+
+  it("reports the cache read/fresh line on a live-prefix hit", async () => {
+    const { spy } = capturingSummarize({
+      input: 420,
+      output: 20,
+      cacheRead: 20_000,
+      cacheWrite: 0,
+      totalTokens: 20_440,
+      cost: USAGE_COST,
+    });
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, { capture: true });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /summary cache: 20\.0k read \/ 420 fresh\./,
+    );
+    const cache = result.details.summaryCache as { hit: boolean };
+    assert.equal(cache.hit, true);
   });
 });

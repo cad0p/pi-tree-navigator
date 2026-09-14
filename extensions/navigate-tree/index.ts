@@ -38,8 +38,10 @@
 
 import { randomUUID } from "node:crypto";
 import {
+  type AgentTool,
   estimateContextTokens,
   type StreamFn,
+  type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
   AgentSession,
@@ -53,6 +55,14 @@ import {
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  buildLiveSummaryMessages,
+  type CacheRequest,
+  createCachePreservingStreamFn,
+  formatSummaryCacheNotice,
+  measureSummaryCache,
+  resolveSummaryCacheRetention,
+} from "./cache-summary.ts";
 import {
   extractTextContent,
   formatContextDelta,
@@ -170,7 +180,13 @@ interface PiInternals {
   agent: {
     state: {
       messages: unknown[];
+      /** Live system prompt (cache-preserving request mirror; #33). */
+      systemPrompt: string;
+      /** Live tool instances (cache-preserving request mirror; #33). */
+      tools: unknown[];
     };
+    /** Live thinking token budgets (plain field on pi-agent-core's Agent). */
+    thinkingBudgets?: unknown;
   };
   sessionManager: SessionManager;
 }
@@ -285,19 +301,25 @@ function stripNullHeaders(
  * native `/tree` summary fails deterministically).
  *
  * The tool-execute ctx exposes neither `settingsManager` (telemetry attribution)
- * nor the live routing `sessionId`, so this replicates only the session half of
- * pi's merge (`getSessionHeaders` in `provider-attribution.ts`): for
+ * nor the live routing `sessionId` on 0.81.x, so this replicates only the session
+ * half of pi's merge (`getSessionHeaders` in `provider-attribution.ts`): for
  * opencode-family providers, inject `x-opencode-session` + `x-opencode-client`.
- * The value is a fresh UUID per rewind — upstream does the same for routing
- * (`completeSummarization` falls back to `uuidv7()` when the caller passes no
- * session id), and one-off summaries have no continuation to route. Proven by
- * the branch-summary eval harness, whose identical injection succeeds on
- * opencode-go where the bare call 400s. Never overrides a header the auth layer
- * already set.
+ *
+ * `sessionId` is the LIVE session id when the caller can supply one
+ * (`sm.getSessionId()`), so the summarization request routes to the same
+ * replica/affinity bucket as the turns it summarizes. A fresh UUID is only the
+ * fallback for callers that cannot supply one (upstream's `completeSummarization`
+ * does the same via `uuidv7()`). The header is routing-only — on
+ * openai-responses the *cache key* is `prompt_cache_key`, derived from the
+ * forwarded `sessionId` option, not from this header (pi-ai sets the header from
+ * `sessionId` only when the provider opts into session affinity).
+ *
+ * Never overrides a header the auth layer already set.
  */
 function withSessionHeaders(
   model: { provider?: string; baseUrl?: string } | undefined,
   headers: Record<string, string> | undefined,
+  sessionId?: string,
 ): Record<string, string> | undefined {
   const provider = model?.provider ?? "";
   let host = "";
@@ -313,7 +335,7 @@ function withSessionHeaders(
   if (!needsSession) return headers;
   const merged = { ...(headers ?? {}) };
   if (!merged["x-opencode-session"]) {
-    merged["x-opencode-session"] = randomUUID();
+    merged["x-opencode-session"] = sessionId || randomUUID();
   }
   if (!merged["x-opencode-client"]) {
     merged["x-opencode-client"] = "pi";
@@ -879,6 +901,112 @@ Operations (set \`action\`):
         return toolError(`Auth resolution failed: ${auth.error}`);
       }
 
+      // -----------------------------------------------------------------
+      // Cache-preserving summary request (#33)
+      //
+      // `generateBranchSummary` builds a cold, standalone request (generic
+      // summarization prompt, serialized blob, no tools, cacheRetention
+      // "none", fresh session id). The live turns being collapsed were just
+      // cache-served, so the summary re-bills the whole input. We cannot
+      // patch upstream (the extension loader aliases @earendil-works/* to the
+      // host process), but the `streamFn` seam we already inject is the exact
+      // point where upstream's cold context/options exist — wrap it and
+      // rewrite them to the live shape. Every live input is read
+      // defensively: on any miss we leave `summaryCacheRequest` null and the
+      // wrapper delegates today's cold request (with a user-visible warning).
+      // -----------------------------------------------------------------
+      const providerStream = resolveProviderStreamFn(
+        ctx.modelRegistry,
+        ctx.model.provider,
+      );
+      let summaryCacheRequest: CacheRequest | null = null;
+      let summaryCacheFallbackReason: string | undefined;
+      let branchStartRetained = true;
+
+      if (process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE === "0") {
+        // Kill switch: an env-var escape hatch to force the pre-#33 cold
+        // request without unloading the extension.
+        summaryCacheFallbackReason = "disabled";
+      } else if (!providerStream) {
+        summaryCacheFallbackReason = "no-provider-stream";
+      } else {
+        const owning = findOwningSession(sm);
+        const internals = owning ? asInternals(owning) : undefined;
+        const liveTools = internals?.agent?.state?.tools;
+        if (!internals) {
+          summaryCacheFallbackReason = "reflection-missing";
+        } else if (!Array.isArray(liveTools)) {
+          summaryCacheFallbackReason = "no-live-tools";
+        } else {
+          // Public accessor first (0.81+), reflected field as backstop. Both
+          // are read here AND in refreshAgentMessages; the reflection probe
+          // covers the plain-field shape.
+          let systemPrompt: string | undefined;
+          if (typeof ctx.getSystemPrompt === "function") {
+            try {
+              systemPrompt = ctx.getSystemPrompt();
+            } catch {
+              systemPrompt = undefined;
+            }
+          }
+          if (typeof systemPrompt !== "string" || systemPrompt.length === 0) {
+            const reflected = internals.agent?.state?.systemPrompt;
+            systemPrompt =
+              typeof reflected === "string" ? reflected : undefined;
+          }
+          if (typeof systemPrompt !== "string" || systemPrompt.length === 0) {
+            summaryCacheFallbackReason = "no-system-prompt";
+          } else {
+            const contextEntries = sm.buildContextEntries();
+            const branchEntryIds = new Set(entries.map((e) => e.id));
+            // Upstream's default `reserveTokens`; the fallback path will
+            // recompute the same budget inside generateBranchSummary.
+            const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
+            const built = buildLiveSummaryMessages({
+              contextEntries,
+              branchEntryIds,
+              inFlightToolCallId: toolCallId,
+              tokenBudget,
+              focus: p.summaryFocus,
+            });
+            branchStartRetained = built.branchStartRetained;
+            const sessionId = sm.getSessionId();
+            // Public since 0.81.0; `ctx.thinkingLevel` only exists >= 0.84.2,
+            // so never read it directly. "off" is omitted, mirroring the
+            // live loop's request shape.
+            const reasoning =
+              typeof pi.getThinkingLevel === "function"
+                ? pi.getThinkingLevel()
+                : undefined;
+            summaryCacheRequest = {
+              context: {
+                systemPrompt,
+                messages: built.messages,
+                tools: liveTools as AgentTool[],
+              },
+              cacheRetention: resolveSummaryCacheRetention(),
+              ...(sessionId ? { sessionId } : {}),
+              ...(typeof reasoning === "string" && reasoning !== "off"
+                ? { reasoning: reasoning as ThinkingLevel }
+                : {}),
+              ...(internals.agent?.thinkingBudgets
+                ? { thinkingBudgets: internals.agent.thinkingBudgets }
+                : {}),
+            };
+          }
+        }
+      }
+
+      // Always wrap when a provider stream exists: with a request it rewrites
+      // the live shape, without one it delegates today's cold request
+      // byte-for-byte (the `used` flag records which happened).
+      const cacheWrapped = providerStream
+        ? createCachePreservingStreamFn({
+            realStreamFn: providerStream.streamFn,
+            request: summaryCacheRequest,
+          })
+        : undefined;
+
       const result = await summarize(entries, {
         // `auth.baseUrl` (OAuth/credential-derived endpoint, e.g.
         // githubCopilotOAuth) must be applied to the model, mirroring pi's
@@ -888,7 +1016,11 @@ Operations (set \`action\`):
           ? { ...ctx.model, baseUrl: auth.baseUrl }
           : ctx.model,
         apiKey: auth.apiKey ?? "",
-        headers: withSessionHeaders(ctx.model, stripNullHeaders(auth.headers)),
+        headers: withSessionHeaders(
+          ctx.model,
+          stripNullHeaders(auth.headers),
+          sm.getSessionId(),
+        ),
         ...(auth.env ? { env: auth.env } : {}),
         signal: signal ?? new AbortController().signal,
         customInstructions: p.summaryFocus,
@@ -899,9 +1031,9 @@ Operations (set \`action\`):
         // compat registry (which only knows builtin apis) — without this,
         // rewind fails with "No API provider registered for api:
         // <custom-id>" for any custom-api provider (e.g. commandcode 0.5.x
-        // with api "commandcode-custom").
-        ...(resolveProviderStreamFn(ctx.modelRegistry, ctx.model.provider) ??
-          {}),
+        // with api "commandcode-custom"). The wrapper delegates to it in
+        // both the live-prefix and fallback cases.
+        ...(cacheWrapped ? { streamFn: cacheWrapped.streamFn } : {}),
       });
       if (result.aborted) {
         return toolError("Summarization aborted.");
@@ -911,6 +1043,19 @@ Operations (set \`action\`):
           `Summarization failed: ${result.error ?? "no summary text"}`,
         );
       }
+
+      // Cache outcome measured from provider usage. Mode reflects whether a
+      // cache-preserving request was BUILT; `used` reflects whether the
+      // wrapper actually delegated it (false when the summarizer is stubbed,
+      // aborted before the wire call, or the fallback path ran).
+      const summaryCacheMode = summaryCacheRequest ? "live-prefix" : "fallback";
+      const summaryCacheStats = measureSummaryCache(
+        result.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 },
+      );
+      const summaryCacheNotice = formatSummaryCacheNotice(summaryCacheStats, {
+        mode: summaryCacheMode,
+        fallbackReason: summaryCacheFallbackReason,
+      });
 
       // Move the tree.
       const summaryId = sm.branchWithSummary(target, result.summary, {
@@ -1050,6 +1195,7 @@ Operations (set \`action\`):
             text:
               `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
               `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
+              (summaryCacheNotice ? `\n${summaryCacheNotice}` : "") +
               (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
           },
         ],
@@ -1064,6 +1210,16 @@ Operations (set \`action\`):
           contextAfter: afterTokens,
           contextWindow,
           agentMessagesRefreshed: refreshed,
+          summaryCache: {
+            mode: summaryCacheMode,
+            fallbackReason: summaryCacheFallbackReason ?? null,
+            branchStartRetained,
+            used: cacheWrapped?.used.value ?? false,
+            cacheRead: summaryCacheStats.cacheRead,
+            input: summaryCacheStats.fresh,
+            cacheWrite: summaryCacheStats.cacheWrite,
+            hit: summaryCacheStats.hit,
+          },
           readFiles: result.readFiles ?? [],
           modifiedFiles: result.modifiedFiles ?? [],
         },

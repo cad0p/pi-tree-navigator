@@ -6,7 +6,7 @@
  * dependencies) still exist with the required shape in the installed
  * @earendil-works/pi-coding-agent / @earendil-works/pi-agent-core.
  *
- * Reflection points (after #14):
+ * Reflection points (after #14, extended by #33):
  *   1. `AgentSession.prototype.prompt` — must be a writable plain data
  *      property (not `#`-private, not a getter-only accessor). The
  *      extension stashes the original and replaces it with a wrapper.
@@ -14,6 +14,16 @@
  *      (exposed as a plain field on AgentSession), `agent.state` must be
  *      readable and `agent.state.messages` writable (plain fields, not
  *      `#`-private). The extension assigns `agent.state.messages = ...`.
+ *   3. `session.agent.state.tools` (#33) — the cache-preserving summary
+ *      request passes the live tool array to the summarizer, so the
+ *      accessor pair must exist and be readable.
+ *   4. `session.agent.state.systemPrompt` (#33) — fallback source for the
+ *      live system prompt when the public `ctx.getSystemPrompt()` is
+ *      unavailable; a plain field on the mutable state object.
+ *   5. `session.agent.thinkingBudgets` (#33) — plain field on the Agent;
+ *      forwarded on the cache path when present.
+ *   6. `SessionManager.prototype.getSessionId` (#33) — the summary joins
+ *      the live session's cache namespace and reuses its routing id.
  *
  * Transitive dependencies:
  *   - `AgentSession` constructor assigns `this.sessionManager` (plain
@@ -161,6 +171,44 @@ try {
       : /set\s+messages\s*\(/.test(agentSrc)
         ? "set messages accessor found"
         : "set messages accessor MISSING",
+  );
+
+  // --- 5. Agent.state.tools + systemPrompt (cache-preserving request, #33) ---
+  // The summary request mirrors the live tool array and system prompt; both
+  // are read off the mutable agent state object created by
+  // createMutableAgentState. Verify the accessor pair for tools and the plain
+  // systemPrompt field, and that the state is not #-private.
+  check(
+    "state.tools accessor pair (source: get/set tools)",
+    /get\s+tools\s*\(/.test(agentSrc) && /set\s+tools\s*\(/.test(agentSrc),
+    /get\s+tools\s*\(/.test(agentSrc) && /set\s+tools\s*\(/.test(agentSrc)
+      ? "tools accessor pair found"
+      : "tools accessor pair MISSING",
+  );
+  check(
+    "state.systemPrompt plain field",
+    /systemPrompt:\s*initialState\?\.systemPrompt/.test(agentSrc),
+    /systemPrompt:\s*initialState\?\.systemPrompt/.test(agentSrc)
+      ? "plain systemPrompt field found"
+      : "systemPrompt field MISSING",
+  );
+
+  // --- 6. Agent.thinkingBudgets (plain field, #33) ---
+  check(
+    "agent.thinkingBudgets plain field",
+    /this\.thinkingBudgets\s*=\s*runtimeOptions\.thinkingBudgets/.test(
+      agentSrc,
+    ),
+    /this\.thinkingBudgets\s*=\s*runtimeOptions\.thinkingBudgets/.test(agentSrc)
+      ? "plain this.thinkingBudgets = found"
+      : "thinkingBudgets assignment MISSING",
+  );
+
+  // --- 7. SessionManager.getSessionId (#33) ---
+  check(
+    "getSessionId is prototype method",
+    typeof SessionManager?.prototype?.getSessionId === "function",
+    typeof SessionManager?.prototype?.getSessionId,
   );
 } catch (e) {
   check("probe crashed", false, String(e.stack || e.message));
