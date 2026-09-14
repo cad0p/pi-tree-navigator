@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(navigate-tree)* Preserve prompt-cache prefix on rewind summaries (closes #33)
+
+
 ## [0.1.3] - 2026-09-14
 
 <!-- USER-EDITABLE SECTION START -->
