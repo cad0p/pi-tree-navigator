@@ -28,8 +28,8 @@ import {
   CACHE_TTL_MS,
   type CacheRequest,
   createCachePreservingStreamFn,
-  detectCacheMiss,
-  formatCacheMissNotice,
+  detectBranchSummaryCacheMiss,
+  formatBranchSummaryCacheMissNotice,
   measureSummaryCache,
   resolveSummaryCacheRetention,
   stripBoundaryOrphanToolResults,
@@ -690,7 +690,7 @@ describe("measureSummaryCache", () => {
   });
 });
 
-describe("detectCacheMiss + formatCacheMissNotice", () => {
+describe("detectBranchSummaryCacheMiss + formatBranchSummaryCacheMissNotice", () => {
   const COST = (over: Record<string, number> = {}) => ({
     input: 0,
     output: 0,
@@ -744,36 +744,24 @@ describe("detectCacheMiss + formatCacheMissNotice", () => {
     ...over,
   });
 
-  /** Call the detector the way `index.ts` does: entries + message + models. */
-  function detect(
-    entries: SessionEntry[],
-    usage: Record<string, unknown>,
-    provider = "claude",
-    model = "claude-sonnet-4-5",
-    timestamp = 1_700_000_001_000,
-    models = priceSource(),
-  ) {
-    return detectCacheMiss(
-      entries,
-      { provider, model, usage: usage as never, timestamp },
-      models,
-    );
-  }
-
   it("counts a miss and renders the default label with cost", () => {
     const entries = [
       usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
     ];
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       entries,
       response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.ok(miss);
     assert.equal(miss.missedTokens, 20_000);
     assert.equal(miss.idleMs, 1000);
     assert.equal(miss.modelChanged, false);
     assert.equal(
-      formatCacheMissNotice(miss),
+      formatBranchSummaryCacheMissNotice(miss),
       "Cache miss: 20k tokens re-billed (~$0.20)",
     );
   });
@@ -782,7 +770,7 @@ describe("detectCacheMiss + formatCacheMissNotice", () => {
     const entries = [
       usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
     ];
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       entries,
       response({ input: 20_000, cost: COST({ input: 0.2 }) }),
       "claude",
@@ -794,116 +782,78 @@ describe("detectCacheMiss + formatCacheMissNotice", () => {
     // paidPerToken = 1e-5, readPerToken = 3e-6 -> 20k * 7e-6 = 0.14
     assert.equal(miss.missedCost.toFixed(2), "0.14");
     assert.equal(
-      formatCacheMissNotice(miss),
+      formatBranchSummaryCacheMissNotice(miss),
       "Cache miss: 20k tokens re-billed (~$0.14)",
     );
   });
 
-  it("counts a miss after a model switch and labels it as such (no suppression)", () => {
+  it("suppresses a miss after a model switch", () => {
     const entries = [
       usageEntry(
         { input: 0, cacheRead: 20_000, cacheWrite: 0 },
         { provider: "openai", model: "gpt-5" },
       ),
     ];
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       entries,
       response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
-    assert.ok(miss);
-    assert.equal(miss.modelChanged, true);
-    assert.equal(
-      formatCacheMissNotice(miss),
-      "Cache miss after model switch: 20k tokens re-billed (~$0.20)",
-    );
+    assert.equal(miss, undefined);
   });
 
   it("suppresses hits and noise-floor misses", () => {
     // Warm read: no missed tokens.
-    const warm = detect(
+    const warm = detectBranchSummaryCacheMiss(
       [usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 })],
       response({ input: 100, cacheRead: 20_000, cost: COST({ input: 0.001 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.equal(warm, undefined);
     // Miss at/below the 1024-token noise floor.
-    const tiny = detect(
+    const tiny = detectBranchSummaryCacheMiss(
       [usageEntry({ input: 0, cacheRead: 50_000, cacheWrite: 0 })],
       response({ input: 1030, cacheRead: 49_000, cost: COST({ input: 0.01 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.equal(tiny, undefined);
   });
 
   it("returns undefined with no baseline request", () => {
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       [userEntry("hi")],
       response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.equal(miss, undefined);
   });
 
-  it("resets the baseline at a branch_summary boundary", () => {
+  it("keeps the baseline across branch_summary entries", () => {
     const entries = [
       usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
       branchSummaryEntry(),
     ];
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       entries,
       response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
-    assert.equal(miss, undefined, "branch_summary must reset the baseline");
-  });
-
-  it("resets the baseline at a compaction boundary", () => {
-    const entries = [
-      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
-      compactionEntry("cut"),
-    ];
-    const miss = detect(
-      entries,
-      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
-    );
-    assert.equal(miss, undefined, "compaction must reset the baseline");
-  });
-
-  it("counts a zero-cache miss when earlier activity in the baseline proved caching (baseline-local reportedCache)", () => {
-    // A cached turn, then a zero-cache baseline turn: `reportedCache` is sticky
-    // within the baseline, so the zero-cache summary is a real total miss.
-    const entries = [
-      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
-      usageEntry({ input: 20_000, cacheRead: 0, cacheWrite: 0 }),
-    ];
-    const miss = detect(
-      entries,
-      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
-    );
-    assert.ok(miss);
-    assert.equal(miss.missedTokens, 20_000);
-  });
-
-  it("does not count a zero-cache response on a provider that never reported caching", () => {
-    const entries = [
-      usageEntry({ input: 20_000, cacheRead: 0, cacheWrite: 0 }),
-    ];
-    const miss = detect(
-      entries,
-      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
-    );
-    assert.equal(miss, undefined);
-  });
-
-  it("does not carry baseline-local reportedCache across a context boundary", () => {
-    // Cached turn, boundary, then a fresh zero-cache baseline: the next
-    // zero-cache response must NOT count (capability is baseline-local).
-    const entries = [
-      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
-      branchSummaryEntry(),
-      usageEntry({ input: 20_000, cacheRead: 0, cacheWrite: 0 }),
-    ];
-    const miss = detect(
-      entries,
-      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
-    );
-    assert.equal(miss, undefined);
+    assert.ok(miss, "branch_summary must not reset the baseline");
   });
 
   it("renders the idle label once the gap spans the cache TTL", () => {
@@ -914,16 +864,17 @@ describe("detectCacheMiss + formatCacheMissNotice", () => {
         { timestamp: base },
       ),
     ];
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       entries,
       response({ input: 20_000, cost: COST({ input: 0.2 }) }),
       "claude",
       "claude-sonnet-4-5",
       base + CACHE_TTL_MS + 60_000,
+      priceSource(),
     );
     assert.ok(miss);
     assert.equal(
-      formatCacheMissNotice(miss),
+      formatBranchSummaryCacheMissNotice(miss),
       "Cache miss after 6m idle: 20k tokens re-billed (~$0.20)",
     );
   });
@@ -932,35 +883,47 @@ describe("detectCacheMiss + formatCacheMissNotice", () => {
     const entries = [
       usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
     ];
-    const noCost = detect(
+    const noCost = detectBranchSummaryCacheMiss(
       entries,
       response({ input: 20_000, cost: COST({ input: 0.001 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.ok(noCost);
     assert.equal(
-      formatCacheMissNotice(noCost),
+      formatBranchSummaryCacheMissNotice(noCost),
       "Cache miss: 20k tokens re-billed",
     );
 
     // Below the 20k-token floor and below $0.10 -> no notice.
-    const below = detect(
+    const below = detectBranchSummaryCacheMiss(
       [usageEntry({ input: 0, cacheRead: 50_000, cacheWrite: 0 })],
       response({ input: 15_000, cost: COST() }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.ok(below);
-    assert.equal(formatCacheMissNotice(below), null);
+    assert.equal(formatBranchSummaryCacheMissNotice(below), null);
   });
 
   it("shows a cost-only miss above the dollar floor", () => {
-    const miss = detect(
+    const miss = detectBranchSummaryCacheMiss(
       [usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 })],
       response({ input: 10_000, cost: COST({ input: 0.5 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
     );
     assert.ok(miss);
     assert.ok(miss.missedTokens < CACHE_MISS_DISPLAY_TOKENS);
     assert.ok(miss.missedCost >= CACHE_MISS_DISPLAY_COST);
     assert.equal(
-      formatCacheMissNotice(miss),
+      formatBranchSummaryCacheMissNotice(miss),
       "Cache miss: 10k tokens re-billed (~$0.50)",
     );
   });

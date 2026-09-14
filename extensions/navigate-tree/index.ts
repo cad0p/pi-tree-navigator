@@ -61,8 +61,8 @@ import {
   buildLiveSummaryMessages,
   type CacheRequest,
   createCachePreservingStreamFn,
-  detectCacheMiss,
-  formatCacheMissNotice,
+  detectBranchSummaryCacheMiss,
+  formatBranchSummaryCacheMissNotice,
   measureSummaryCache,
   resolveSummaryCacheRetention,
 } from "./cache-summary.ts";
@@ -1112,31 +1112,33 @@ Operations (set \`action\`):
         result.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 },
       );
 
-      // Upstream-faithful miss accounting: scan the entries as they stand (the
-      // branch_summary is not appended yet) and compare the summary's measured
-      // usage against the previous request's baseline. HITS ARE SILENT — the
-      // footer/session totals already cover them; only an actionable miss is
-      // worth a transcript line. The fallback path (cache request not built) is
-      // NOT special-cased: the legacy cold request measures as a miss exactly
-      // when the numbers say so, and `fallbackReason` lives in
-      // `details.summaryCache` only. Upstream pi renders cache notices as
-      // transcript lines gated by `showCacheMissNotices`; the extension does the
-      // same by storing the notice string and rendering it from the tool's
-      // `renderResult`. The model-visible tool-result content stays cache-free
-      // (the model was proven to echo the line verbatim). The setting is read
-      // reflectively off the captured session — the extension ctx does not
-      // expose `settingsManager`. `Date.now()` is the summary timestamp, as the
-      // upstream `message_end` call site uses. Headless runs and setting-off
+      // Fork-faithful miss accounting (cad0p/pi@eval/branch-summary-prompt):
+      // scan the entries as they stand (the branch_summary is not appended
+      // yet) and compare the summary's measured usage against the previous
+      // request's baseline — the baseline survives branch_summary entries
+      // (the summary request reuses the live prefix), while a summary miss
+      // after a model switch is suppressed as expected re-billing. HITS ARE
+      // SILENT — the footer/session totals already cover them; only an
+      // actionable miss is worth a transcript line. The fallback path (cache
+      // request not built) is NOT special-cased: the legacy cold request
+      // measures as a miss exactly when the numbers say so, and
+      // `fallbackReason` lives in `details.summaryCache` only. Upstream pi
+      // renders cache notices as transcript lines gated by
+      // `showCacheMissNotices`; the extension does the same by storing the
+      // notice string and rendering it from the tool's `renderResult`. The
+      // model-visible tool-result content stays cache-free (the model was
+      // proven to echo the line verbatim). The setting is read reflectively
+      // off the captured session — the extension ctx does not expose
+      // `settingsManager`. `Date.now()` is the summary timestamp, as the
+      // fork's `navigateTree` call site uses. Headless runs and setting-off
       // runs surface the same numbers via `details.summaryCache`.
       const summaryCacheMiss = result.usage
-        ? detectCacheMiss(
+        ? detectBranchSummaryCacheMiss(
             allEntries,
-            {
-              provider: requestModel.provider,
-              model: requestModel.id,
-              usage: result.usage,
-              timestamp: Date.now(),
-            },
+            result.usage,
+            requestModel.provider,
+            requestModel.id,
+            Date.now(),
             {
               getModel: (provider, model) =>
                 ctx.modelRegistry.find(provider, model),
@@ -1145,7 +1147,7 @@ Operations (set \`action\`):
         : undefined;
       let summaryCacheNotice: string | null = null;
       if (summaryCacheMiss) {
-        const notice = formatCacheMissNotice(summaryCacheMiss);
+        const notice = formatBranchSummaryCacheMissNotice(summaryCacheMiss);
         if (notice !== null) {
           let showCacheNotices = false;
           try {

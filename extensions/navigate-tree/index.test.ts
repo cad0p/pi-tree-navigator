@@ -4733,7 +4733,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
   });
 
-  it("stores the upstream miss notice when the summary misses a 20k baseline", async () => {
+  it("stores the fork's miss notice when the summary misses a 20k baseline", async () => {
     const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const { fake } = setupRewindable(sm, pi, { capture: true });
@@ -5119,7 +5119,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(cache.notice, null);
   });
 
-  it("stores a model-switch notice (no suppression)", async () => {
+  it("suppresses a miss after a model switch", async () => {
     const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const { fake } = setupRewindable(sm, pi, { capture: true });
@@ -5145,17 +5145,17 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
+    // Fork semantics: a cold summary right after a model switch is expected
+    // re-billing (the live baseline belongs to another model), not an
+    // actionable miss — the detector returns undefined, so nothing is stored.
     const cache = result.details.summaryCache as {
       missedTokens: number;
       modelChanged: boolean;
       notice: string | null;
     };
-    assert.equal(cache.missedTokens, 20_000);
-    assert.equal(cache.modelChanged, true);
-    assert.equal(
-      cache.notice,
-      "Cache miss after model switch: 20k tokens re-billed (~$0.20)",
-    );
+    assert.equal(cache.missedTokens, 0);
+    assert.equal(cache.modelChanged, false);
+    assert.equal(cache.notice, null);
   });
 
   it("labels the miss as idle once the gap spans the cache TTL", async () => {
