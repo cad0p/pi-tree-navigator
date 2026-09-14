@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-09-14
+
+<!-- USER-EDITABLE SECTION START -->
+Last version before adopting the branch summarization cache hit mechanism to save everyone money -> https://github.com/earendil-works/pi/issues/9411
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(ci)* Daily pi-upstream reflection probe (closes #17)
+- *(guidelines)* Steer agents to anchor early at context-gathered (closes #29)
+- Mandate anchoring via before_agent_start system prompt (closes #31)
+
+### 🐛 Bug Fixes
+
+- *(rewind)* Reject degenerate rewinds below a min-savings floor (closes #21, closes #20)
+- *(rewind)* Inject opencode session headers for summarization (closes #26)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(tooldef)* Trim navigate_tree tool definition (~848 → ~470 tok/request) (closes #22)
+
+
 ## [0.1.2] - 2026-08-20
 
 <!-- USER-EDITABLE SECTION START -->
