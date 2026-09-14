@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 
 - *(navigate-tree)* Preserve prompt-cache prefix on rewind summaries (closes #33)
 
+### 🐛 Bug Fixes
+
+- *(rewind)* Refuse sibling-batched rewinds — rewind must be the only tool call in its batch (closes #37)
+
 
 ## [0.1.3] - 2026-09-14
 
