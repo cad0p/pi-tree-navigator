@@ -164,6 +164,32 @@ export function stripBoundaryOrphanToolResults(
   });
 }
 
+/**
+ * Newest index of an assistant entry whose content carries a `toolCall` with
+ * `inFlightToolCallId`, or -1 when none exists. Searches from the end because
+ * sequential execution can leave sibling `toolResult` entries after the
+ * assistant that owns the in-flight call.
+ */
+function findInFlightAssistantIndex(
+  entries: SessionEntry[],
+  inFlightToolCallId: string,
+): number {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (
+      entry.type === "message" &&
+      entry.message.role === "assistant" &&
+      Array.isArray(entry.message.content) &&
+      entry.message.content.some(
+        (block) => block.type === "toolCall" && block.id === inFlightToolCallId,
+      )
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 export interface BuildLiveSummaryArgs {
   /**
    * The live projection of the active branch (`sessionManager
@@ -184,8 +210,13 @@ export interface BuildLiveSummaryArgs {
    * Id of the tool call whose assistant message triggered this rewind. That
    * assistant entry was never part of any cached live prefix (it is the
    * response being streamed), and an unpaired `tool_use` immediately
-   * followed by a user message is rejected by Anthropic. Dropping it makes
-   * the retained history byte-identical to the previous live request.
+   * followed by a user message is rejected by Anthropic. The newest retained
+   * assistant entry carrying a `toolCall` with this id is removed by index —
+   * NOT merely from the tail: `navigate_tree` runs `executionMode:
+   * "sequential"`, so pi-agent-core appends each sibling `toolResult` before
+   * the next call executes and a sibling result can follow this assistant.
+   * Dropping the assistant makes the retained history byte-identical to the
+   * previous live request.
    */
   inFlightToolCallId: string;
   /** Context window minus the response reserve (upstream default 16384). */
@@ -237,19 +268,20 @@ export function buildLiveSummaryMessages(
   } = args;
 
   // --- in-flight assistant exclusion (must happen before anything else) ---
+  // Search the WHOLE retained array, not just the tail. `navigate_tree`
+  // declares `executionMode: "sequential"`, so pi-agent-core runs the batch
+  // through `executeToolCallsSequential`: calls execute in order and each
+  // `toolResult` is appended before the next call executes. When a sibling
+  // tool call precedes the rewind call in the same assistant turn, the last
+  // session entry is that sibling's `toolResult` — not the assistant — so a
+  // tail-only check would leave the assistant (and its unpaired `tool_use`)
+  // in the payload and Anthropic would reject the summary request. Remove the
+  // assistant at its index; the sibling `toolResult`s that follow then have
+  // no matching call and are dropped by `stripBoundaryOrphanToolResults`
+  // below (single removal path — do not add a second one here).
   const retained = contextEntries.slice();
-  const last = retained[retained.length - 1];
-  if (
-    last &&
-    last.type === "message" &&
-    last.message.role === "assistant" &&
-    Array.isArray(last.message.content) &&
-    last.message.content.some(
-      (block) => block.type === "toolCall" && block.id === inFlightToolCallId,
-    )
-  ) {
-    retained.pop();
-  }
+  const excludedAt = findInFlightAssistantIndex(retained, inFlightToolCallId);
+  if (excludedAt >= 0) retained.splice(excludedAt, 1);
 
   // --- newest→oldest walk with the upstream token budget ---
   const evidence: WireMessage[] = [];
@@ -374,9 +406,11 @@ export function measureSummaryCache(
 
 export interface FormatSummaryCacheNoticeOptions {
   /**
-   * `"live-prefix"` when a cache-preserving request was built and sent;
-   * `"fallback"` when any live input was unavailable and today's cold
-   * standalone request ran instead.
+   * `"live-prefix"` when a cache-preserving request was BUILT (it may not
+   * have been delegated — e.g. the summarizer returned "No content to
+   * summarize" before the wire call; `details.summaryCache.used` records
+   * whether the wrapper actually delegated); `"fallback"` when any live
+   * input was unavailable and today's cold standalone request ran instead.
    */
   mode: "live-prefix" | "fallback";
   /** Why the cache path was skipped (only rendered in `"fallback"` mode). */

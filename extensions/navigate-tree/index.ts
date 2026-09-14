@@ -984,7 +984,12 @@ Operations (set \`action\`):
                 messages: built.messages,
                 tools: liveTools as AgentTool[],
               },
-              cacheRetention: resolveSummaryCacheRetention(),
+              // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
+              // over `process.env`, mirroring pi-ai's `getProviderEnvValue`:
+              // the live turns resolve retention from the provider env, so a
+              // provider-scoped "long" with a process-level "short" would
+              // make live=long / summary=short and silently miss.
+              cacheRetention: resolveSummaryCacheRetention(auth.env),
               ...(sessionId ? { sessionId } : {}),
               ...(typeof reasoning === "string" && reasoning !== "off"
                 ? { reasoning: reasoning as ThinkingLevel }
@@ -1007,17 +1012,23 @@ Operations (set \`action\`):
           })
         : undefined;
 
+      // `auth.baseUrl` (OAuth/credential-derived endpoint, e.g.
+      // githubCopilotOAuth) must be applied to the model, mirroring pi's
+      // own `_getSummarizationRequestAuth` (`result.auth.baseUrl ?
+      // { ...model, baseUrl: result.auth.baseUrl } : model`). Use this one
+      // resolved model for BOTH the summarization call and the session
+      // headers: the routing header is derived from the endpoint actually
+      // contacted, so reading the un-overridden `ctx.model` there would
+      // diverge.
+      const requestModel = auth.baseUrl
+        ? { ...ctx.model, baseUrl: auth.baseUrl }
+        : ctx.model;
+
       const result = await summarize(entries, {
-        // `auth.baseUrl` (OAuth/credential-derived endpoint, e.g.
-        // githubCopilotOAuth) must be applied to the model, mirroring pi's
-        // own `_getSummarizationRequestAuth` (`result.auth.baseUrl ?
-        // { ...model, baseUrl: result.auth.baseUrl } : model`).
-        model: auth.baseUrl
-          ? { ...ctx.model, baseUrl: auth.baseUrl }
-          : ctx.model,
+        model: requestModel,
         apiKey: auth.apiKey ?? "",
         headers: withSessionHeaders(
-          ctx.model,
+          requestModel,
           stripNullHeaders(auth.headers),
           sm.getSessionId(),
         ),
@@ -1047,7 +1058,9 @@ Operations (set \`action\`):
       // Cache outcome measured from provider usage. Mode reflects whether a
       // cache-preserving request was BUILT; `used` reflects whether the
       // wrapper actually delegated it (false when the summarizer is stubbed,
-      // aborted before the wire call, or the fallback path ran).
+      // aborted before the wire call, or the fallback path ran). A request
+      // that was built but never delegated produces zero usage, so it emits
+      // no notice — `mode` is informational only.
       const summaryCacheMode = summaryCacheRequest ? "live-prefix" : "fallback";
       const summaryCacheStats = measureSummaryCache(
         result.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 },

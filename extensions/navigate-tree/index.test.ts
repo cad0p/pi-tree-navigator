@@ -2336,6 +2336,108 @@ describe("dispatch: rewind happy path", () => {
       "auth.env must be forwarded to summarize",
     );
   });
+
+  it("resolves cacheRetention from the provider-scoped auth.env, not process.env", async () => {
+    // pi-ai's getProviderEnvValue reads `auth.env` before `process.env`; a
+    // provider-scoped PI_CACHE_RETENTION=long must therefore make the summary
+    // request long (matching live) even when process.env says otherwise.
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    assert.ok(fake);
+    fake.agent.state.tools = [
+      { name: "read", description: "r", parameters: {} },
+    ];
+
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      env: { PI_CACHE_RETENTION: "long" },
+    });
+
+    const original = process.env.PI_CACHE_RETENTION;
+    process.env.PI_CACHE_RETENTION = "short";
+    try {
+      const result = await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "provider-scoped retention must win over process env",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, undefined);
+      assert.equal(typeof captured.streamFn, "function");
+      await (
+        captured.streamFn as (
+          m: unknown,
+          c: unknown,
+          o: unknown,
+        ) => Promise<unknown>
+      )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+      assert.equal(provider.calls.length, 1);
+      assert.equal(
+        provider.calls[0].options?.cacheRetention,
+        "long",
+        "provider-scoped PI_CACHE_RETENTION must override process.env",
+      );
+    } finally {
+      if (original === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = original;
+    }
+  });
+
+  it("derives session-affinity headers from the auth.baseUrl-overridden model", async () => {
+    // The opencode routing header keys off the model's `baseUrl` host. When
+    // auth supplies the endpoint, `withSessionHeaders` must see the same
+    // overridden model the request is sent to.
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, {});
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      baseUrl: "https://opencode.ai/zen/v1",
+    });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "auth baseUrl must drive the session-affinity header",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (captured.headers as Record<string, string> | undefined)?.[
+        "x-opencode-session"
+      ],
+      sm.getSessionId(),
+      "the opencode routing header must be derived from the overridden baseUrl host",
+    );
+  });
 });
 
 // =============================================================================
