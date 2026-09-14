@@ -4,6 +4,11 @@
 
 Lets a pi agent anchor named milestones in its own conversation, then collapse work between them into a model-generated `branch_summary` to free up context — without tripping Anthropic's `tool_use` ↔ `tool_result` validation, and with the freed context immediately available to the next assistant turn (even within the same `prompt()` call).
 
+This way you can have a session that looks like this :)
+
+<img width="2686" height="708" alt="image" src="https://github.com/user-attachments/assets/dc3beecf-c18c-4ab2-b5a8-19b9f94d1498" />
+
+
 ## Install
 
 Stable npm release:
