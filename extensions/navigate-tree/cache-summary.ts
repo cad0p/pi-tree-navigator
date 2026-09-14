@@ -235,11 +235,15 @@ export interface LiveSummaryMessages {
    */
   first: number;
   /**
-   * False when no retained entry belongs to the collapsed branch (the
-   * branch start was dropped by compaction). `first` is then 1 — every
-   * retained message is background and gets summarized — and index.ts
-   * records this in `details.summaryCache`. A retained survivor by
-   * definition implies a hit, so there is no clamp step.
+   * False when no retained entry belongs to the collapsed branch: a
+   * labels-only segment, the newest message alone exceeding the budget, or
+   * the branch start being dropped by compaction. `first` is then 1 — every
+   * retained message is background and gets summarized. The index.ts call
+   * site now treats `false` as a real fallback (reason
+   * `"branch-start-not-retained"`), so a live-prefix request always carries
+   * `true`; the flag is kept in `details.summaryCache` for diagnostics. A
+   * retained survivor by definition implies a hit, so there is no clamp
+   * step.
    */
   branchStartRetained: boolean;
 }

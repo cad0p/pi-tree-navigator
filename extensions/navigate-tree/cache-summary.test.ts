@@ -145,6 +145,17 @@ function compactionEntry(summary: string, tokensBefore = 0) {
   } satisfies SessionEntry;
 }
 
+function labelEntry(label: string, targetId = "target") {
+  return {
+    type: "label",
+    id: nextId(),
+    parentId: null,
+    timestamp: new Date(1_700_000_000_000).toISOString(),
+    targetId,
+    label,
+  } satisfies SessionEntry;
+}
+
 /** Wire payload the live loop would have produced for a set of entries. */
 function wireOf(entries: SessionEntry[]): WireMessage[] {
   return convertToLlm(
@@ -566,6 +577,28 @@ describe("buildLiveSummaryMessages", () => {
     });
     assert.equal(built.branchStartRetained, false);
     assert.equal(built.first, 1);
+  });
+
+  it("flags a labels-only segment (no message-producing entries) as not retained", () => {
+    // A segment made only of label entries (and/or model/thinking changes)
+    // maps to zero wire messages, so no branch message survives into the
+    // payload. The call site turns this into a real fallback
+    // ("branch-start-not-retained") instead of shipping a background-only
+    // request with {first}=1.
+    const bgUser = userEntry("background");
+    const labelA = labelEntry("anchor:start", bgUser.id);
+    const labelB = labelEntry("anchor:other", bgUser.id);
+    const contextEntries: SessionEntry[] = [bgUser, labelA, labelB];
+    const built = buildLiveSummaryMessages({
+      contextEntries,
+      branchEntryIds: new Set([labelA.id, labelB.id]),
+      inFlightToolCallId: "none",
+      tokenBudget: 0,
+      focus: "x",
+    });
+    assert.equal(built.branchStartRetained, false);
+    assert.equal(built.first, 1);
+    assert.equal(trailerFirst(built.messages), 1);
   });
 
   it("pins the raw converted role sequence (trailer may follow a toolResult)", () => {

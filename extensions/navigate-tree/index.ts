@@ -914,6 +914,26 @@ Operations (set \`action\`):
       // rewrite them to the live shape. Every live input is read
       // defensively: on any miss we leave `summaryCacheRequest` null and the
       // wrapper delegates today's cold request (with a user-visible warning).
+      //
+      // Two evidence guards also refuse the cache path and fall back to the
+      // cold request, because raw branch evidence must beat a cache hit when
+      // the two disagree:
+      //
+      //   - "branch-crosses-compaction": `buildContextEntries()` applies the
+      //     compaction cut — entries before the latest compaction's
+      //     `firstKeptEntryId` are dropped from the live projection. When a
+      //     rewind segment reaches older than that cut, the cache payload
+      //     would summarize the lossy compacted projection while the legacy
+      //     path summarizes the raw segment. The compaction entry itself is
+      //     retained, so `branchStartRetained` cannot catch this; the
+      //     id-difference check below does (every other entry type — labels,
+      //     model changes, thinking-level changes — stays in the projection,
+      //     so only compaction-dropped entries are missing).
+      //   - "branch-start-not-retained": no message from the collapsed
+      //     segment survived into the payload (labels-only segment) or the
+      //     newest message alone exceeded the token budget. The legacy path
+      //     then either summarizes the raw evidence or returns "No content to
+      //     summarize" before any wire call.
       // -----------------------------------------------------------------
       const providerStream = resolveProviderStreamFn(
         ctx.modelRegistry,
@@ -958,46 +978,63 @@ Operations (set \`action\`):
             summaryCacheFallbackReason = "no-system-prompt";
           } else {
             const contextEntries = sm.buildContextEntries();
-            const branchEntryIds = new Set(entries.map((e) => e.id));
-            // Upstream's default `reserveTokens`; the fallback path will
-            // recompute the same budget inside generateBranchSummary.
-            const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
-            const built = buildLiveSummaryMessages({
-              contextEntries,
-              branchEntryIds,
-              inFlightToolCallId: toolCallId,
-              tokenBudget,
-              focus: p.summaryFocus,
-            });
-            branchStartRetained = built.branchStartRetained;
-            const sessionId = sm.getSessionId();
-            // Public since 0.81.0; `ctx.thinkingLevel` only exists >= 0.84.2,
-            // so never read it directly. "off" is omitted, mirroring the
-            // live loop's request shape.
-            const reasoning =
-              typeof pi.getThinkingLevel === "function"
-                ? pi.getThinkingLevel()
-                : undefined;
-            summaryCacheRequest = {
-              context: {
-                systemPrompt,
-                messages: built.messages,
-                tools: liveTools as AgentTool[],
-              },
-              // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
-              // over `process.env`, mirroring pi-ai's `getProviderEnvValue`:
-              // the live turns resolve retention from the provider env, so a
-              // provider-scoped "long" with a process-level "short" would
-              // make live=long / summary=short and silently miss.
-              cacheRetention: resolveSummaryCacheRetention(auth.env),
-              ...(sessionId ? { sessionId } : {}),
-              ...(typeof reasoning === "string" && reasoning !== "off"
-                ? { reasoning: reasoning as ThinkingLevel }
-                : {}),
-              ...(internals.agent?.thinkingBudgets
-                ? { thinkingBudgets: internals.agent.thinkingBudgets }
-                : {}),
-            };
+            const contextIds = new Set(contextEntries.map((e) => e.id));
+            // Evidence-loss guard: any segment entry missing from the live
+            // projection means the compaction cut dropped raw evidence, so
+            // the cache payload would diverge from the legacy raw segment.
+            // Use the id-difference predicate — NOT a "segment contains a
+            // compaction" check: a segment that contains the compaction
+            // entry but whose target sits at/after `firstKeptEntryId` loses
+            // no evidence and must still take the cache path.
+            if (entries.some((e) => !contextIds.has(e.id))) {
+              summaryCacheFallbackReason = "branch-crosses-compaction";
+            } else {
+              const branchEntryIds = new Set(entries.map((e) => e.id));
+              // Upstream's default `reserveTokens`; the fallback path will
+              // recompute the same budget inside generateBranchSummary.
+              const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
+              const built = buildLiveSummaryMessages({
+                contextEntries,
+                branchEntryIds,
+                inFlightToolCallId: toolCallId,
+                tokenBudget,
+                focus: p.summaryFocus,
+              });
+              branchStartRetained = built.branchStartRetained;
+              if (!built.branchStartRetained) {
+                summaryCacheFallbackReason = "branch-start-not-retained";
+              } else {
+                const sessionId = sm.getSessionId();
+                // Public since 0.81.0; `ctx.thinkingLevel` only exists >=
+                // 0.84.2, so never read it directly. "off" is omitted,
+                // mirroring the live loop's request shape.
+                const reasoning =
+                  typeof pi.getThinkingLevel === "function"
+                    ? pi.getThinkingLevel()
+                    : undefined;
+                summaryCacheRequest = {
+                  context: {
+                    systemPrompt,
+                    messages: built.messages,
+                    tools: liveTools as AgentTool[],
+                  },
+                  // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
+                  // over `process.env`, mirroring pi-ai's
+                  // `getProviderEnvValue`: the live turns resolve retention
+                  // from the provider env, so a provider-scoped "long" with
+                  // a process-level "short" would make live=long /
+                  // summary=short and silently miss.
+                  cacheRetention: resolveSummaryCacheRetention(auth.env),
+                  ...(sessionId ? { sessionId } : {}),
+                  ...(typeof reasoning === "string" && reasoning !== "off"
+                    ? { reasoning: reasoning as ThinkingLevel }
+                    : {}),
+                  ...(internals.agent?.thinkingBudgets
+                    ? { thinkingBudgets: internals.agent.thinkingBudgets }
+                    : {}),
+                };
+              }
+            }
           }
         }
       }

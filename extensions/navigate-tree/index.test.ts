@@ -4391,6 +4391,20 @@ function appendInFlightAssistant(sm: SessionManager, id: string): string {
   } as never);
 }
 
+/**
+ * Append a compaction entry that keeps the path from `firstKeptEntryId`
+ * onward. `buildContextEntries()` then drops every path entry before that id
+ * from the live projection — the exact evidence-loss shape the call site
+ * must refuse to summarize from the cache path.
+ */
+function appendCompaction(
+  sm: SessionManager,
+  firstKeptEntryId: string,
+  summary = "COMPACTED",
+): string {
+  return sm.appendCompaction(summary, firstKeptEntryId, 20_000);
+}
+
 describe("dispatch: rewind cache-preserving summary request (#33)", () => {
   const ORIGINAL_KILL_SWITCH = process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE;
   afterEach(() => {
@@ -4694,7 +4708,198 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       result.content[0].text,
       /summary cache: 20\.0k read \/ 420 fresh\./,
     );
-    const cache = result.details.summaryCache as { hit: boolean };
+    const cache = result.details.summaryCache as {
+      hit: boolean;
+      fallbackReason: string | null;
+      branchStartRetained: boolean;
+    };
     assert.equal(cache.hit, true);
+    // Non-crossing regression: no compaction in the segment, so the request
+    // stays live-prefix with no fallback and a retained branch start.
+    assert.equal(cache.fallbackReason, null);
+    assert.equal(cache.branchStartRetained, true);
+  });
+
+  it("falls back with branch-crosses-compaction when the segment crosses the compaction cut", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const a1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(a1.assistantId, "anchor:start");
+    const a2 = appendTurn(sm, "u2", "a2", 12_000);
+    // Keep from a2 onward: the anchor (a1), its label entry, and u2 are
+    // dropped from the live projection, so the cache payload would lose raw
+    // branch evidence the legacy path still sends.
+    appendCompaction(sm, a2.assistantId);
+    appendTurn(sm, "u3", "a3", 18_000);
+    appendTurn(sm, "u4", "a4", 24_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the raw branch evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /⚠ cache-preserving summary unavailable \(branch-crosses-compaction\) — the branch input was re-billed in full\./,
+    );
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "branch-crosses-compaction");
+
+    // `request === null` path: the wrapper delegates the caller's cold
+    // context/options verbatim (the raw-evidence legacy request).
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+    assert.equal(provider.calls.length, 1);
+    assert.equal(provider.calls[0].context.systemPrompt, "COLD");
+  });
+
+  it("keeps live-prefix when the segment contains a compaction but the target is after firstKeptEntryId", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    appendTurn(sm, "u1", "a1", 6_000);
+    const t2 = appendTurn(sm, "u2", "a2", 12_000);
+    pi.pi.setLabel(t2.assistantId, "anchor:start");
+    appendTurn(sm, "u3", "a3", 18_000);
+    // Keep from u2 onward: the anchor (a2) and its label survive the cut, so
+    // the segment loses no evidence even though it contains the compaction
+    // entry. A "segment has a compaction" predicate would wrongly fall back.
+    appendCompaction(sm, t2.userId);
+    appendTurn(sm, "u4", "a4", 24_000);
+    appendTurn(sm, "u5", "a5", 30_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the live evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string | null;
+      branchStartRetained: boolean;
+    };
+    assert.equal(cache.mode, "live-prefix");
+    assert.equal(cache.fallbackReason, null);
+    assert.equal(cache.branchStartRetained, true);
+  });
+
+  it("keeps live-prefix when the target is exactly the compaction entry", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    appendTurn(sm, "u2", "a2", 12_000);
+    // Keep everything (firstKeptEntryId = u1); the segment after the
+    // compaction entry is fully retained.
+    const compactionId = appendCompaction(sm, t1.userId);
+    pi.pi.setLabel(compactionId, "anchor:start");
+    appendTurn(sm, "u3", "a3", 18_000);
+    appendTurn(sm, "u4", "a4", 24_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the live evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string | null;
+    };
+    assert.equal(cache.mode, "live-prefix");
+    assert.equal(cache.fallbackReason, null);
+  });
+
+  it("falls back with branch-start-not-retained when the newest message alone exceeds the budget", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({
+      summarize: spy,
+      contextWindow: 20_000,
+    });
+    const a1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(a1.assistantId, "anchor:start");
+    // The newest entry alone (~10k tokens) exceeds the 20_000 - 16384 =
+    // 3616-token budget, so the newest→oldest walk breaks before adding any
+    // branch evidence.
+    appendTurn(
+      sm,
+      `u2 ${"x".repeat(20_000)}`,
+      `a2 ${"y".repeat(40_000)}`,
+      30_000,
+    );
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the raw branch evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(
+      result.content[0].text,
+      /⚠ cache-preserving summary unavailable \(branch-start-not-retained\) — the branch input was re-billed in full\./,
+    );
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      branchStartRetained: boolean;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "branch-start-not-retained");
+    assert.equal(cache.branchStartRetained, false);
   });
 });
