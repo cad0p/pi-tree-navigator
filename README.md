@@ -149,6 +149,13 @@ pnpm run typecheck # tsc --noEmit
 
 Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`), `extensions/navigate-tree/index.ts` (action dispatch, schema shape, synthetic-assistant injection, context-event projection, reflection bootstrap, salvage path, and the #33 cache-request call site — in `index.test.ts`), and `extensions/navigate-tree/cache-summary.ts` (payload shaping, `{first}` numbering + budget truncation, the r5d prompt pin, the notice matrix, and the wrapper contract driven through the real upstream `generateBranchSummary` — in `cache-summary.test.ts`). The `summarize` factory option injects a stub for `generateBranchSummary` so no real LLM call fires during rewind tests, and the wrapper tests use a fake capturing `streamFn`; the suite is fully offline. Additional manual e2e validation against the current pi release (0.84.x at time of writing) is recommended for any pi version bump (the reflection bootstrap depends on `AgentSession.prototype.prompt` / `agent.state.messages` field shapes; the cache path additionally reads `agent.state.tools` / `agent.state.systemPrompt` / `agent.thinkingBudgets`).
 
+### Live summary verification
+
+The unit suite is fully offline; it cannot prove that a real provider serves the summary from cache or that the model's output is scope-clean. For any change to `cache-summary.ts` or the rewind call site, run both halves against a configured provider:
+
+1. **Cache gate** — in a fresh session with only this extension loaded (`pi --no-extensions -e <repo>/extensions/navigate-tree/index.ts`), anchor at the start of a stage, accumulate real work (e.g. two file reads), then `rewind`. Confirm the response's `summary cache: <n> read / <n> fresh.` line and `cacheRead > 0` in `details.summaryCache` in the session JSONL. A `⚠ summary cache miss` or fallback warning means a mirrored request param diverged — bisect in this order: caller `maxTokens` (must be stripped), `reasoning`, `cacheRetention`, session headers.
+2. **Quality smoke** — `node scripts/summary-quality-check.mjs ~/.pi/agent/sessions/<dir>/<file>.jsonl` checks the r5d headings/length/preamble (and prints the newest `details.summaryCache` block); eyeball the printed summary for scope: branch only, pre-branch background excluded, unresolved work preserved, no continuation of the collapsed work.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
