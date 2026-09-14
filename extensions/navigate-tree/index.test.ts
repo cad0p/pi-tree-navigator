@@ -20,11 +20,12 @@
  */
 
 import * as assert from "node:assert/strict";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, before, describe, it } from "node:test";
 import {
   type AgentSession,
   type ExtensionAPI,
   generateBranchSummary,
+  initTheme,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { MAX_NAME_LENGTH } from "./helpers.ts";
@@ -100,6 +101,10 @@ function makeFakePi(sm: SessionManager): FakePi {
       list.push(handler);
       onCalls.set(event, list);
     },
+    // Public since pi 0.81.0; the cache request mirrors it as `reasoning`.
+    getThinkingLevel() {
+      return "medium";
+    },
   } as unknown as ExtensionAPI;
   return { pi, setLabelCalls, registered, onCalls };
 }
@@ -121,7 +126,11 @@ interface FakeCtx {
       | { ok: true; apiKey: string; headers: Record<string, string> }
       | { ok: false; error: string }
     >;
+    /** Pricing lookup for the cache-miss detector (optional in real code). */
+    find(provider: string, modelId: string): unknown;
   };
+  /** Public system-prompt accessor (0.81+); override per test as needed. */
+  getSystemPrompt(): string;
 }
 
 function makeCtx(
@@ -143,10 +152,14 @@ function makeCtx(
   return {
     sessionManager: sm,
     model,
+    getSystemPrompt: () => "LIVE SYSTEM PROMPT",
     modelRegistry: {
       async getApiKeyAndHeaders(_m: unknown) {
         if (opts.authError) return { ok: false, error: opts.authError };
         return { ok: true, apiKey: "test-key", headers: {} };
+      },
+      find(_p: string, _m: string) {
+        return undefined;
       },
     },
   };
@@ -238,14 +251,23 @@ interface FakeAgentSession {
   sessionManager: SessionManager;
   agent: {
     state: { systemPrompt: string; messages: unknown[]; tools: unknown[] };
+    /** Plain field on pi-agent-core's Agent (cache request mirror). */
+    thinkingBudgets?: unknown;
     prepareNextTurn?: unknown;
     prepareNextTurnWithContext?: unknown;
   };
+  /**
+   * Plain field on `AgentSession`; the extension reads
+   * `getShowCacheMissNotices()` off it to gate the TUI cache notice. Default
+   * in this fake mirrors pi's own default (off).
+   */
+  settingsManager?: { getShowCacheMissNotices?: () => boolean };
 }
 
 function makeFakeSession(sm: SessionManager): FakeAgentSession {
   return {
     sessionManager: sm,
+    settingsManager: { getShowCacheMissNotices: () => false },
     agent: {
       state: { systemPrompt: "S", messages: [], tools: [] },
       prepareNextTurn: undefined,
@@ -1819,7 +1841,7 @@ describe("dispatch: rewind happy path", () => {
     }
   });
 
-  it("passes the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
+  it("wraps the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
     // Regression: rewind failed with "No API provider registered for api:
     // commandcode-custom" for providers registered via
     // pi.registerProvider(name, { api: <custom-id>, streamSimple }) because
@@ -1828,8 +1850,12 @@ describe("dispatch: rewind happy path", () => {
     // only knows builtin apis). The fix forwards the composed provider's
     // `streamSimple` via the public modelRegistry.getProvider() API — the
     // same routing pi's own branchWithSummary uses.
-    // A regression that drops the forwarding re-introduces the failure for
-    // commandcode 0.5.x and every other custom-api provider.
+    //
+    // #33 wraps that function (to rewrite the request at the seam), so the
+    // identity changed from "the provider's streamSimple" to "a wrapper that
+    // delegates to it". Pin the delegation, not the identity: a regression
+    // that drops the forwarding still fails here because the delegate is
+    // never called.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -1847,7 +1873,15 @@ describe("dispatch: rewind happy path", () => {
     // Simulate a custom-api provider (e.g. commandcode 0.5.x with
     // api "commandcode-custom"): the composed provider exposes
     // `streamSimple` via the public modelRegistry.getProvider().
-    const providerStreamSimple = async () => ({}) as never;
+    const delegated: unknown[] = [];
+    const providerStreamSimple = async (
+      _m: unknown,
+      context: unknown,
+      options: unknown,
+    ) => {
+      delegated.push({ context, options });
+      return { result: async () => ({}) } as never;
+    };
     (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
       () => ({ streamSimple: providerStreamSimple });
 
@@ -1865,9 +1899,25 @@ describe("dispatch: rewind happy path", () => {
     );
     assert.equal(result.isError, undefined);
     assert.equal(
-      capturedStreamFn,
-      providerStreamSimple,
-      "summarize must receive the provider's streamSimple as streamFn",
+      typeof capturedStreamFn,
+      "function",
+      "summarize must receive a streamFn that delegates to the provider streamSimple",
+    );
+    // No captured session in this fixture ⇒ cold fallback: the wrapper
+    // delegates the caller's context/options verbatim.
+    const coldContext = { systemPrompt: "COLD", messages: [] };
+    await (
+      capturedStreamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, coldContext, { maxTokens: 2048 });
+    assert.equal(delegated.length, 1, "delegate must be invoked");
+    assert.equal(
+      (delegated[0] as { context: unknown }).context,
+      coldContext,
+      "fallback must be byte-identical delegation",
     );
   });
 
@@ -2033,10 +2083,23 @@ describe("dispatch: rewind happy path", () => {
       ctx,
     );
     assert.equal(result.isError, undefined);
+    // #33 always wraps a truthy provider streamSimple, so the option is the
+    // wrapper (a function), not the raw truthy value. Calling it surfaces
+    // the delegate's TypeError — pin that instead of the old identity.
     assert.equal(
-      capturedStreamFn,
-      notAFunction,
-      "summarize receives the truthy streamSimple verbatim (current behavior pin)",
+      typeof capturedStreamFn,
+      "function",
+      "truthy streamSimple is wrapped (function-shaped option)",
+    );
+    assert.throws(
+      () =>
+        (capturedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(
+          {},
+          {},
+          {},
+        ),
+      TypeError,
+      "invoking the wrapper surfaces the non-function delegate error",
     );
   });
 
@@ -2155,14 +2218,21 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(headers["x-opencode-client"], "pi");
   });
 
-  it("generates a fresh x-opencode-session per rewind when auth sets none", async () => {
-    const seen: string[] = [];
+  it("uses the live session id for x-opencode-session when auth sets none", async () => {
+    // #33: the summarization request must route to the same
+    // replica/affinity bucket as the turns it summarizes, so the header uses
+    // the LIVE session id (not a fresh per-rewind uuid). A fresh uuid is
+    // only the no-session fallback. Two distinct sessions must still produce
+    // distinct ids (i.e. it is not a constant).
+    const pairs: Array<{ header: string; live: string }> = [];
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
-      seen.push(
-        (opts as { headers?: Record<string, string> }).headers?.[
-          "x-opencode-session"
-        ] ?? "__missing__",
-      );
+      pairs.push({
+        header:
+          (opts as { headers?: Record<string, string> }).headers?.[
+            "x-opencode-session"
+          ] ?? "__missing__",
+        live: "__pending__",
+      });
       return {
         summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
         readFiles: [] as string[],
@@ -2171,8 +2241,6 @@ describe("dispatch: rewind happy path", () => {
       };
     }) as typeof fakeSummarize;
 
-    const uuidRe =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     for (const tc of ["tc-rewind-1", "tc-rewind-2"]) {
       const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
       setupRewindable(sm, pi, {});
@@ -2198,21 +2266,27 @@ describe("dispatch: rewind happy path", () => {
           action: "rewind",
           labelStart: "start",
           labelEnd: "end",
-          summaryFocus: "fresh session id regression focus",
+          summaryFocus: "live session id header regression focus",
         },
         undefined,
         undefined,
         ctx,
       );
       assert.equal(result.isError, undefined);
+      pairs[pairs.length - 1].live = sm.getSessionId();
     }
-    assert.equal(seen.length, 2);
-    assert.match(seen[0], uuidRe, "first rewind needs a uuid session id");
-    assert.match(seen[1], uuidRe, "second rewind needs a uuid session id");
+    assert.equal(pairs.length, 2);
+    for (const pair of pairs) {
+      assert.equal(
+        pair.header,
+        pair.live,
+        "x-opencode-session must be the live session id, not a fresh uuid",
+      );
+    }
     assert.notEqual(
-      seen[0],
-      seen[1],
-      "each rewind mints its own session id (one-off summaries have no continuation)",
+      pairs[0].header,
+      pairs[1].header,
+      "distinct sessions must yield distinct ids (not a constant)",
     );
   });
 
@@ -2273,6 +2347,108 @@ describe("dispatch: rewind happy path", () => {
       capturedEnv,
       { FOO: "bar" },
       "auth.env must be forwarded to summarize",
+    );
+  });
+
+  it("resolves cacheRetention from the provider-scoped auth.env, not process.env", async () => {
+    // pi-ai's getProviderEnvValue reads `auth.env` before `process.env`; a
+    // provider-scoped PI_CACHE_RETENTION=long must therefore make the summary
+    // request long (matching live) even when process.env says otherwise.
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    assert.ok(fake);
+    fake.agent.state.tools = [
+      { name: "read", description: "r", parameters: {} },
+    ];
+
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      env: { PI_CACHE_RETENTION: "long" },
+    });
+
+    const original = process.env.PI_CACHE_RETENTION;
+    process.env.PI_CACHE_RETENTION = "short";
+    try {
+      const result = await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          labelStart: "start",
+          labelEnd: "end",
+          summaryFocus: "provider-scoped retention must win over process env",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, undefined);
+      assert.equal(typeof captured.streamFn, "function");
+      await (
+        captured.streamFn as (
+          m: unknown,
+          c: unknown,
+          o: unknown,
+        ) => Promise<unknown>
+      )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+      assert.equal(provider.calls.length, 1);
+      assert.equal(
+        provider.calls[0].options?.cacheRetention,
+        "long",
+        "provider-scoped PI_CACHE_RETENTION must override process.env",
+      );
+    } finally {
+      if (original === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = original;
+    }
+  });
+
+  it("derives session-affinity headers from the auth.baseUrl-overridden model", async () => {
+    // The opencode routing header keys off the model's `baseUrl` host. When
+    // auth supplies the endpoint, `withSessionHeaders` must see the same
+    // overridden model the request is sent to.
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, {});
+    (
+      ctx.modelRegistry as unknown as {
+        getApiKeyAndHeaders: () => Promise<unknown>;
+      }
+    ).getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: "test-key",
+      headers: {},
+      baseUrl: "https://opencode.ai/zen/v1",
+    });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "auth baseUrl must drive the session-affinity header",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (captured.headers as Record<string, string> | undefined)?.[
+        "x-opencode-session"
+      ],
+      sm.getSessionId(),
+      "the opencode routing header must be derived from the overridden baseUrl host",
     );
   });
 });
@@ -4127,5 +4303,1032 @@ describe("dispatch: rewind beforeTokens fallback", () => {
       typeof before === "number" && before > 0,
       `expected non-zero contextBefore; got ${before}`,
     );
+  });
+});
+
+// =============================================================================
+// dispatch: rewind cache-preserving summary request (#33)
+//
+// The cache path is built at the rewind call site and injected through the
+// `streamFn` seam. These tests pin the wiring (live inputs read, request
+// assembled, wrapper forwarded) and the fallback/miss/hit matrix.
+// Cache notices never enter the tool-result content (the model must not see
+// them); when `showCacheMissNotices` is on, the notice string is stored in
+// `details.summaryCache.notice` for the tool's TUI `renderResult`. The same
+// numbers always live in `details.summaryCache`.
+// Provider usage is stubbed; no request leaves the process.
+// =============================================================================
+
+interface CapturedRewindOptions {
+  streamFn?: unknown;
+  headers?: Record<string, string>;
+  customInstructions?: unknown;
+}
+
+/** Summarize stub that captures the options the call site passes downstream. */
+function capturingSummarize(usage?: unknown) {
+  const captured: CapturedRewindOptions = {};
+  const spy = (async (_entries: unknown, opts: unknown) => {
+    const o = opts as CapturedRewindOptions;
+    captured.streamFn = o.streamFn;
+    captured.headers = o.headers;
+    captured.customInstructions = o.customInstructions;
+    return {
+      summary: "## Goal\nspy.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+      readFiles: [] as string[],
+      modifiedFiles: [] as string[],
+      aborted: false,
+      ...(usage ? { usage } : {}),
+    };
+  }) as typeof fakeSummarize;
+  return { spy, captured };
+}
+
+interface ProviderCall {
+  context: {
+    systemPrompt?: string;
+    messages: Array<{ role: string }>;
+    tools?: unknown;
+  };
+  options: Record<string, unknown> | undefined;
+}
+
+/** Fake provider `streamSimple` that records the wire request. */
+function capturingProvider() {
+  const calls: ProviderCall[] = [];
+  const streamSimple = async (
+    _model: unknown,
+    context: ProviderCall["context"],
+    options: Record<string, unknown> | undefined,
+  ) => {
+    calls.push({ context, options });
+    return { result: async () => ({}) } as never;
+  };
+  return { calls, streamSimple };
+}
+
+function installProvider(ctx: FakeCtx, streamSimple: unknown): void {
+  (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
+    () => ({ streamSimple });
+}
+
+const USAGE_COST = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  total: 0,
+};
+
+/**
+ * Cache notices must never reach the model: the rewind tool-result content
+ * (the only text the LLM sees) must carry none of the notice copy. The
+ * human-readable notice travels through `details.summaryCache.notice` and is
+ * rendered by the tool's `renderResult`; the machine-readable numbers stay in
+ * `details.summaryCache`.
+ */
+function assertNoCacheNoticeInContent(text: string): void {
+  assert.doesNotMatch(text, /summary cache:/);
+  assert.doesNotMatch(text, /summary cache miss/);
+  assert.doesNotMatch(text, /cache-preserving summary unavailable/);
+}
+
+/** Append an assistant entry carrying a single toolCall (the in-flight one). */
+function appendInFlightAssistant(sm: SessionManager, id: string): string {
+  return sm.appendMessage({
+    role: "assistant",
+    content: [
+      {
+        type: "toolCall",
+        id,
+        name: "navigate_tree",
+        arguments: { action: "rewind" },
+      },
+    ],
+    api: "anthropic",
+    provider: "claude",
+    model: "claude-sonnet-4-5",
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 20_000,
+      cost: USAGE_COST,
+    },
+  } as never);
+}
+
+/**
+ * Append a compaction entry that keeps the path from `firstKeptEntryId`
+ * onward. `buildContextEntries()` then drops every path entry before that id
+ * from the live projection — the exact evidence-loss shape the call site
+ * must refuse to summarize from the cache path.
+ */
+function appendCompaction(
+  sm: SessionManager,
+  firstKeptEntryId: string,
+  summary = "COMPACTED",
+): string {
+  return sm.appendCompaction(summary, firstKeptEntryId, 20_000);
+}
+
+/**
+ * Append an assistant "previous request" turn with explicit prompt/cache
+ * accounting so `detectBranchSummaryCacheMiss` has a baseline to compare the
+ * summary request against. `totalTokens` feeds the existing token estimator.
+ */
+function appendUsageTurn(
+  sm: SessionManager,
+  usage: {
+    input: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: { input: number; cacheRead: number; cacheWrite: number };
+  },
+  opts: { provider?: string; model?: string; timestamp?: number } = {},
+): string {
+  const total = usage.input + usage.cacheRead + usage.cacheWrite;
+  return sm.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "baseline" }],
+    api: "anthropic",
+    provider: opts.provider ?? "claude",
+    model: opts.model ?? "claude-sonnet-4-5",
+    stopReason: "endTurn",
+    timestamp: opts.timestamp ?? Date.now(),
+    usage: {
+      input: usage.input,
+      output: 0,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      totalTokens: total,
+      cost: {
+        input: usage.cost.input,
+        output: 0,
+        cacheRead: usage.cost.cacheRead,
+        cacheWrite: usage.cost.cacheWrite,
+        total: usage.cost.input + usage.cost.cacheRead + usage.cost.cacheWrite,
+      },
+    },
+  } as never);
+}
+
+/** A 20k-prompt-token baseline whose prefix should have been cache-served. */
+const CACHE_BASELINE_USAGE = {
+  input: 0,
+  cacheRead: 20_000,
+  cacheWrite: 0,
+  cost: { input: 0, cacheRead: 0.001, cacheWrite: 0 },
+};
+
+/**
+ * Summary response that missed a 20k baseline: 20k tokens re-billed at
+ * $0.20. Clears both the token and dollar display floors.
+ */
+const SUMMARY_MISS_USAGE = {
+  input: 20_000,
+  output: 20,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 20_020,
+  cost: { input: 0.2, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.2 },
+};
+
+/** Expected TUI warning for `SUMMARY_MISS_USAGE` against `CACHE_BASELINE_USAGE`. */
+const SUMMARY_MISS_NOTICE = "Cache miss: 20k tokens re-billed (~$0.20)";
+
+describe("dispatch: rewind cache-preserving summary request (#33)", () => {
+  const ORIGINAL_KILL_SWITCH = process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE;
+  afterEach(() => {
+    if (ORIGINAL_KILL_SWITCH === undefined) {
+      delete process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE;
+    } else {
+      process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE = ORIGINAL_KILL_SWITCH;
+    }
+  });
+
+  it("assembles the live request and delegates it through the wrapper", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    const inFlightId = appendInFlightAssistant(sm, "tc-rewind");
+    assert.equal(sm.getLeafId(), inFlightId);
+
+    const fake = makeFakeSession(sm);
+    const liveTools = [{ name: "read", description: "r", parameters: {} }];
+    fake.agent.state.tools = liveTools;
+    fake.agent.thinkingBudgets = { high: 4242 };
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    (pi.pi as unknown as { getThinkingLevel: () => string }).getThinkingLevel =
+      () => "high";
+
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus:
+          "Preserve the latest instruction, note done work, list what remains.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (result.details.summaryCache as { mode: string }).mode,
+      "live-prefix",
+    );
+    assert.equal(
+      (result.details.summaryCache as { used: boolean }).used,
+      false,
+      "stub summarizer never invokes the wrapper, so `used` stays false",
+    );
+
+    // The wrapper was handed to the summarizer; invoke it the way the real
+    // generateBranchSummary would (cold context/options in, live request out).
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+
+    assert.equal(provider.calls.length, 1);
+    const call = provider.calls[0];
+    assert.equal(call.context.systemPrompt, "LIVE SYSTEM PROMPT");
+    assert.equal(
+      call.context.tools,
+      liveTools,
+      "live tool instances must be reused",
+    );
+    assert.equal(
+      call.options?.maxTokens,
+      undefined,
+      "caller cap must be stripped",
+    );
+    assert.equal(call.options?.cacheRetention, "short");
+    assert.equal(call.options?.sessionId, sm.getSessionId());
+    assert.equal(call.options?.reasoning, "high");
+    assert.deepEqual(call.options?.thinkingBudgets, { high: 4242 });
+
+    // In-flight assistant excluded: the payload ends before the assistant
+    // that carries the triggering toolCall, leaving no unpaired tool_use.
+    const body = call.context.messages.slice(0, -1);
+    assert.ok(
+      !body.some(
+        (m) =>
+          m.role === "assistant" && JSON.stringify(m).includes("tc-rewind"),
+      ),
+      "in-flight assistant toolCall must not appear in the summary payload",
+    );
+    const trailer = call.context.messages[call.context.messages.length - 1] as {
+      role: string;
+      content: Array<{ text: string }>;
+    };
+    assert.equal(trailer.role, "user");
+    assert.match(
+      trailer.content[0].text,
+      /Additional focus: Preserve the latest/,
+    );
+    assert.doesNotMatch(trailer.content[0].text, /\{first\}/);
+  });
+
+  it("falls back with reflection-missing when no owning session can be found", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi);
+    // Provider present so the fallback reason is the reflection miss, not
+    // the missing stream.
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    // No owning session => the settings gate is unreadable => no notice stored.
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      hit: boolean;
+      notice: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "reflection-missing");
+    assert.equal(cache.hit, false);
+    assert.equal(cache.notice, null);
+  });
+
+  it("falls back when the reflected session has no live tool array", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi);
+    // Capture a session whose tools field is not an array. (Must be the only
+    // captured session for this sm so findOwningSession resolves it.)
+    const fake = makeFakeSession(sm);
+    fake.agent.state.tools = undefined as never;
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    // The stub reports no usage, so no miss is measured -> no notice.
+    assert.equal(
+      (result.details.summaryCache as { notice: string | null }).notice,
+      null,
+    );
+    assert.equal(
+      (result.details.summaryCache as { fallbackReason: string })
+        .fallbackReason,
+      "no-live-tools",
+    );
+  });
+
+  it("kill switch PI_NAVIGATE_TREE_SUMMARY_CACHE=0 bypasses the cache path", async () => {
+    process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE = "0";
+    const { spy } = capturingSummarize(undefined);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, { capture: true });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      notice: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "disabled");
+    assert.equal(cache.notice, null);
+  });
+
+  it("falls back with no-provider-stream when the registry has no streamSimple", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi, { capture: true });
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    assert.equal(
+      (result.details.summaryCache as { notice: string | null }).notice,
+      null,
+    );
+  });
+
+  it("stores the fork's miss notice when the summary misses a 20k baseline", async () => {
+    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    fake.settingsManager = { getShowCacheMissNotices: () => true };
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      hit: boolean;
+      cacheRead: number;
+      input: number;
+      cacheWrite: number;
+      missedTokens: number;
+      missedCost: number;
+      notice: string | null;
+    };
+    assert.equal(cache.hit, false);
+    assert.equal(cache.cacheRead, 0);
+    assert.equal(cache.input, 20_000);
+    assert.equal(cache.cacheWrite, 0);
+    assert.equal(cache.missedTokens, 20_000);
+    assert.equal(cache.missedCost.toFixed(2), "0.20");
+    assert.equal(cache.notice, SUMMARY_MISS_NOTICE);
+  });
+
+  it("stays silent on a cache hit and still reports the measured stats", async () => {
+    const { spy } = capturingSummarize({
+      input: 420,
+      output: 20,
+      cacheRead: 20_000,
+      cacheWrite: 0,
+      totalTokens: 20_440,
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0.001,
+        cacheWrite: 0,
+        total: 0.001,
+      },
+    });
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    fake.settingsManager = { getShowCacheMissNotices: () => true };
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    // Hits are silent: session totals cover them, there is no hit notice.
+    const cache = result.details.summaryCache as {
+      hit: boolean;
+      fallbackReason: string | null;
+      branchStartRetained: boolean;
+      cacheRead: number;
+      notice: string | null;
+    };
+    assert.equal(cache.hit, true);
+    assert.equal(cache.cacheRead, 20_000);
+    assert.equal(cache.notice, null);
+    // Non-crossing regression: no compaction in the segment, so the request
+    // stays live-prefix with no fallback and a retained branch start.
+    assert.equal(cache.fallbackReason, null);
+    assert.equal(cache.branchStartRetained, true);
+  });
+
+  it("falls back with branch-crosses-compaction when the segment crosses the compaction cut", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const a1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(a1.assistantId, "anchor:start");
+    const a2 = appendTurn(sm, "u2", "a2", 12_000);
+    // Keep from a2 onward: the anchor (a1), its label entry, and u2 are
+    // dropped from the live projection, so the cache payload would lose raw
+    // branch evidence the legacy path still sends.
+    appendCompaction(sm, a2.assistantId);
+    appendTurn(sm, "u3", "a3", 18_000);
+    appendTurn(sm, "u4", "a4", 24_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the raw branch evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    // Default fake settings (off) => no notice stored for the fallback.
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      notice: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "branch-crosses-compaction");
+    assert.equal(cache.notice, null);
+
+    // `request === null` path: the wrapper delegates the caller's cold
+    // context/options verbatim (the raw-evidence legacy request).
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+    assert.equal(provider.calls.length, 1);
+    assert.equal(provider.calls[0].context.systemPrompt, "COLD");
+  });
+
+  it("keeps live-prefix when the segment contains a compaction but the target is after firstKeptEntryId", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    appendTurn(sm, "u1", "a1", 6_000);
+    const t2 = appendTurn(sm, "u2", "a2", 12_000);
+    pi.pi.setLabel(t2.assistantId, "anchor:start");
+    appendTurn(sm, "u3", "a3", 18_000);
+    // Keep from u2 onward: the anchor (a2) and its label survive the cut, so
+    // the segment loses no evidence even though it contains the compaction
+    // entry. A "segment has a compaction" predicate would wrongly fall back.
+    appendCompaction(sm, t2.userId);
+    appendTurn(sm, "u4", "a4", 24_000);
+    appendTurn(sm, "u5", "a5", 30_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the live evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string | null;
+      branchStartRetained: boolean;
+    };
+    assert.equal(cache.mode, "live-prefix");
+    assert.equal(cache.fallbackReason, null);
+    assert.equal(cache.branchStartRetained, true);
+  });
+
+  it("keeps live-prefix when the target is exactly the compaction entry", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    appendTurn(sm, "u2", "a2", 12_000);
+    // Keep everything (firstKeptEntryId = u1); the segment after the
+    // compaction entry is fully retained.
+    const compactionId = appendCompaction(sm, t1.userId);
+    pi.pi.setLabel(compactionId, "anchor:start");
+    appendTurn(sm, "u3", "a3", 18_000);
+    appendTurn(sm, "u4", "a4", 24_000);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the live evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string | null;
+    };
+    assert.equal(cache.mode, "live-prefix");
+    assert.equal(cache.fallbackReason, null);
+  });
+
+  it("falls back with branch-start-not-retained when the newest message alone exceeds the budget", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({
+      summarize: spy,
+      contextWindow: 20_000,
+    });
+    const a1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(a1.assistantId, "anchor:start");
+    // The newest entry alone (~10k tokens) exceeds the 20_000 - 16384 =
+    // 3616-token budget, so the newest→oldest walk breaks before adding any
+    // branch evidence.
+    appendTurn(
+      sm,
+      `u2 ${"x".repeat(20_000)}`,
+      `a2 ${"y".repeat(40_000)}`,
+      30_000,
+    );
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve the raw branch evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      branchStartRetained: boolean;
+      notice: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "branch-start-not-retained");
+    assert.equal(cache.branchStartRetained, false);
+    assert.equal(cache.notice, null);
+  });
+
+  it("stores no notice when the settings gate is unreadable", async () => {
+    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    // Present but throwing: the reflective read must swallow and store nothing.
+    fake.settingsManager = {
+      getShowCacheMissNotices: () => {
+        throw new Error("settings unavailable");
+      },
+    };
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      missedTokens: number;
+      notice: string | null;
+    };
+    assert.equal(cache.missedTokens, 20_000);
+    assert.equal(cache.notice, null);
+  });
+
+  it("stores no notice when showCacheMissNotices is off", async () => {
+    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    // Default fake session: getShowCacheMissNotices() === false.
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      missedTokens: number;
+      notice: string | null;
+    };
+    assert.equal(cache.missedTokens, 20_000);
+    assert.equal(cache.notice, null);
+  });
+
+  it("stores no notice below the 20k-token / $0.10 display floor", async () => {
+    const { spy } = capturingSummarize({
+      input: 15_000,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 15_020,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    fake.settingsManager = { getShowCacheMissNotices: () => true };
+    appendUsageTurn(sm, {
+      input: 0,
+      cacheRead: 50_000,
+      cacheWrite: 0,
+      cost: { input: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      missedTokens: number;
+      notice: string | null;
+    };
+    assert.equal(cache.missedTokens, 15_000);
+    assert.equal(cache.notice, null);
+  });
+
+  it("suppresses a miss after a model switch", async () => {
+    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    fake.settingsManager = { getShowCacheMissNotices: () => true };
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE, {
+      provider: "openai",
+      model: "gpt-5",
+    });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    // Fork semantics: a cold summary right after a model switch is expected
+    // re-billing (the live baseline belongs to another model), not an
+    // actionable miss — the detector returns undefined, so nothing is stored.
+    const cache = result.details.summaryCache as {
+      missedTokens: number;
+      modelChanged: boolean;
+      notice: string | null;
+    };
+    assert.equal(cache.missedTokens, 0);
+    assert.equal(cache.modelChanged, false);
+    assert.equal(cache.notice, null);
+  });
+
+  it("labels the miss as idle once the gap spans the cache TTL", async () => {
+    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    fake.settingsManager = { getShowCacheMissNotices: () => true };
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE, {
+      timestamp: Date.now() - (5 * 60 * 1000 + 60_000),
+    });
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    const cache = result.details.summaryCache as {
+      idleMs: number;
+      notice: string | null;
+    };
+    assert.ok(cache.idleMs >= 5 * 60 * 1000);
+    assert.equal(
+      cache.notice,
+      "Cache miss after 6m idle: 20k tokens re-billed (~$0.20)",
+    );
+  });
+
+  it("measures the fallback path through the same miss detector", async () => {
+    process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE = "0";
+    const { spy } = capturingSummarize(SUMMARY_MISS_USAGE);
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const { fake } = setupRewindable(sm, pi, { capture: true });
+    if (!fake) throw new Error("capture: true must return fake");
+    fake.settingsManager = { getShowCacheMissNotices: () => true };
+    appendUsageTurn(sm, CACHE_BASELINE_USAGE);
+    installProvider(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assertNoCacheNoticeInContent(result.content[0].text);
+    // Fallback is NOT special-cased: the cold request measures as a miss.
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      missedTokens: number;
+      notice: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "disabled");
+    assert.equal(cache.missedTokens, 20_000);
+    assert.equal(cache.notice, SUMMARY_MISS_NOTICE);
+  });
+});
+
+// =============================================================================
+// dispatch: cache-notice transcript rendering (#33)
+//
+// Upstream pi renders cache notices as transcript lines via the tool renderer
+// (not toasts). `execute` stores the notice string; `renderResult` reproduces
+// the default result body and appends `new Spacer(1)` + a warning `Text`.
+// =============================================================================
+
+type RenderResultFn = (
+  result: {
+    content: Array<{ type: string; text?: string }>;
+    details: unknown;
+  },
+  options: { expanded: boolean; isPartial: boolean },
+  theme: { fg: (color: string, text: string) => string },
+) => { render(width: number): string[] };
+
+const STUB_THEME = { fg: (_color: string, text: string) => text };
+
+function renderToolResult(
+  tool: CapturedTool,
+  contentText: string,
+  notice: string | null,
+  expanded: boolean,
+): string {
+  const renderResult = (tool as { renderResult?: RenderResultFn }).renderResult;
+  assert.equal(typeof renderResult, "function");
+  const component = (renderResult as RenderResultFn)(
+    {
+      content: [{ type: "text", text: contentText }],
+      details: { summaryCache: { notice } },
+    },
+    { expanded, isPartial: false },
+    STUB_THEME,
+  );
+  // Each rendered line is padded to the width; trim for readable assertions.
+  return component
+    .render(200)
+    .map((line) => line.trim())
+    .join("\n");
+}
+
+describe("dispatch: cache-notice transcript rendering (#33)", () => {
+  before(() => {
+    // `keyHint` reads the module-global pi theme; initialize it once.
+    initTheme();
+  });
+
+  it("renders content only when there is no notice", () => {
+    const { tool } = setup();
+    const out = renderToolResult(tool, "line one\nline two", null, true);
+    assert.equal(out, "line one\nline two");
+    assert.doesNotMatch(out, /Cache miss/);
+  });
+
+  it("appends the warning line when a notice is present", () => {
+    const { tool } = setup();
+    const out = renderToolResult(
+      tool,
+      "body line",
+      "Cache miss: 20k tokens re-billed (~$0.20)",
+      true,
+    );
+    assert.match(out, /body line/);
+    assert.match(out, /Cache miss: 20k tokens re-billed/);
+  });
+
+  it("previews the first 10 lines with an expand hint when collapsed", () => {
+    const { tool } = setup();
+    const content = Array.from({ length: 13 }, (_, i) => `l${i + 1}`).join(
+      "\n",
+    );
+    const out = renderToolResult(tool, content, null, false);
+    assert.match(out, /l10/);
+    assert.doesNotMatch(out, /l11/);
+    assert.match(out, /3 more lines/);
+    assert.match(out, /to expand/);
+  });
+
+  it("renders all lines with no hint when expanded", () => {
+    const { tool } = setup();
+    const content = Array.from({ length: 13 }, (_, i) => `l${i + 1}`).join(
+      "\n",
+    );
+    const out = renderToolResult(tool, content, null, true);
+    assert.match(out, /l13/);
+    assert.doesNotMatch(out, /more lines/);
+  });
+
+  it("adds a Spacer between the body and the warning line", () => {
+    const { tool } = setup();
+    const out = renderToolResult(
+      tool,
+      "body",
+      "Cache miss: 5k tokens re-billed",
+      true,
+    );
+    assert.match(out, /body\n\s*\n\s*Cache miss: 5k tokens re-billed/);
   });
 });
