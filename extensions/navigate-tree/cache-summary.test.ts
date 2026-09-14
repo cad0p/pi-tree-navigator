@@ -856,6 +856,30 @@ describe("detectBranchSummaryCacheMiss + formatBranchSummaryCacheMissNotice", ()
     assert.ok(miss, "branch_summary must not reset the baseline");
   });
 
+  it("counts a zero-cache miss after a compaction boundary when earlier activity proved caching (session-scoped capability)", () => {
+    // `everReportedCache` is session-scoped: a compaction resets the prompt
+    // baseline (`prev`) but must NOT reset the provider-cache capability —
+    // otherwise a total miss on a cache-read-only provider would be mistaken
+    // for a provider that never reports caching at all. Port of the fork's
+    // `cache-stats.ts` scan; without the capability flag this test's response
+    // (zero cache read AND zero cache write) would be silently ignored.
+    const entries = [
+      usageEntry({ input: 0, cacheRead: 20_000, cacheWrite: 0 }),
+      compactionEntry("cut"),
+      usageEntry({ input: 20_000, cacheRead: 0, cacheWrite: 0 }),
+    ];
+    const miss = detectBranchSummaryCacheMiss(
+      entries,
+      response({ input: 20_000, cost: COST({ input: 0.2 }) }),
+      "claude",
+      "claude-sonnet-4-5",
+      1_700_000_001_000,
+      priceSource(),
+    );
+    assert.ok(miss, "compaction must reset the baseline, not the capability");
+    assert.equal(miss.missedTokens, 20_000);
+  });
+
   it("renders the idle label once the gap spans the cache TTL", () => {
     const base = 1_700_000_000_000;
     const entries = [
