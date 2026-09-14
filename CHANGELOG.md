@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [calver-released]
 
 <!-- USER-EDITABLE SECTION START -->
-<!-- Add your curated release notes here. -->
+Last version before adopting the branch summarization cache hit mechanism to save everyone money -> https://github.com/earendil-works/pi/issues/9411
 <!-- USER-EDITABLE SECTION END -->
 
 ### 🚀 Features
