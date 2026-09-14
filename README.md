@@ -128,6 +128,8 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 - **Tiny rewinds are rejected by a minimum-savings floor.** A `rewind` whose measured savings falls below an internal floor (~4k tokens of apparent context freed) is refused with guidance listing the active anchors instead of executing — collapsing a near-empty segment burns a summarizer LLM call and can even grow live context once the summary and its synthetic assistant land on the kept chain. This pairs with anchoring early: anchor at the start of a stage, then rewind only once real work has accumulated above the anchor.
 
+- **`rewind` must be a solo tool call.** A batched rewind is refused before any mutation because the post-rewind projection is `[everything up to the anchor] + [the new summary]`, so a sibling result would be orphaned (generated pre-collapse, written post-collapse, no declaring call in context); re-issue the rewind alone.
+
 - **Abandoned branches grow the JSONL forever.** Each rewind preserves the abandoned subtree on disk. Session files get bigger over time even as live context shrinks. For very long autonomous runs (days), session files can hit hundreds of MB.
 
 - **Tested against Anthropic and Kiro providers.** The synthetic-tool_use trick is specifically for Anthropic's strict tool_use/tool_result pairing; the synthetic's `stopReason: "toolUse"` survives Kiro's `normalizeMessages` filter. Other providers may have different validation rules — untested.
