@@ -2965,6 +2965,45 @@ describe("findInFlightAssistantToolCalls (#37)", () => {
     );
   });
 
+  it("counts id-bearing toolCall blocks with a malformed name (fail-open, name → 'unknown')", () => {
+    // Detection must fail open on shape, not count: a sibling block whose
+    // `name` is missing/renamed must still count toward the batch, so the
+    // refusal can't be bypassed by an unexpected field shape.
+    const { sm } = setup();
+    sm.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "tc-rewind",
+          name: "navigate_tree",
+          arguments: {},
+        },
+        { type: "toolCall", id: "tc-sibling", arguments: {} },
+      ],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "toolUse",
+      timestamp: Date.now(),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 30_000,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      [
+        { id: "tc-rewind", name: "navigate_tree" },
+        { id: "tc-sibling", name: "unknown" },
+      ],
+    );
+  });
+
   it("returns null when the in-flight toolCallId is absent", () => {
     const { sm } = setup();
     appendTurn(sm, "u", "a");

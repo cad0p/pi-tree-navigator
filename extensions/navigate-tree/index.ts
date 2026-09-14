@@ -421,9 +421,8 @@ function findLabeledEntry(
 
 /** Shape of a `toolCall` content block on an assistant message. */
 interface ToolCallBlock {
-  type: string;
   id: string;
-  name: string;
+  name?: unknown;
 }
 
 /**
@@ -449,6 +448,11 @@ interface ToolCallBlock {
  * fall back to the same scan over the captured session's
  * `agent.state.messages`. A miss returns `null` so callers fall through to
  * the pre-guard behavior — never hard-fail on undetectable state.
+ *
+ * Detection fails open on shape, not count: every `toolCall` block with a
+ * string `id` counts toward the returned batch, even if its `name` is
+ * missing or malformed (`name` falls back to `"unknown"`), so a sibling
+ * call can't be silently dropped from the count by an unexpected shape.
  */
 function findInFlightAssistantToolCalls(
   sm: SessionManager,
@@ -482,22 +486,28 @@ function findInFlightAssistantToolCalls(
           !!block &&
           typeof block === "object" &&
           (block as { type?: unknown }).type === "toolCall" &&
-          typeof (block as { id?: unknown }).id === "string" &&
-          typeof (block as { name?: unknown }).name === "string",
+          typeof (block as { id?: unknown }).id === "string",
       );
       if (toolCalls.some((block) => block.id === toolCallId)) {
-        return toolCalls.map((block) => ({ id: block.id, name: block.name }));
+        return toolCalls.map((block) => ({
+          id: block.id,
+          name: typeof block.name === "string" ? block.name : "unknown",
+        }));
       }
     }
     return null;
   };
 
+  let branch: SessionEntry[] | undefined;
   try {
-    const onBranch = scan(sm.getBranch());
-    if (onBranch) return onBranch;
+    branch = sm.getBranch();
   } catch {
     // getBranch() reads internal session state; fall through to the
     // captured-session scan instead of aborting the rewind.
+  }
+  if (branch) {
+    const onBranch = scan(branch);
+    if (onBranch) return onBranch;
   }
   const session = findOwningSession(sm);
   const liveMessages = session

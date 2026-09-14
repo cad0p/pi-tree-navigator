@@ -355,7 +355,7 @@ try {
     batchOrdering.detail,
   );
   const sessionPersistsOnMessageEnd =
-    /if\s*\(event\.type === "message_end"\)[\s\S]{0,800}?this\.sessionManager\.appendMessage\(event\.message\)/.test(
+    /if \(event\.type === "message_end"\)[\s\S]{0,400}?else if \(event\.message\.role === "user" \|\|[\s\S]{0,300}?this\.sessionManager\.appendMessage\(event\.message\)/.test(
       sessionSrc,
     );
   const sessionSubscribes = /this\.agent\.subscribe\(this\._handleAgentEvent\)/.test(
