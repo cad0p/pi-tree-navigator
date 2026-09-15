@@ -1498,6 +1498,7 @@ describe("dispatch: solo-batch guard (#37)", () => {
     it(`refuses a ${order} batch without side effects`, async () => {
       const f = await batchedRewindFixture(order);
       assert.equal(f.result.isError, true);
+      assert.equal(f.result.details.refusal, true);
       const text = f.result.content[0].text;
       // Pinned copy (stable clauses), with labelStart interpolated.
       assert.match(text, /rewind must be the only tool call in its batch/);
@@ -1569,6 +1570,87 @@ describe("dispatch: solo-batch guard (#37)", () => {
       __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
       batch,
     );
+  });
+});
+
+// =============================================================================
+// dispatch: refusal results surface as failed tool calls
+//
+// `AgentToolResult` has no `isError` field in pi-agent-core's contract, and
+// the agent runtime overwrites any returned flag with its own boolean (only a
+// thrown `execute()` is finalized as an error). `toolError` therefore tags
+// its details with `refusal: true` and the factory's `tool_result` handler
+// flips the host's `isError` — the signal that turns the TUI row and the
+// transcript entry red. These pins cover registration, the flip, and the
+// no-op paths.
+// =============================================================================
+
+describe("dispatch: refusal results surface as failed tool calls", () => {
+  function toolResultHandler(): (e: unknown) => unknown {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("tool_result");
+    assert.ok(handlers, "factory must register a tool_result handler");
+    assert.equal(handlers.length, 1);
+    return handlers[0] as unknown as (e: unknown) => unknown;
+  }
+
+  it("returns isError:true for a navigate_tree refusal", () => {
+    const out = toolResultHandler()({
+      type: "tool_result",
+      toolName: "navigate_tree",
+      toolCallId: "tc-refusal",
+      input: { action: "rewind" },
+      content: [{ type: "text", text: "rewind must be the only tool call…" }],
+      // Shape produced by `toolError`.
+      details: { refusal: true, rejected: "batched-rewind" },
+      isError: false,
+    });
+    assert.deepEqual(out, { isError: true });
+  });
+
+  it("leaves successful navigate_tree results untouched", () => {
+    const out = toolResultHandler()({
+      type: "tool_result",
+      toolName: "navigate_tree",
+      toolCallId: "tc-anchor",
+      input: { action: "anchor" },
+      content: [{ type: "text", text: "[anchor 'start'] set at 1.0%" }],
+      details: { label: "start", contextTokens: 1_234 },
+      isError: false,
+    });
+    assert.equal(out, undefined);
+  });
+
+  it("ignores other tools even with a refusal-shaped payload", () => {
+    const out = toolResultHandler()({
+      type: "tool_result",
+      toolName: "bash",
+      toolCallId: "tc-bash",
+      input: { command: "true" },
+      content: [{ type: "text", text: "ok" }],
+      details: { refusal: true },
+      isError: false,
+    });
+    assert.equal(out, undefined);
+  });
+
+  it("toolError tags every refusal with the marker, keeping caller details", async () => {
+    const { tool, ctx } = setup();
+    const result = await tool.execute(
+      "tc-bad-focus",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "too short",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+    assert.equal(result.details.refusal, true);
+    assert.match(result.content[0].text, /summaryFocus/);
   });
 });
 
