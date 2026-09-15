@@ -2,10 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.2.0] - 2026-09-15
 
 <!-- USER-EDITABLE SECTION START -->
-<!-- Add your curated release notes here. -->
+Headline release: `rewind` summaries now ride the prompt cache.
+
+`rewind` collapses a conversation segment by asking a model to summarize it, and that summary request used to be built cold — generic summarization system prompt, conversation serialized to a blob, no tools, fresh session id, no reasoning params, `cacheRetention: "none"` — so it re-billed the entire branch even though the turns it collapsed had just been prompt-cache-served (measured ~77k tokens / $0.0075 cold vs ~$0.0004 warm on opencode-go). The extension now rewrites the request at the `streamFn` seam to mirror the live turns: same system prompt, same tool array, the live structured message prefix (minus the in-flight assistant), same session routing, cache retention, reasoning effort, and thinking budgets. Measured on opencode-go: ~98–99% of the summary request input served from the live prefix cache (~20–24k tokens read, a few hundred fresh tokens billed). No upstream fork or patched pi host needed.
+
+Safety stays ahead of cache hits: a segment whose raw evidence is not in the live projection (it crosses the latest compaction's cut) or whose branch evidence is entirely dropped deliberately refuses the cache path and re-bills cold, and `PI_NAVIGATE_TREE_SUMMARY_CACHE=0` forces the pre-cache path. A cache miss that clears the ≥20k-token / ≥$0.10 display floor is surfaced as a TUI transcript line when pi's `showCacheMissNotices` setting is on (default off); hits are silent, and every rewind always records `mode` / `used` / `cacheRead` / `hit` / `missedTokens` / `missedCost` / `fallbackReason` in `details.summaryCache` in the session JSONL. The `@earendil-works/pi-tui` peer powers the notice line. See the README's “Cache-preserving summary request (#33)” and “Live summary verification” for the full contract and the cache-gate checklist.
+
+Also in this release: `rewind` is now refused before any mutation when it shares an assistant batch with sibling tool calls — sibling results land after the collapse with no declaring call, which is exactly how sessions got bricked (#37). The model re-issues the rewind solo.
 <!-- USER-EDITABLE SECTION END -->
 
 ### 🚀 Features
