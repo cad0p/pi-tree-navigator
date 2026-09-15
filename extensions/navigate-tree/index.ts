@@ -676,7 +676,13 @@ function toolError(
 ): ToolResult {
   return {
     content: [{ type: "text", text }],
-    details,
+    // `isError` is a statement of intent only: pi-agent-core ignores the flag
+    // on a *returned* result (only a thrown `execute()` is finalized as
+    // failed), so without the `refusal` marker below the host records this
+    // as a successful call and the TUI paints the row with `toolSuccessBg`.
+    // The `tool_result` handler in the factory promotes the marker into the
+    // host's real error channel.
+    details: { ...details, refusal: true },
     isError: true,
   };
 }
@@ -712,6 +718,20 @@ export default function (
     const selected = event.systemPromptOptions?.selectedTools;
     if (Array.isArray(selected) && !selected.includes(TOOL_NAME)) return {};
     return { systemPrompt: `${event.systemPrompt}\n\n${ANCHOR_MANDATE}` };
+  });
+
+  // Refusals must render (and be recorded) as failed tool calls. A returned
+  // `isError: true` never reaches the host's error channel — pi-agent-core
+  // only finalizes a call as failed when `execute()` throws, overwriting the
+  // flag with its own boolean — so `toolError` tags its details with
+  // `refusal: true` and this handler flips the host's `isError`, which drives
+  // the TUI's `toolErrorBg` shell, the transcript entry, and any other
+  // extension's `tool_result` view. Content is left untouched, so the model
+  // still reads the refusal copy.
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== TOOL_NAME) return undefined;
+    const details = event.details as { refusal?: boolean } | undefined;
+    return details?.refusal === true ? { isError: true } : undefined;
   });
 
   pi.registerTool({
