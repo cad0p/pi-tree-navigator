@@ -5,10 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [0.2.0] - 2026-09-15
 
 <!-- USER-EDITABLE SECTION START -->
-- **Cache-hit rewind summaries** — summary requests now mirror the live prompt prefix and ride the same prompt cache: ~98–99% cache-served (~20–24k tokens read, a few hundred fresh) instead of a cold re-bill (~77k tokens / $0.0075 → ~$0.0004 warm). No fork or patched host needed.
+- **Cache-hit rewind summaries** ([#33](https://github.com/cad0p/pi-tree-navigator/issues/33)) — summary requests now mirror the live prompt prefix and ride the same prompt cache: ~98–99% cache-served (~20–24k tokens read, a few hundred fresh) instead of a cold re-bill (~77k tokens / $0.0075 → ~$0.0004 warm). No fork or patched host needed.
 - **Correctness first** — evidence-losing segments (compaction-crossing, dropped branch evidence) still re-bill cold; `PI_NAVIGATE_TREE_SUMMARY_CACHE=0` opts out; misses ≥20k tokens / ≥$0.10 show a gated TUI notice (hits silent); numbers always in `details.summaryCache`.
-- **Batched rewinds refused (#37)** — `rewind` sharing an assistant batch with sibling tool calls is refused before any mutation; re-issue it solo.
-- **Refusals render as failures (#40)** — red error row + `isError: true` in the transcript (the returned flag was ignored; promoted via the public `tool_result` event).
+- **Batched rewinds refused** ([#37](https://github.com/cad0p/pi-tree-navigator/issues/37)) — `rewind` sharing an assistant batch with sibling tool calls is refused before any mutation; re-issue it solo.
+- **Refusals render as failures** ([#40](https://github.com/cad0p/pi-tree-navigator/issues/40)) — red error row + `isError: true` in the transcript (the returned flag was ignored; promoted via the public `tool_result` event).
 <!-- USER-EDITABLE SECTION END -->
 
 ### 🚀 Features
