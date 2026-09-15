@@ -21,6 +21,7 @@ Also in this release: `rewind` is now refused before any mutation when it shares
 ### 🐛 Bug Fixes
 
 - *(rewind)* Refuse sibling-batched rewinds — rewind must be the only tool call in its batch (closes #37)
+- *(rewind)* Surface refusals as failed tool calls (closes #40)
 
 
 ## [0.1.3] - 2026-09-14
