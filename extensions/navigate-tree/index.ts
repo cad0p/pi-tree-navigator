@@ -419,6 +419,108 @@ function findLabeledEntry(
   return null;
 }
 
+/** Shape of a `toolCall` content block on an assistant message. */
+interface ToolCallBlock {
+  id: string;
+  name?: unknown;
+}
+
+/**
+ * Find the assistant message that declared the in-flight tool call and
+ * return its full tool-call batch as emitted (emission order), or `null`
+ * when neither the active branch nor the captured session's live messages
+ * carry it.
+ *
+ * `rewind` is only structurally safe as a solo call (#37): it forks the
+ * tree and re-declares ONLY its own tool call in a synthetic assistant, so
+ * a sibling call's result — appended by pi's sequential loop after the
+ * fork — would land on the new branch with no declaring assistant and
+ * brick every subsequent request. This helper is the detection seam for
+ * the pre-mutation refusal guard.
+ *
+ * Primary source is `sm.getBranch()`: pi persists the assistant
+ * SessionEntry on `message_end` before `tool_execution_start`, so the
+ * in-flight assistant is already on the active branch when `execute` runs
+ * (asserted by `scripts/pi-upstream-probe.mjs`). The walk matches by
+ * tool-call id, not by tail position, because preceding sibling results
+ * may already trail the assistant. `getBranch()` reads internal session
+ * state and can throw, and tree-write lag can leave it stale; both cases
+ * fall back to the same scan over the captured session's
+ * `agent.state.messages`. A miss returns `null` so callers fall through to
+ * the pre-guard behavior — never hard-fail on undetectable state.
+ *
+ * Detection fails open on shape, not count: every `toolCall` block with a
+ * string `id` counts toward the returned batch, even if its `name` is
+ * missing or malformed (`name` falls back to `"unknown"`), so a sibling
+ * call can't be silently dropped from the count by an unexpected shape.
+ */
+function findInFlightAssistantToolCalls(
+  sm: SessionManager,
+  toolCallId: string,
+): Array<{ id: string; name: string }> | null {
+  const scan = (
+    items: ReadonlyArray<unknown>,
+  ): Array<{ id: string; name: string }> | null => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i] as
+        | { type?: unknown; message?: unknown }
+        | null
+        | undefined;
+      if (!item || typeof item !== "object") continue;
+      // SessionEntry: `{ type: "message", message: {...} }`. Raw
+      // `agent.state.messages` entries are the message itself.
+      const candidate = (item.type === "message" ? item.message : item) as
+        | { role?: unknown; content?: unknown }
+        | null
+        | undefined;
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        candidate.role !== "assistant" ||
+        !Array.isArray(candidate.content)
+      ) {
+        continue;
+      }
+      const toolCalls = candidate.content.filter(
+        (block): block is ToolCallBlock =>
+          !!block &&
+          typeof block === "object" &&
+          (block as { type?: unknown }).type === "toolCall" &&
+          typeof (block as { id?: unknown }).id === "string",
+      );
+      if (toolCalls.some((block) => block.id === toolCallId)) {
+        return toolCalls.map((block) => ({
+          id: block.id,
+          name: typeof block.name === "string" ? block.name : "unknown",
+        }));
+      }
+    }
+    return null;
+  };
+
+  let branch: SessionEntry[] | undefined;
+  try {
+    branch = sm.getBranch();
+  } catch {
+    // getBranch() reads internal session state; fall through to the
+    // captured-session scan instead of aborting the rewind.
+  }
+  if (branch) {
+    const onBranch = scan(branch);
+    if (onBranch) return onBranch;
+  }
+  const session = findOwningSession(sm);
+  const liveMessages = session
+    ? asInternals(session).agent?.state?.messages
+    : undefined;
+  if (!Array.isArray(liveMessages)) return null;
+  try {
+    return scan(liveMessages);
+  } catch {
+    return null;
+  }
+}
+
 function estimateActiveBranchTokens(sm: SessionManager): number {
   return estimateContextTokens(sm.buildSessionContext().messages).tokens;
 }
@@ -791,6 +893,27 @@ Operations (set \`action\`):
             `  1. the user's most recent instruction verbatim,\n` +
             `  2. which parts have already been done in the work being collapsed,\n` +
             `  3. which parts remain unactioned.`,
+        );
+      }
+
+      // Solo-batch guard (#37): a rewind must be the only tool call in its
+      // assistant batch. Pi runs a batch containing this sequential-mode tool
+      // sequentially; `branchWithSummary` then puts the declaring assistant
+      // on the abandoned branch, and the synthetic assistant re-declares
+      // ONLY this call — so any sibling result pi appends afterwards would
+      // land on the new branch with no declaring `tool_calls`, 400-ing every
+      // subsequent request. Refuse before any mutation or LLM call. A missed
+      // detection returns null and falls through to today's behavior. The
+      // validations above ran first so the copy can interpolate a valid
+      // labelStart.
+      const inFlightBatch = findInFlightAssistantToolCalls(sm, toolCallId);
+      if (inFlightBatch && inFlightBatch.length > 1) {
+        return toolError(
+          `rewind must be the only tool call in its batch — after it, the next context is everything up to '${p.labelStart}' plus the new summary, so any other call's result would be orphaned — never read by anyone. Those other calls already ran; re-issue only the rewind, alone.`,
+          {
+            rejected: "batched-rewind",
+            batchedToolCalls: inFlightBatch.map((call) => call.name),
+          },
         );
       }
 
@@ -1415,6 +1538,7 @@ export const __testHooks = {
   buildSyntheticAssistant,
   findLabelHint,
   findLabeledEntry,
+  findInFlightAssistantToolCalls,
   buildContextMessages,
   refreshAgentMessages,
   captureSession,

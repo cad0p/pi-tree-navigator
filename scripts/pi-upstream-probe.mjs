@@ -226,6 +226,148 @@ try {
     typeof SettingsManager?.prototype?.getShowCacheMissNotices === "function",
     typeof SettingsManager?.prototype?.getShowCacheMissNotices,
   );
+
+  // --- 9. Assistant persisted before tool execution (#37 solo-batch guard) ---
+  // The #37 guard reads the active branch to find the in-flight assistant
+  // (the one declaring the rewind tool call) BEFORE any mutation. That read
+  // is only sound because pi:
+  //   (a) emits the assistant `message_end` — and AgentSession persists it
+  //       via `sessionManager.appendMessage` — before the loop calls
+  //       `executeToolCalls` → emits `tool_execution_start`;
+  //   (b) awaits listeners inside the event dispatch, so persistence
+  //       completes before the tool body runs.
+  // Verify (a)+(b) behaviorally with a real Agent + stub streamFn: a listener
+  // that appends on assistant message_end must have the append visible from
+  // the tool body. Then pin the AgentSession persistence site and its
+  // subscription from source. A future pi reorder must fail this probe
+  // loudly instead of silently reopening #37.
+  let batchOrdering = { ok: false, detail: "not run" };
+  try {
+    const ZERO_USAGE = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const batchEvents = [];
+    const persisted = new Set();
+    let toolSawPersistedAssistant = true;
+    let streamCalls = 0;
+    const makeAssistant = (content, stopReason) => ({
+      role: "assistant",
+      content,
+      api: "anthropic",
+      provider: "probe",
+      model: "probe",
+      stopReason,
+      timestamp: Date.now(),
+      usage: ZERO_USAGE,
+    });
+    const probeTool = (name) => ({
+      name,
+      label: name,
+      description: "probe",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      executionMode: "sequential",
+      execute: async (toolCallId) => {
+        batchEvents.push(`execute:${toolCallId}`);
+        if (!persisted.has(toolCallId)) toolSawPersistedAssistant = false;
+        return { content: [{ type: "text", text: "ok" }], details: {} };
+      },
+    });
+    const batchAgent = new Agent({
+      streamFn: async () => {
+        streamCalls++;
+        const message =
+          streamCalls === 1
+            ? makeAssistant(
+                [
+                  {
+                    type: "toolCall",
+                    id: "probe-tc-a",
+                    name: "probe_batch_a",
+                    arguments: {},
+                  },
+                  {
+                    type: "toolCall",
+                    id: "probe-tc-b",
+                    name: "probe_batch_b",
+                    arguments: {},
+                  },
+                ],
+                "toolUse",
+              )
+            : makeAssistant([{ type: "text", text: "done" }], "endTurn");
+        return {
+          async *[Symbol.asyncIterator]() {},
+          async result() {
+            return message;
+          },
+        };
+      },
+      initialState: {
+        systemPrompt: "probe",
+        model: { id: "probe", provider: "probe", api: "anthropic" },
+        thinkingLevel: "off",
+        messages: [],
+        tools: [probeTool("probe_batch_a"), probeTool("probe_batch_b")],
+      },
+    });
+    batchAgent.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "assistant") {
+        for (const block of event.message.content) {
+          if (block.type === "toolCall") persisted.add(block.id);
+        }
+        batchEvents.push("persist:assistant");
+      } else if (event.type === "tool_execution_start") {
+        batchEvents.push(`tool_execution_start:${event.toolCallId}`);
+      }
+    });
+    await batchAgent.prompt("go");
+    const firstPersist = batchEvents.indexOf("persist:assistant");
+    const firstToolStart = batchEvents.findIndex((e) =>
+      e.startsWith("tool_execution_start:"),
+    );
+    const ok =
+      firstPersist !== -1 &&
+      firstToolStart !== -1 &&
+      firstPersist < firstToolStart &&
+      toolSawPersistedAssistant;
+    batchOrdering = {
+      ok,
+      detail: `${batchEvents.join(" -> ")}${toolSawPersistedAssistant ? "" : " [tool ran before persist]"}`,
+    };
+  } catch (e) {
+    batchOrdering = {
+      ok: false,
+      detail: `threw: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  check(
+    "assistant message_end (persisted) precedes tool_execution_start (#37)",
+    batchOrdering.ok,
+    batchOrdering.detail,
+  );
+  const sessionPersistsOnMessageEnd =
+    /if \(event\.type === "message_end"\)[\s\S]{0,400}?else if \(event\.message\.role === "user" \|\|[\s\S]{0,300}?this\.sessionManager\.appendMessage\(event\.message\)/.test(
+      sessionSrc,
+    );
+  const sessionSubscribes = /this\.agent\.subscribe\(this\._handleAgentEvent\)/.test(
+    sessionSrc,
+  );
+  check(
+    "AgentSession persists message_end payloads via sessionManager.appendMessage (#37)",
+    sessionSubscribes && sessionPersistsOnMessageEnd,
+    sessionSubscribes && sessionPersistsOnMessageEnd
+      ? "subscription + message_end appendMessage found"
+      : `subscription: ${sessionSubscribes ? "found" : "MISSING"}, message_end persistence: ${sessionPersistsOnMessageEnd ? "found" : "MISSING"}`,
+  );
 } catch (e) {
   check("probe crashed", false, String(e.stack || e.message));
 }

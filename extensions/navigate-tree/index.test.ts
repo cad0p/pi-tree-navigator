@@ -215,6 +215,40 @@ async function fakeSummarize() {
 }
 
 /**
+ * Append an assistant message declaring a tool-call batch — the #37 shape
+ * (e.g. `navigate_tree(rewind)` + `bash` emitted in one assistant message).
+ * Returns the assistant entry id.
+ */
+function appendAssistantToolCalls(
+  sm: SessionManager,
+  toolCalls: Array<{ id: string; name: string }>,
+  totalTokens = 30_000,
+): string {
+  return sm.appendMessage({
+    role: "assistant",
+    content: toolCalls.map((tc) => ({
+      type: "toolCall",
+      id: tc.id,
+      name: tc.name,
+      arguments: { action: "rewind" },
+    })),
+    api: "anthropic",
+    provider: "claude",
+    model: "claude-sonnet-4-5",
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  } as never);
+}
+
+/**
  * Register the navigate-tree tool against a fresh fake pi + SessionManager
  * and return the captured tool plus the helpers tests need.
  */
@@ -1369,6 +1403,172 @@ describe("dispatch: rewind validation guards", () => {
     assert.equal(result.isError, true);
     // Past the focus guard, into the label-existence guard.
     assert.match(result.content[0].text, /No label 'missing'/);
+  });
+});
+
+// =============================================================================
+// dispatch: solo-batch guard (#37)
+//
+// A rewind sharing an assistant batch with any other tool call bricks the
+// active branch: the fork puts the declaring assistant on the abandoned
+// branch, the synthetic re-declares ONLY the rewind call, and pi's
+// sequential loop appends the sibling's result to the new branch with no
+// declaring `tool_calls` — every subsequent request 400s. The guard refuses
+// before any mutation or summarizer call.
+// =============================================================================
+
+describe("dispatch: solo-batch guard (#37)", () => {
+  /**
+   * Drive a rewind whose declaring assistant carries `batch` — the #37
+   * shape that must be refused. Spies on the summarizer and on
+   * `branchWithSummary`, and snapshots the tree so the refusal can be
+   * proven side-effect-free.
+   */
+  async function batchedRewindFixture(order: "rewind-first" | "sibling-first") {
+    let summarizeCalls = 0;
+    const summarize = (async () => {
+      summarizeCalls++;
+      return {
+        summary:
+          "## Goal\nshould never run.\n## Progress\n### Done\nx.\n## Next Steps\ny.",
+        readFiles: [] as string[],
+        modifiedFiles: [] as string[],
+        aborted: false,
+      };
+    }) as typeof fakeSummarize;
+    const { sm, pi, tool, ctx } = setup({ summarize });
+    // Healthy stage above the anchor: the guard must fire before the
+    // min-savings floor / summarizer, so the refusal can't be mistaken for
+    // an earlier rejection.
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 15_000);
+    appendTurn(sm, "u3", "a3", 26_000);
+
+    // Instance shadow: the tool calls `sm.branchWithSummary(...)`.
+    const originalBranchWithSummary = sm.branchWithSummary.bind(sm);
+    let branchCalls = 0;
+    (
+      sm as unknown as {
+        branchWithSummary: typeof originalBranchWithSummary;
+      }
+    ).branchWithSummary = (
+      ...args: Parameters<typeof originalBranchWithSummary>
+    ) => {
+      branchCalls++;
+      return originalBranchWithSummary(...args);
+    };
+
+    const navigate = { id: "tc-rewind", name: "navigate_tree" };
+    const sibling = { id: "tc-sibling", name: "bash" };
+    const batch =
+      order === "rewind-first" ? [navigate, sibling] : [sibling, navigate];
+    appendAssistantToolCalls(sm, batch);
+
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const entriesBefore = sm.getEntries().length;
+    const leafBefore = sm.getLeafId();
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    return {
+      sm,
+      result,
+      batch,
+      summarizeCalls: () => summarizeCalls,
+      branchCalls: () => branchCalls,
+      entriesBefore,
+      leafBefore,
+    };
+  }
+
+  for (const order of ["rewind-first", "sibling-first"] as const) {
+    it(`refuses a ${order} batch without side effects`, async () => {
+      const f = await batchedRewindFixture(order);
+      assert.equal(f.result.isError, true);
+      const text = f.result.content[0].text;
+      // Pinned copy (stable clauses), with labelStart interpolated.
+      assert.match(text, /rewind must be the only tool call in its batch/);
+      assert.match(text, /everything up to 'start' plus the new summary/);
+      assert.match(text, /would be orphaned — never read by anyone/);
+      assert.match(
+        text,
+        /Those other calls already ran; re-issue only the rewind, alone\./,
+      );
+      assert.equal(f.result.details.rejected, "batched-rewind");
+      assert.deepEqual(
+        f.result.details.batchedToolCalls,
+        f.batch.map((tc) => tc.name),
+      );
+      // Zero side effects: no summarizer call, no branch move, no new entry,
+      // leaf unchanged.
+      assert.equal(f.summarizeCalls(), 0);
+      assert.equal(f.branchCalls(), 0);
+      assert.equal(f.sm.getEntries().length, f.entriesBefore);
+      assert.equal(f.sm.getLeafId(), f.leafBefore);
+    });
+  }
+
+  it("reports the batch in emission order (order independence)", async () => {
+    const rewindFirst = await batchedRewindFixture("rewind-first");
+    assert.deepEqual(rewindFirst.result.details.batchedToolCalls, [
+      "navigate_tree",
+      "bash",
+    ]);
+    const siblingFirst = await batchedRewindFixture("sibling-first");
+    assert.deepEqual(siblingFirst.result.details.batchedToolCalls, [
+      "bash",
+      "navigate_tree",
+    ]);
+  });
+
+  it("does not refuse a solo navigate_tree batch — the guard is length > 1 only", async () => {
+    // Contrast pin against the refusals above: the same fixture with a
+    // single-call assistant must execute the rewind. This is the first
+    // fixture whose in-flight assistant is actually detectable (the older
+    // happy-path fixtures use text-only assistants → helper returns null),
+    // so it pins the length-1 passthrough explicitly.
+    const batch = [{ id: "tc-rewind", name: "navigate_tree" }];
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 15_000);
+    appendTurn(sm, "u3", "a3", 26_000);
+    appendAssistantToolCalls(sm, batch);
+    const fake = makeFakeSession(sm);
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        labelStart: "start",
+        labelEnd: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    // Post-rewind the synthetic re-declares only the rewind call, so the
+    // helper now sees a solitary toolCall batch (length 1, no refusal).
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      batch,
+    );
   });
 });
 
@@ -2732,6 +2932,139 @@ describe("findLabeledEntry", () => {
     assert.equal(
       __testHooks.findLabeledEntry(sm, "anchor:found"),
       t.assistantId,
+    );
+  });
+});
+
+// =============================================================================
+// findInFlightAssistantToolCalls (#37)
+// =============================================================================
+
+describe("findInFlightAssistantToolCalls (#37)", () => {
+  it("returns the full batch when a sibling toolResult trails the declaring assistant", () => {
+    // Sequential execution: pi appends each sibling's result before the
+    // next call runs, so the newest entry may be a toolResult, not the
+    // assistant. The walk matches by tool-call id, not tail position.
+    const { sm } = setup();
+    const batch = [
+      { id: "tc-sibling", name: "bash" },
+      { id: "tc-rewind", name: "navigate_tree" },
+    ];
+    appendAssistantToolCalls(sm, batch);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "tc-sibling",
+      toolName: "bash",
+      content: [{ type: "text", text: "sibling output" }],
+      isError: false,
+      timestamp: Date.now(),
+    } as never);
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      batch,
+    );
+  });
+
+  it("counts id-bearing toolCall blocks with a malformed name (fail-open, name → 'unknown')", () => {
+    // Detection must fail open on shape, not count: a sibling block whose
+    // `name` is missing/renamed must still count toward the batch, so the
+    // refusal can't be bypassed by an unexpected field shape.
+    const { sm } = setup();
+    sm.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "tc-rewind",
+          name: "navigate_tree",
+          arguments: {},
+        },
+        { type: "toolCall", id: "tc-sibling", arguments: {} },
+      ],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "toolUse",
+      timestamp: Date.now(),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 30_000,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      [
+        { id: "tc-rewind", name: "navigate_tree" },
+        { id: "tc-sibling", name: "unknown" },
+      ],
+    );
+  });
+
+  it("returns null when the in-flight toolCallId is absent", () => {
+    const { sm } = setup();
+    appendTurn(sm, "u", "a");
+    assert.equal(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      null,
+    );
+  });
+
+  it("falls back to agent.state.messages when the branch walk misses", () => {
+    const { sm } = setup();
+    const batch = [{ id: "tc-rewind", name: "navigate_tree" }];
+    const fake = makeFakeSession(sm);
+    fake.agent.state.messages = [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      {
+        role: "assistant",
+        content: batch.map((tc) => ({
+          type: "toolCall",
+          ...tc,
+          arguments: {},
+        })),
+      },
+    ];
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    // The active branch carries no assistant declaring tc-rewind.
+    appendTurn(sm, "u", "a");
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      batch,
+    );
+  });
+
+  it("falls back when getBranch() throws, and returns null when both sources miss", () => {
+    const { sm } = setup();
+    const batch = [{ id: "tc-rewind", name: "navigate_tree" }];
+    const fake = makeFakeSession(sm);
+    fake.agent.state.messages = [
+      {
+        role: "assistant",
+        content: batch.map((tc) => ({
+          type: "toolCall",
+          ...tc,
+          arguments: {},
+        })),
+      },
+    ];
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    (sm as unknown as { getBranch: () => never }).getBranch = () => {
+      throw new Error("branch read not available");
+    };
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      batch,
+    );
+    // Both sources miss → null (the caller falls through to the pre-guard
+    // behavior, never hard-fails on undetectable state).
+    fake.agent.state.messages = [];
+    assert.equal(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      null,
     );
   });
 });
