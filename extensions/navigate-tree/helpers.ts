@@ -24,6 +24,11 @@
 // desync the `[navigate_tree hint]` copy from the tool the model calls.
 export const TOOL_NAME = "navigate_tree";
 
+// Reserved label prefix shared by anchor/rewind labels. Lives here (not
+// index.ts) so the tool description, the tool handlers, and the rewind-hint
+// copy builders can't desync on a rename.
+export const LABEL_PREFIX = "anchor:";
+
 // Hard cap on label-name length. 40 chars accommodates descriptive names
 // (e.g. 'parser-edge-case-investigation', 31 chars) while keeping list
 // output column-friendly under common terminal widths and preventing a

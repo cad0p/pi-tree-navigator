@@ -10,7 +10,7 @@
 
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { TOOL_NAME } from "./helpers.ts";
+import { LABEL_PREFIX, TOOL_NAME } from "./helpers.ts";
 import {
   buildNoAnchorText,
   buildRewindHintText,
@@ -111,6 +111,15 @@ describe("buildNoAnchorText", () => {
       ),
     );
   });
+
+  it("renders the LABEL_PREFIX-derived label instructions (rename-desync pin)", () => {
+    const text = buildNoAnchorText(91.2, 1_000_000);
+    assert.ok(
+      text.includes(
+        `label it \`${LABEL_PREFIX}<name>\` (e.g. ${LABEL_PREFIX}context-gathered)`,
+      ),
+    );
+  });
 });
 
 describe("REWIND_HINT_CUSTOM_TYPE", () => {
@@ -138,6 +147,17 @@ describe("collectAnchorNames", () => {
       a: "anchor:context-gathered",
       b: "anchor:plan-approved",
       c: undefined,
+    });
+    assert.deepEqual(collectAnchorNames(sm), [
+      "context-gathered",
+      "plan-approved",
+    ]);
+  });
+
+  it("matches labels built from LABEL_PREFIX (rename-desync pin)", () => {
+    const sm = fakeSm(["a", "b"], {
+      a: `${LABEL_PREFIX}context-gathered`,
+      b: `${LABEL_PREFIX}plan-approved`,
     });
     assert.deepEqual(collectAnchorNames(sm), [
       "context-gathered",

@@ -12,19 +12,10 @@
  * structurally.
  */
 
-import { formatWindow, TOOL_NAME } from "./helpers.ts";
+import { formatWindow, LABEL_PREFIX, TOOL_NAME } from "./helpers.ts";
 
 export const REWIND_HINT_CUSTOM_TYPE = "navigate-tree-rewind-hint";
 export const REWIND_HINT_MAX_ANCHORS = 3;
-
-/**
- * Mirrors `LABEL_PREFIX` in index.ts (module-private there; duplicating the
- * short literal here keeps this module free of an index.ts import cycle).
- * The anchor tests in `index.test.ts` and the copy pins here exercise
- * `anchor:` end to end, so a prefix change landing in only one module
- * surfaces there.
- */
-const ANCHOR_PREFIX = "anchor:";
 
 /**
  * One-shot crossing tracker. `observe` returns true exactly on a fresh
@@ -67,7 +58,7 @@ export function buildNoAnchorText(
   percent: number,
   contextWindow: number,
 ): string {
-  return `${TOOL_NAME}: context at ${percent.toFixed(1)}% of ${formatWindow(contextWindow)} — no anchors on the active branch, so no rewind hint was sent. To enable one: /tree, select the entry to rewind to, press shift+l, label it \`${ANCHOR_PREFIX}<name>\` (e.g. ${ANCHOR_PREFIX}context-gathered), then ask me to rewind to it.`;
+  return `${TOOL_NAME}: context at ${percent.toFixed(1)}% of ${formatWindow(contextWindow)} — no anchors on the active branch, so no rewind hint was sent. To enable one: /tree, select the entry to rewind to, press shift+l, label it \`${LABEL_PREFIX}<name>\` (e.g. ${LABEL_PREFIX}context-gathered), then ask me to rewind to it.`;
 }
 
 /**
@@ -84,8 +75,8 @@ export function collectAnchorNames(sm: {
   const names: string[] = [];
   for (const entry of sm.getBranch()) {
     const label = sm.getLabel(entry.id);
-    if (!label?.startsWith(ANCHOR_PREFIX)) continue;
-    names.push(label.slice(ANCHOR_PREFIX.length));
+    if (!label?.startsWith(LABEL_PREFIX)) continue;
+    names.push(label.slice(LABEL_PREFIX.length));
     if (names.length >= REWIND_HINT_MAX_ANCHORS) break;
   }
   return names;
