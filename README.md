@@ -54,10 +54,10 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 | action | params | effect |
 |---|---|---|
 | `anchor` | `name` | Label the current point in the conversation as a milestone. |
-| `rewind` | `labelStart`, `labelEnd`, `summaryFocus` | Collapse work between `labelStart` and the current leaf into a `branch_summary` entry. The summary is itself labeled with `labelEnd`, so you can chain rewinds. `summaryFocus` is required (non-trivial focus required; floor enforced at runtime by `MIN_SUMMARY_FOCUS_LENGTH`). Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from `labelStart` and continues forward from a model-generated summary; the original subtree is preserved on disk but no longer on the active path. |
+| `rewind` | `rewindTo`, `newLabel`, `summaryFocus` | Collapse work between `rewindTo` and the current leaf into a `branch_summary` entry. The summary is itself labeled with `newLabel`, so you can chain rewinds. `summaryFocus` is required (non-trivial focus required; floor enforced at runtime by `MIN_SUMMARY_FOCUS_LENGTH`). Despite the verb, `rewind` does not restore prior state — it forks a sibling branch from `rewindTo` and continues forward from a model-generated summary; the original subtree is preserved on disk but no longer on the active path. |
 | `list` | — | Show all anchors on the active branch with cumulative context %. |
 
-`name` (written by `anchor`) and `labelEnd` (written by `rewind`) both share the reserved `anchor:` label prefix; `labelStart` resolves against that same namespace. Every label written by `anchor` and every `labelEnd` written by `rewind` is referenceable by any subsequent `rewind`'s `labelStart`, and `list` shows all of them.
+`name` (written by `anchor`) and `newLabel` (written by `rewind`) both share the reserved `anchor:` label prefix; `rewindTo` resolves against that same namespace. Every label written by `anchor` and every `newLabel` written by `rewind` is referenceable by any subsequent `rewind`'s `rewindTo`, and `list` shows all of them.
 
 **Anchoring is mandated, not suggested.** On every agent start the extension appends a one-line mandate to the end of the system prompt (`before_agent_start`), gated on the tool being active: `navigate_tree: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end.` The append lands after project context and skills, is re-applied on every prompt, and survives compaction — unlike the `promptGuidelines` bullet it replaced. ~35 tokens, constant for prompt caching.
 
@@ -71,10 +71,10 @@ agent: navigate_tree(action="anchor", name="impl-start")
 
 agent: ...does work, runs tools, accumulates context to 30%...
 
-agent: navigate_tree(action="rewind", labelStart="impl-start", labelEnd="impl-end",
+agent: navigate_tree(action="rewind", rewindTo="impl-start", newLabel="impl-end",
                      summaryFocus="record only the public API of the parser
                                    and the open issue with edge case X")
-  → [rewind 'impl-start' → 'impl-end'] · context 30.4% → 4.1% of 1.0M
+  → [rewind to 'impl-start' · collapsed as 'impl-end'] · context 30.4% → 4.1% of 1.0M
   → A branch_summary recording the work just collapsed has been appended
     to your context. Items under '### Done' are complete. ...
 
@@ -149,7 +149,7 @@ The synthetic assistant we inject after each rewind carries the **post-rewind ch
 
 - **Loading the extension monkey-patches `AgentSession.prototype.prompt` globally.** Every session in the host pi process picks up the patch on import, including sessions that never call `navigate_tree`. The patch is install-on-import and not reversible within a running pi process; restart pi to fully unload it.
 
-- **`anchor:` is a reserved label prefix.** Any label written via pi's `/label` command or by another extension that begins with `anchor:` will be picked up by `list` and addressable by `rewind`'s `labelStart` / `labelEnd`. Avoid the prefix in manually-set labels.
+- **`anchor:` is a reserved label prefix.** Any label written via the `/tree` view (`Shift+L` on the selected entry) or by another extension that begins with `anchor:` will be picked up by `list` and addressable by `rewind`'s `rewindTo` / `newLabel`. Avoid the prefix in manually-set labels.
 
 - **Disk-fault during `rewind` (rare).** Pi's `branchWithSummary` advances the in-memory leaf before persisting the new entry to disk. If pi's session-write fails mid-call (full disk, FS error on a persisted session), the in-memory leaf has already moved past the original assistant turn but the synthetic-assistant injection in this extension never runs — pi's tool-result then lands without a matching tool_use, surfacing as the same `context_length_exceeded` 400 the synthetic exists to prevent. Production risk: low (in-memory tests don't reach this case; pi's session-write is robust on POSIX disk). Tracked for an additional salvage layer wrapping `branchWithSummary` itself in v0.2.0.
 

@@ -538,19 +538,19 @@ function estimateAtEntry(
 /**
  * Rejection copy for the rewind min-savings floor (#21). Reports the
  * apparent savings plus every active anchor — chronological root→leaf,
- * same walk order as `list`, including labelStart itself — with its
+ * same walk order as `list`, including rewindTo itself — with its
  * cumulative context percentage, so the agent can pick a genuinely earlier
  * anchor or keep working. Move-on-collision means the tool itself never
- * creates duplicate anchor names; a manual `/label anchor:x` CAN put the
- * same name on two entries — duplicates print twice here, exactly as
+ * creates duplicate anchor names; a manual `/tree` label `anchor:x` CAN
+ * put the same name on two entries — duplicates print twice here, exactly as
  * `list` prints them today.
  *
  * Deliberately does NOT print the floor value anywhere: an agent-visible
  * numeric bar invites grinding up to it instead of doing real work.
  */
 function buildMinSavingsRejection(
-  labelStart: string,
-  labelEnd: string,
+  rewindTo: string,
+  newLabel: string,
   apparentSavings: number,
   sm: SessionManager,
   cw: number,
@@ -572,10 +572,10 @@ function buildMinSavingsRejection(
   // suffix is omitted, mirroring `list`'s header behavior.
   const suffix = cw > 0 ? ` of ${formatWindow(cw)}` : "";
   const guidance =
-    oldestAnchorName === labelStart
+    oldestAnchorName === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
       : "Rewind further back to actually free context, or keep working.";
-  return `Rewinding '${labelStart}' → '${labelEnd}' would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.join(" · ")}${suffix}`;
+  return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.join(" · ")}${suffix}`;
 }
 
 /**
@@ -748,10 +748,10 @@ export default function (
 
 Operations (set \`action\`):
   • 'anchor', name='<milestone-name>': label the current point. Anchor at the start of a stage you'll summarize (e.g. 'impl-start').
-  • 'rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary labeled labelEnd, so rewinds can chain.
+  • 'rewind', rewindTo='<existing>', newLabel='<new>': collapse work between rewindTo and the current leaf into a branch_summary labeled newLabel, so rewinds can chain.
   • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
 
-\`name\` (anchor) and \`labelEnd\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`labelStart\`. Avoid the reserved \`anchor:\` prefix.`,
+\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`anchor:\` prefix.`,
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
@@ -773,14 +773,14 @@ Operations (set \`action\`):
           description: `Required when action='anchor'. Kebab-case milestone label, max ${MAX_NAME_LENGTH} chars.`,
         }),
       ),
-      labelStart: Type.Optional(
+      rewindTo: Type.Optional(
         Type.String({
           description: `Required when action='rewind'. Kebab-case name of an existing anchor on the active branch to rewind to.`,
         }),
       ),
-      labelEnd: Type.Optional(
+      newLabel: Type.Optional(
         Type.String({
-          description: `Required when action='rewind'. Kebab-case label for the resulting branch_summary entry; reusable as a future labelStart.`,
+          description: `Required when action='rewind'. Kebab-case label for the resulting branch_summary entry; reusable as a future rewindTo.`,
         }),
       ),
       summaryFocus: Type.Optional(
@@ -794,8 +794,8 @@ Operations (set \`action\`):
       const p = params as {
         action: "anchor" | "rewind" | "list";
         name?: string;
-        labelStart?: string;
-        labelEnd?: string;
+        rewindTo?: string;
+        newLabel?: string;
         summaryFocus?: string;
       };
 
@@ -878,7 +878,7 @@ Operations (set \`action\`):
               type: "text",
               text:
                 `[anchor '${p.name}'] set at ${positionLine}${hintLine}\n\n` +
-                `Once real work has accumulated after this anchor, collapse it into a summary with: ${TOOL_NAME}(action='rewind', labelStart='${p.name}', labelEnd='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
+                `Once real work has accumulated after this anchor, collapse it into a summary with: ${TOOL_NAME}(action='rewind', rewindTo='${p.name}', newLabel='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
             },
           ],
           details: {
@@ -892,14 +892,14 @@ Operations (set \`action\`):
       }
 
       // --- rewind ---
-      if (!isValidName(p.labelStart)) {
+      if (!isValidName(p.rewindTo)) {
         return toolError(
-          `rewind requires \`labelStart\` in kebab-case, max ${MAX_NAME_LENGTH} chars.`,
+          `rewind requires \`rewindTo\` in kebab-case, max ${MAX_NAME_LENGTH} chars.`,
         );
       }
-      if (!isValidName(p.labelEnd)) {
+      if (!isValidName(p.newLabel)) {
         return toolError(
-          `rewind requires \`labelEnd\` in kebab-case, max ${MAX_NAME_LENGTH} chars.`,
+          `rewind requires \`newLabel\` in kebab-case, max ${MAX_NAME_LENGTH} chars.`,
         );
       }
       if (
@@ -925,11 +925,11 @@ Operations (set \`action\`):
       // subsequent request. Refuse before any mutation or LLM call. A missed
       // detection returns null and falls through to today's behavior. The
       // validations above ran first so the copy can interpolate a valid
-      // labelStart.
+      // rewindTo.
       const inFlightBatch = findInFlightAssistantToolCalls(sm, toolCallId);
       if (inFlightBatch && inFlightBatch.length > 1) {
         return toolError(
-          `rewind must be the only tool call in its batch — after it, the next context is everything up to '${p.labelStart}' plus the new summary, so any other call's result would be orphaned — never read by anyone. Those other calls already ran; re-issue only the rewind, alone.`,
+          `rewind must be the only tool call in its batch — after it, the next context is everything up to '${p.rewindTo}' plus the new summary, so any other call's result would be orphaned — never read by anyone. Those other calls already ran; re-issue only the rewind, alone.`,
           {
             rejected: "batched-rewind",
             batchedToolCalls: inFlightBatch.map((call) => call.name),
@@ -937,18 +937,16 @@ Operations (set \`action\`):
         );
       }
 
-      const target = findLabeledEntry(sm, LABEL_PREFIX + p.labelStart);
+      const target = findLabeledEntry(sm, LABEL_PREFIX + p.rewindTo);
       if (!target) {
         return toolError(
-          `No label '${p.labelStart}' on the active branch. Use action='list' to see available labels.`,
+          `No label '${p.rewindTo}' on the active branch. Use action='list' to see available labels.`,
         );
       }
 
       const oldLeaf = sm.getLeafId();
       if (!oldLeaf || oldLeaf === target) {
-        return toolError(
-          `Already at '${p.labelStart}' — nothing to summarize.`,
-        );
+        return toolError(`Already at '${p.rewindTo}' — nothing to summarize.`);
       }
 
       // Token math hoisted ABOVE the model check / auth await (#21): these
@@ -985,7 +983,7 @@ Operations (set \`action\`):
       const { entries } = collectEntriesForBranchSummary(sm, oldLeaf, target);
       if (entries.length === 0) {
         return toolError(
-          `No entries between leaf and '${p.labelStart}' — nothing to summarize.`,
+          `No entries between leaf and '${p.rewindTo}' — nothing to summarize.`,
         );
       }
       // Chained-rewind-no-turns guard: bail if the only message between
@@ -1034,8 +1032,8 @@ Operations (set \`action\`):
       if (apparentSavings < MIN_REWIND_SAVINGS_TOKENS) {
         return toolError(
           buildMinSavingsRejection(
-            p.labelStart,
-            p.labelEnd,
+            p.rewindTo,
+            p.newLabel,
             apparentSavings,
             sm,
             contextWindow,
@@ -1320,10 +1318,10 @@ Operations (set \`action\`):
       // stopReason: "toolUse" (survives Kiro's normalizeMessages filter
       // — see `buildSyntheticAssistant` JSDoc). The synthetic append
       // sits OUTSIDE the try so it runs exactly once regardless of
-      // which earlier step threw. labelEnd write moves before clear,
+      // which earlier step threw. newLabel write moves before clear,
       // mirroring `anchor`'s move-on-collision so duplicate anchors
       // can't survive a chained rewind.
-      const fullLabelEnd = LABEL_PREFIX + p.labelEnd;
+      const fullLabelEnd = LABEL_PREFIX + p.newLabel;
       let priorLabelEnd: ReturnType<typeof findLabeledEntry> = null;
       let tokensAtNewLeaf = 0;
       let originalErr: unknown;
@@ -1365,7 +1363,7 @@ Operations (set \`action\`):
           try {
             pi.setLabel(summaryId, fullLabelEnd);
           } catch (retryErr) {
-            salvageDetail = `labelEnd retry failed: ${
+            salvageDetail = `newLabel retry failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
             }`;
           }
@@ -1393,7 +1391,10 @@ Operations (set \`action\`):
       // Truncate to MAX_SYNTHETIC_FOCUS_LENGTH so a long focus string
       // doesn't inflate every later turn indefinitely.
       const syntheticArgs: Record<string, unknown> = {
-        ...(p as unknown as Record<string, unknown>),
+        action: "rewind",
+        rewindTo: p.rewindTo,
+        newLabel: p.newLabel,
+        summaryFocus: p.summaryFocus,
       };
       if (
         typeof p.summaryFocus === "string" &&
@@ -1418,7 +1419,7 @@ Operations (set \`action\`):
       const refreshed = refreshAgentMessages(sm);
 
       if (originalErr) {
-        // Salvage path: synthetic landed (chain is valid), labelEnd retry
+        // Salvage path: synthetic landed (chain is valid), newLabel retry
         // and refresh were best-effort. Re-throw the original error with
         // any salvage detail attached so the failure surfaces to the
         // agent and post-mortem reviewers can tell what was recovered.
@@ -1444,14 +1445,14 @@ Operations (set \`action\`):
           {
             type: "text",
             text:
-              `[rewind '${p.labelStart}' → '${p.labelEnd}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
+              `[rewind to '${p.rewindTo}' · collapsed as '${p.newLabel}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
               `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
               (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
           },
         ],
         details: {
-          labelStart: p.labelStart,
-          labelEnd: p.labelEnd,
+          rewindTo: p.rewindTo,
+          newLabel: p.newLabel,
           targetId: target,
           summaryId,
           syntheticAssistantId: syntheticId,

@@ -328,17 +328,17 @@ function setupRewindable(
   opts: {
     capture?: boolean;
     turnsAfter?: number;
-    labelStartName?: string;
+    rewindToName?: string;
     tokenCounts?: number[];
   } = {},
 ): { fake?: FakeAgentSession } {
-  const labelStartName = opts.labelStartName ?? "start";
+  const rewindToName = opts.rewindToName ?? "start";
   const turnsAfter = opts.turnsAfter ?? 3;
   const tokenCounts = opts.tokenCounts ?? [
     6_000, 12_000, 18_000, 24_000, 30_000,
   ];
   const t1 = appendTurn(sm, "u1", "a1", tokenCounts[0]);
-  pi.pi.setLabel(t1.assistantId, `anchor:${labelStartName}`);
+  pi.pi.setLabel(t1.assistantId, `anchor:${rewindToName}`);
   for (let i = 0; i < turnsAfter; i++) {
     appendTurn(sm, `u${i + 2}`, `a${i + 2}`, tokenCounts[i + 1] ?? 100);
   }
@@ -427,8 +427,8 @@ describe("context event handler", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve the user instruction and continue.",
       },
       undefined,
@@ -618,7 +618,7 @@ describe("schema shape \u2014 Kiro compatibility", () => {
     assert.equal(params.type, "object");
     // Tighter pin: `action` is the ONLY required field at the schema level.
     // Runtime guards (in execute) handle the action-conditional required-ness
-    // for `name`, `labelStart`, `labelEnd`, `summaryFocus`. A regression
+    // for `name`, `rewindTo`, `newLabel`, `summaryFocus`. A regression
     // that lifts a runtime guard into the schema (e.g. adding
     // `summaryFocus` to `required`) would re-introduce the original Kiro
     // 400 — this assertion catches it.
@@ -626,11 +626,34 @@ describe("schema shape \u2014 Kiro compatibility", () => {
     // Each action-conditional field must still exist in `properties` so the
     // schema describes the full surface to the model.
     const props = params.properties ?? {};
-    for (const key of ["name", "labelStart", "labelEnd", "summaryFocus"]) {
+    for (const key of ["name", "rewindTo", "newLabel", "summaryFocus"]) {
       assert.ok(key in props, `${key} must be a schema property`);
     }
     assert.equal(params.anyOf, undefined);
     assert.equal(params.oneOf, undefined);
+  });
+
+  it("schema clean break: rewindTo/newLabel registered, legacy names absent (#43)", () => {
+    // #43 is a clean break — no aliases. The schema must expose only the
+    // new param names; a legacy key reappearing in `properties` would keep
+    // the old vocabulary in the model-facing tool definition (and the
+    // cached prefix it sits at the head of). Legacy key names are
+    // assembled at runtime so the repo's zero-hit ref audit stays clean.
+    const legacyRewindTo = `label${"Start"}`;
+    const legacyNewLabel = `label${"End"}`;
+    const { tool } = setup();
+    const props = (tool.parameters as { properties: Record<string, unknown> })
+      .properties;
+    assert.ok("rewindTo" in props, "rewindTo must be a schema property");
+    assert.ok("newLabel" in props, "newLabel must be a schema property");
+    assert.ok(
+      !(legacyRewindTo in props),
+      `no legacy ${legacyRewindTo} alias in the schema`,
+    );
+    assert.ok(
+      !(legacyNewLabel in props),
+      `no legacy ${legacyNewLabel} alias in the schema`,
+    );
   });
 
   it("declares executionMode: 'sequential' (concurrency contract)", () => {
@@ -656,11 +679,11 @@ describe("schema shape \u2014 Kiro compatibility", () => {
     ).properties;
     assert.match(props.name.description ?? "", /Required when action='anchor'/);
     assert.match(
-      props.labelStart.description ?? "",
+      props.rewindTo.description ?? "",
       /Required when action='rewind'/,
     );
     assert.match(
-      props.labelEnd.description ?? "",
+      props.newLabel.description ?? "",
       /Required when action='rewind'/,
     );
     assert.match(
@@ -700,10 +723,10 @@ describe("tool definition \u2014 #22 token-trim pins", () => {
 
 Operations (set \`action\`):
   • 'anchor', name='<milestone-name>': label the current point. Anchor at the start of a stage you'll summarize (e.g. 'impl-start').
-  • 'rewind', labelStart='<existing>', labelEnd='<new>': collapse work between labelStart and the current leaf into a branch_summary labeled labelEnd, so rewinds can chain.
+  • 'rewind', rewindTo='<existing>', newLabel='<new>': collapse work between rewindTo and the current leaf into a branch_summary labeled newLabel, so rewinds can chain.
   • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
 
-\`name\` (anchor) and \`labelEnd\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`labelStart\`. Avoid the reserved \`anchor:\` prefix.`;
+\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`anchor:\` prefix.`;
 
   it("description byte-equals the issue-approved trimmed string", () => {
     // Byte-exact snapshot: any wording change to the tool description must
@@ -725,12 +748,12 @@ Operations (set \`action\`):
       `Required when action='anchor'. Kebab-case milestone label, max ${MAX_NAME_LENGTH} chars.`,
     );
     assert.equal(
-      props.labelStart.description,
+      props.rewindTo.description,
       `Required when action='rewind'. Kebab-case name of an existing anchor on the active branch to rewind to.`,
     );
     assert.equal(
-      props.labelEnd.description,
-      `Required when action='rewind'. Kebab-case label for the resulting branch_summary entry; reusable as a future labelStart.`,
+      props.newLabel.description,
+      `Required when action='rewind'. Kebab-case label for the resulting branch_summary entry; reusable as a future rewindTo.`,
     );
     assert.equal(
       props.summaryFocus.description,
@@ -740,9 +763,10 @@ Operations (set \`action\`):
 
   it("re-bloat tripwire: description + param descriptions stay ≤400 tok at chars/4", () => {
     // Every character of the tool definition is paid per request. The #22
-    // trim lands at 1485 chars = 371.25 tok; this bound guards against
-    // silently regrowing the schema — a future legit edit that needs more
-    // room must raise this number consciously, not bleed past it.
+    // trim lands at 1477 chars = 369.25 tok (#43 rename recompute); this
+    // bound guards against silently regrowing the schema — a future legit
+    // edit that needs more room must raise this number consciously, not
+    // bleed past it.
     const { tool } = setup();
     const props = (
       tool.parameters as {
@@ -753,8 +777,8 @@ Operations (set \`action\`):
       tool.description,
       props.action.description ?? "",
       props.name.description ?? "",
-      props.labelStart.description ?? "",
-      props.labelEnd.description ?? "",
+      props.rewindTo.description ?? "",
+      props.newLabel.description ?? "",
       props.summaryFocus.description ?? "",
     ].join("");
     assert.ok(
@@ -1013,8 +1037,8 @@ describe("dispatch: list action", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "Preserve user instructions and continue.",
         },
         undefined,
@@ -1102,7 +1126,7 @@ describe("dispatch: anchor action", () => {
     // accuracy on the very first rewind.
     const text = (result.content[0] as { text: string }).text;
     assert.match(text, /navigate_tree\(action='rewind'/);
-    assert.match(text, /labelStart='impl-start'/);
+    assert.match(text, /rewindTo='impl-start'/);
     assert.match(text, /summaryFocus=/);
     assert.match(text, new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`));
   });
@@ -1265,13 +1289,13 @@ describe("dispatch: anchor action", () => {
     assert.equal(result.isError, true);
     // Pin that the unknown-action falls through to the rewind-validation
     // site specifically (not just "any error"). The rewind dispatch's
-    // first guard rejects a missing/invalid `labelStart` with a
+    // first guard rejects a missing/invalid `rewindTo` with a
     // "kebab-case" message; pinning that text confirms the fall-through
-    // landed at the labelStart guard, not at a future explicit
+    // landed at the rewindTo guard, not at a future explicit
     // unknown-action default.
     assert.match(
       (result.content[0] as { text: string }).text,
-      /labelStart.*kebab-case/,
+      /rewindTo.*kebab-case/,
     );
   });
 });
@@ -1282,7 +1306,7 @@ describe("dispatch: anchor action", () => {
 
 describe("dispatch: rewind validation guards", () => {
   // Each row produces an isError=true result whose text matches the regex.
-  // The order matches the guard order in execute(): labelStart, labelEnd,
+  // The order matches the guard order in execute(): rewindTo, newLabel,
   // summaryFocus, then label-existence.
   const cases: Array<{
     name: string;
@@ -1290,26 +1314,26 @@ describe("dispatch: rewind validation guards", () => {
     want: RegExp;
   }> = [
     {
-      name: "missing labelStart",
+      name: "missing rewindTo",
       params: { action: "rewind" },
-      want: /labelStart.*kebab-case/,
+      want: /rewindTo.*kebab-case/,
     },
     {
-      name: "labelStart present, missing labelEnd",
-      params: { action: "rewind", labelStart: "ok" },
-      want: /labelEnd.*kebab-case/,
+      name: "rewindTo present, missing newLabel",
+      params: { action: "rewind", rewindTo: "ok" },
+      want: /newLabel.*kebab-case/,
     },
     {
-      name: "labelStart and labelEnd valid, missing summaryFocus",
-      params: { action: "rewind", labelStart: "ok", labelEnd: "ok2" },
+      name: "rewindTo and newLabel valid, missing summaryFocus",
+      params: { action: "rewind", rewindTo: "ok", newLabel: "ok2" },
       want: /summaryFocus/,
     },
     {
       name: "summaryFocus shorter than min length",
       params: {
         action: "rewind",
-        labelStart: "ok",
-        labelEnd: "ok2",
+        rewindTo: "ok",
+        newLabel: "ok2",
         summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1), // just under the floor
       },
       want: /summaryFocus/,
@@ -1322,8 +1346,8 @@ describe("dispatch: rewind validation guards", () => {
       name: "summaryFocus shorter than min length after trim",
       params: {
         action: "rewind",
-        labelStart: "ok",
-        labelEnd: "ok2",
+        rewindTo: "ok",
+        newLabel: "ok2",
         summaryFocus: `  ${"x".repeat(MIN_SUMMARY_FOCUS_LENGTH - 1)}  `,
       },
       want: /summaryFocus/,
@@ -1332,8 +1356,8 @@ describe("dispatch: rewind validation guards", () => {
       name: "summaryFocus mentions the 20-char threshold in error text",
       params: {
         action: "rewind",
-        labelStart: "ok",
-        labelEnd: "ok2",
+        rewindTo: "ok",
+        newLabel: "ok2",
         summaryFocus: "short",
       },
       // Pin that the error text surfaces MIN_SUMMARY_FOCUS_LENGTH literally;
@@ -1341,21 +1365,21 @@ describe("dispatch: rewind validation guards", () => {
       want: new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`),
     },
     {
-      name: "labelStart kebab-invalid (uppercase)",
-      params: { action: "rewind", labelStart: "Bad-Name" },
-      want: /labelStart.*kebab-case/,
+      name: "rewindTo kebab-invalid (uppercase)",
+      params: { action: "rewind", rewindTo: "Bad-Name" },
+      want: /rewindTo.*kebab-case/,
     },
     {
-      name: "labelEnd kebab-invalid (snake_case)",
-      params: { action: "rewind", labelStart: "ok", labelEnd: "snake_case" },
-      want: /labelEnd.*kebab-case/,
+      name: "newLabel kebab-invalid (snake_case)",
+      params: { action: "rewind", rewindTo: "ok", newLabel: "snake_case" },
+      want: /newLabel.*kebab-case/,
     },
     {
-      name: "all valid but no such labelStart on the active branch",
+      name: "all valid but no such rewindTo on the active branch",
       params: {
         action: "rewind",
-        labelStart: "missing",
-        labelEnd: "after",
+        rewindTo: "missing",
+        newLabel: "after",
         summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
       },
       want: /No label 'missing'/,
@@ -1379,10 +1403,61 @@ describe("dispatch: rewind validation guards", () => {
     });
   }
 
+  it("old-name rewind calls reach execute and are refused by the new-name guards (clean break)", async () => {
+    // #43 clean break: pi-ai's argument validation passes unknown keys
+    // through (the schema has no `additionalProperties`), so a resumed
+    // session replaying old-name params still reaches `execute` — the
+    // runtime guards are the path exercised here, representative of the
+    // live one-retry self-heal (each error names the new param). An
+    // execute-level alias fallback would not add a schema key, so the
+    // second row is the only guard against it. Legacy key names are
+    // assembled at runtime so the repo's zero-hit ref audit stays clean.
+    const legacyRewindTo = `label${"Start"}`;
+    const legacyNewLabel = `label${"End"}`;
+    const cases: Array<{
+      name: string;
+      params: Record<string, unknown>;
+      want: RegExp;
+    }> = [
+      {
+        name: "legacy rewindTo key only",
+        params: { action: "rewind", [legacyRewindTo]: "ok" },
+        want: /rewind requires `rewindTo` in kebab-case/,
+      },
+      {
+        name: "legacy newLabel key only (valid rewindTo + summaryFocus)",
+        params: {
+          action: "rewind",
+          rewindTo: "ok",
+          [legacyNewLabel]: "ok2",
+          summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
+        },
+        want: /rewind requires `newLabel` in kebab-case/,
+      },
+    ];
+    for (const c of cases) {
+      const { sm, tool, ctx } = setup();
+      appendTurn(sm, "u", "a");
+      const result = await tool.execute(
+        "tc-old-name",
+        c.params,
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, true, `${c.name}: must be refused`);
+      assert.match(
+        (result.content[0] as { text: string }).text,
+        c.want,
+        `${c.name}: refusal must name the new param`,
+      );
+    }
+  });
+
   it("summaryFocus exactly 20 chars after trim passes the guard", async () => {
     // Boundary: summaryFocus.trim().length >= MIN_SUMMARY_FOCUS_LENGTH (the
     // >= boundary, not strict >). The call still errors at the next guard
-    // (no labelStart on chain), but it moves past the focus-length check —
+    // (no rewindTo on chain), but it moves past the focus-length check —
     // pinning that the comparison is inclusive at exactly MIN. Trim-
     // presence on the rejection path is pinned by the
     // "shorter than min length after trim" row above, not here.
@@ -1392,8 +1467,8 @@ describe("dispatch: rewind validation guards", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "missing",
-        labelEnd: "after",
+        rewindTo: "missing",
+        newLabel: "after",
         summaryFocus: `  ${"x".repeat(MIN_SUMMARY_FOCUS_LENGTH)}  `,
       },
       undefined,
@@ -1475,8 +1550,8 @@ describe("dispatch: solo-batch guard (#37)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -1500,7 +1575,7 @@ describe("dispatch: solo-batch guard (#37)", () => {
       assert.equal(f.result.isError, true);
       assert.equal(f.result.details.refusal, true);
       const text = f.result.content[0].text;
-      // Pinned copy (stable clauses), with labelStart interpolated.
+      // Pinned copy (stable clauses), with rewindTo interpolated.
       assert.match(text, /rewind must be the only tool call in its batch/);
       assert.match(text, /everything up to 'start' plus the new summary/);
       assert.match(text, /would be orphaned — never read by anyone/);
@@ -1555,8 +1630,8 @@ describe("dispatch: solo-batch guard (#37)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -1640,8 +1715,8 @@ describe("dispatch: refusal results surface as failed tool calls", () => {
       "tc-bad-focus",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "too short",
       },
       undefined,
@@ -1678,8 +1753,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -1692,7 +1767,15 @@ describe("dispatch: rewind happy path", () => {
   it("emits the [rewind] response prose with Done / In Progress / Blocked / Next Steps", async () => {
     const { result } = await rewindFixture();
     assert.equal(result.isError, undefined);
-    assert.match(result.content[0].text, /\[rewind 'start' \u2192 'end'\]/);
+    assert.match(
+      result.content[0].text,
+      /\[rewind to 'start' · collapsed as 'end'\]/,
+    );
+    // #43: the structured details keys carry the new param names and the
+    // fixture's values. This is the machine-read JSONL surface, so it is
+    // pinned alongside the model-visible prose above.
+    assert.equal(result.details.rewindTo, "start");
+    assert.equal(result.details.newLabel, "end");
     assert.match(result.content[0].text, /### Done/);
     assert.match(result.content[0].text, /### In Progress/);
     assert.match(result.content[0].text, /### Blocked/);
@@ -1700,9 +1783,9 @@ describe("dispatch: rewind happy path", () => {
     assert.match(result.content[0].text, /## Next Steps/);
   });
 
-  it("labels the summary entry with anchor:<labelEnd> and leaves a synthetic leaf", async () => {
+  it("labels the summary entry with anchor:<newLabel> and leaves a synthetic leaf", async () => {
     const { sm, result } = await rewindFixture();
-    // The new summary entry carries the labelEnd.
+    // The new summary entry carries the newLabel.
     const summaryId = result.details.summaryId as string;
     assert.equal(sm.getLabel(summaryId), "anchor:end");
     // The leaf is the synthetic assistant, NOT the branch_summary.
@@ -1778,8 +1861,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -1808,8 +1891,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "a",
-        labelEnd: "b",
+        rewindTo: "a",
+        newLabel: "b",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -1827,8 +1910,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-2",
       {
         action: "rewind",
-        labelStart: "b",
-        labelEnd: "c",
+        rewindTo: "b",
+        newLabel: "c",
         summaryFocus: "Preserve user instructions across the second rewind.",
       },
       undefined,
@@ -1837,7 +1920,7 @@ describe("dispatch: rewind happy path", () => {
     );
     assert.equal(r2.isError, undefined);
     const sumC = r2.details.summaryId as string;
-    // Final summary carries labelEnd.
+    // Final summary carries newLabel.
     assert.equal(sm.getLabel(sumC), "anchor:c");
     // The b-summary still carries 'anchor:b'. (The b-summary isn't on the
     // active branch anymore \u2014 it's an ancestor of sumC in storage but the
@@ -1847,9 +1930,9 @@ describe("dispatch: rewind happy path", () => {
     assert.ok(bEntry, "b-summary entry still present in storage");
     // Pin label retention explicitly: the b-summary keeps its 'anchor:b'
     // label across the second rewind. Nothing in the rewind path clears
-    // labelStart's label (it's only labelEnd that gets the new write +
+    // rewindTo's label (it's only newLabel that gets the new write +
     // move-on-collision), so the prior label survives. A regression that
-    // accidentally cleared labelStart on rewind would surface here.
+    // accidentally cleared rewindTo on rewind would surface here.
     assert.equal(
       sm.getLabel(sumB),
       "anchor:b",
@@ -1868,9 +1951,9 @@ describe("dispatch: rewind happy path", () => {
     }
   });
 
-  it("labelEnd collides with an existing anchor: rewind moves the anchor to the new summary (mirrors anchor's move-on-collision)", async () => {
-    // Namespace symmetry: anchor.name and rewind.labelEnd both write into
-    // the `anchor:` namespace, so a `rewind` whose labelEnd already labels
+  it("newLabel collides with an existing anchor: rewind moves the anchor to the new summary (mirrors anchor's move-on-collision)", async () => {
+    // Namespace symmetry: anchor.name and rewind.newLabel both write into
+    // the `anchor:` namespace, so a `rewind` whose newLabel already labels
     // another entry on the *post-move active branch* must move the label
     // to the new summary — mirroring `anchor`'s write-before-clear
     // move-on-collision. Without the move, two entries on the same active
@@ -1878,7 +1961,7 @@ describe("dispatch: rewind happy path", () => {
     // uniqueness invariant.
     //
     // Setup ordering matters: the prior `anchor:b` must be on the
-    // ancestral side of `labelStart` (= tA), so that branchWithSummary
+    // ancestral side of `rewindTo` (= tA), so that branchWithSummary
     // leaves it on the *active* branch (between root and the new
     // summary), NOT on the abandoned one. We anchor 'b' on the FIRST
     // turn and 'a' on the SECOND turn:
@@ -1909,8 +1992,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "a",
-        labelEnd: "b",
+        rewindTo: "a",
+        newLabel: "b",
         summaryFocus: "Preserve the user's instruction and continue the work.",
       },
       undefined,
@@ -1924,7 +2007,7 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(
       sm.getLabel(summaryId),
       "anchor:b",
-      "new branch_summary must carry the labelEnd anchor",
+      "new branch_summary must carry the newLabel anchor",
     );
     // The prior 'b'-labeled entry lost its label — cleared by the
     // move-on-collision branch in rewind. (Only its label was cleared;
@@ -1957,8 +2040,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: focus,
       },
       undefined,
@@ -2009,8 +2092,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: focus,
       },
       undefined,
@@ -2076,8 +2159,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: fullFocus,
       },
       undefined,
@@ -2121,6 +2204,64 @@ describe("dispatch: rewind happy path", () => {
         "synthetic must store the truncated form",
       );
     }
+  });
+
+  it("synthetic args are normalized: extra caller keys never leak onto the kept chain (#43)", async () => {
+    // pi-ai's validateToolArguments passes unknown keys through (no
+    // `additionalProperties` in the schema), so the raw params object can
+    // carry extras — including old-name keys replayed by a resumed
+    // session. The synthetic assistant is re-emitted on every subsequent
+    // turn until the next rewind, so it must carry exactly the normalized
+    // new-name arguments. A regression back to spreading `p` would leak
+    // unknown keys (and retrigger this test).
+    const { sm, pi, tool, ctx } = setup();
+    setupRewindable(sm, pi, { capture: true });
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+        legacyAlias: "must-not-leak",
+        unknownKey: 42,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+
+    const leafId = sm.getLeafId();
+    assert.ok(leafId);
+    const leaf = sm.getEntry(leafId as string);
+    assert.ok(leaf && leaf.type === "message");
+    if (leaf?.type !== "message") {
+      assert.fail("expected the kept leaf to be a message entry");
+    }
+    // Unconditional role pin: without it, a regression leaving a
+    // non-assistant leaf would skip the shape assertions below and pass
+    // vacuously.
+    assert.equal(leaf.message.role, "assistant");
+    const c0 = (
+      leaf.message.content as Array<{
+        type: string;
+        arguments?: Record<string, unknown>;
+      }>
+    )[0];
+    assert.equal(c0.type, "toolCall");
+    assert.deepEqual(Object.keys(c0.arguments ?? {}).sort(), [
+      "action",
+      "newLabel",
+      "rewindTo",
+      "summaryFocus",
+    ]);
+    assert.deepEqual(c0.arguments, {
+      action: "rewind",
+      rewindTo: "start",
+      newLabel: "end",
+      summaryFocus: "Preserve user instructions and continue.",
+    });
   });
 
   it("wraps the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
@@ -2171,8 +2312,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "custom-api stream routing regression focus",
       },
       undefined,
@@ -2229,8 +2370,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "no-streamSimple fallback regression focus",
       },
       undefined,
@@ -2270,8 +2411,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "undefined-provider fallback regression focus",
       },
       undefined,
@@ -2313,8 +2454,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "throwing-provider fallback regression focus",
       },
       undefined,
@@ -2356,8 +2497,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "non-function streamSimple pin focus",
       },
       undefined,
@@ -2421,8 +2562,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "null-header stripping regression focus",
       },
       undefined,
@@ -2481,8 +2622,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "opencode session header regression focus",
       },
       undefined,
@@ -2546,8 +2687,8 @@ describe("dispatch: rewind happy path", () => {
         tc,
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "live session id header regression focus",
         },
         undefined,
@@ -2611,8 +2752,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "oauth baseUrl/env forwarding regression focus",
       },
       undefined,
@@ -2664,8 +2805,8 @@ describe("dispatch: rewind happy path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "provider-scoped retention must win over process env",
         },
         undefined,
@@ -2716,8 +2857,8 @@ describe("dispatch: rewind happy path", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "auth baseUrl must drive the session-affinity header",
       },
       undefined,
@@ -2980,7 +3121,7 @@ describe("findLabelHint", () => {
 
   it("custom_message entry: hint extracts the content text", () => {
     // findLabelHint also walks into `custom_message` entries (e.g. the
-    // pi /label command's audit entries). Pin: the text content lands
+    // `/tree` view's label entries). Pin: the text content lands
     // in the hint, no prefix.
     const sm = SessionManager.inMemory("/tmp");
     sm.appendCustomMessageEntry(
@@ -3159,7 +3300,7 @@ describe("dispatch: adversarial inputs", () => {
   it("100KB summaryFocus passes the length guard and reaches the no-such-label guard", async () => {
     // Pin behavior: no input-size cap on summaryFocus. The guard checks
     // a minimum, not a maximum. The test reaches the next guard
-    // (no labelStart on active branch) without crashing.
+    // (no rewindTo on active branch) without crashing.
     const { sm, tool, ctx } = setup();
     appendTurn(sm, "u", "a");
     const huge = "x".repeat(100_000);
@@ -3167,8 +3308,8 @@ describe("dispatch: adversarial inputs", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "missing",
-        labelEnd: "after",
+        rewindTo: "missing",
+        newLabel: "after",
         summaryFocus: huge,
       },
       undefined,
@@ -3179,9 +3320,9 @@ describe("dispatch: adversarial inputs", () => {
     assert.match(result.content[0].text, /No label 'missing'/);
   });
 
-  it("labelEnd === labelStart passes name validation; surfaces as a 'no such label' error if not pre-anchored", async () => {
+  it("newLabel === rewindTo passes name validation; surfaces as a 'no such label' error if not pre-anchored", async () => {
     // Both pass isValidName; pinning that the dispatch doesn't reject
-    // labelStart === labelEnd up front. (Without a pre-set anchor, the
+    // rewindTo === newLabel up front. (Without a pre-set anchor, the
     // label-existence guard fires.)
     const { sm, tool, ctx } = setup();
     appendTurn(sm, "u", "a");
@@ -3189,8 +3330,8 @@ describe("dispatch: adversarial inputs", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "same",
-        labelEnd: "same",
+        rewindTo: "same",
+        newLabel: "same",
         summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
       },
       undefined,
@@ -3208,8 +3349,8 @@ describe("dispatch: adversarial inputs", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -3227,8 +3368,8 @@ describe("dispatch: adversarial inputs", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -3247,7 +3388,7 @@ describe("dispatch: adversarial inputs", () => {
 /**
  * Wrap an existing `pi.setLabel` so the Nth call (1-indexed) throws. Earlier
  * calls go through to the original. Used to inject a throw on the rewind's
- * labelEnd write (the second setLabel call after the anchor write).
+ * newLabel write (the second setLabel call after the anchor write).
  */
 function throwOnNthSetLabel(pi: FakePi, n: number, err: Error): void {
   const orig = pi.pi.setLabel.bind(pi.pi);
@@ -3284,7 +3425,7 @@ function throwOnNextAppendMessage(sm: SessionManager, err: Error): () => void {
 }
 
 describe("dispatch: rewind salvage path", () => {
-  it("setLabel(labelEnd) throws \u2192 synthetic still appended; original error wraps salvage detail", async () => {
+  it("setLabel(newLabel) throws \u2192 synthetic still appended; original error wraps salvage detail", async () => {
     const { sm, pi, tool, ctx } = setup();
     const { fake } = setupRewindable(sm, pi, {
       capture: true,
@@ -3294,7 +3435,7 @@ describe("dispatch: rewind salvage path", () => {
     if (!fake) throw new Error("capture: true must return fake");
 
     // We patch AFTER the anchor write above, so the patch counter starts
-    // at 0. The first patched call is the rewind's labelEnd write; the
+    // at 0. The first patched call is the rewind's newLabel write; the
     // second is the salvage retry. Throw on every call so BOTH the
     // original write and the retry fail, surfacing the salvage detail in
     // the wrapped error.
@@ -3315,8 +3456,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "Preserve user instructions and continue.",
         },
         undefined,
@@ -3331,7 +3472,7 @@ describe("dispatch: rewind salvage path", () => {
     assert.match(msg, /setLabel boom #1/);
     // Salvage detail wraps the original: the retry
     // (#2) ALSO threw, so the salvage-failure clause is appended.
-    assert.match(msg, /salvage:.*labelEnd retry failed/);
+    assert.match(msg, /salvage:.*newLabel retry failed/);
     // Error.cause carries the original throw verbatim so post-mortem
     // readers walking the cause chain (or callers doing
     // `err.cause instanceof TypeError`-style checks) can recover the
@@ -3372,7 +3513,7 @@ describe("dispatch: rewind salvage path", () => {
     const { sm, pi, tool, ctx } = setup();
     setupRewindable(sm, pi);
 
-    // Throw on call #1 (original labelEnd write). The salvage retry runs
+    // Throw on call #1 (original newLabel write). The salvage retry runs
     // as call #2 and succeeds, so no salvage detail in the wrapped error.
     throwOnNthSetLabel(pi, 1, new Error("transient setLabel boom"));
 
@@ -3382,8 +3523,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "Preserve user instructions and continue.",
         },
         undefined,
@@ -3415,7 +3556,7 @@ describe("dispatch: rewind salvage path", () => {
         assert.match(thrown.cause.message, /transient setLabel boom/);
       }
     }
-    // labelEnd was eventually written, so a chained rewind could find it.
+    // newLabel was eventually written, so a chained rewind could find it.
     const summaryLabel = "anchor:end";
     let foundLabelEnd = false;
     for (const e of sm.getBranch()) {
@@ -3424,7 +3565,7 @@ describe("dispatch: rewind salvage path", () => {
         break;
       }
     }
-    assert.equal(foundLabelEnd, true, "labelEnd retry should have written");
+    assert.equal(foundLabelEnd, true, "newLabel retry should have written");
     // Synthetic's `usage.totalTokens === 0` regardless of retry outcome:
     // the salvage path can't safely run estimateActiveBranchTokens
     // post-throw (the SM may be in an unknown state), so the synthetic
@@ -3479,8 +3620,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "Preserve user instructions and continue.",
         },
         undefined,
@@ -3536,7 +3677,7 @@ describe("dispatch: rewind salvage path", () => {
         "salvage synthetic must use totalTokens=0 after estimate throw",
       );
     }
-    // labelEnd write succeeded BEFORE the estimate threw — so a chained
+    // newLabel write succeeded BEFORE the estimate threw — so a chained
     // rewind could still find it. Pin: walking the active branch finds
     // an entry with `anchor:end`. A regression that moves the label
     // write inside the throwing closure (or aborts the salvage label
@@ -3551,7 +3692,7 @@ describe("dispatch: rewind salvage path", () => {
     assert.equal(
       foundLabelEnd,
       true,
-      "labelEnd should have landed before estimate threw",
+      "newLabel should have landed before estimate threw",
     );
   });
 
@@ -3576,8 +3717,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "Preserve user instructions and continue.",
         },
         undefined,
@@ -3597,8 +3738,8 @@ describe("dispatch: rewind salvage path", () => {
     assert.equal(msg, "appendMessage boom");
   });
 
-  it("findLabeledEntry(labelEnd) throws → synthetic still appended; original error propagates", async () => {
-    // The labelEnd-collision lookup runs inside the salvage try as the
+  it("findLabeledEntry(newLabel) throws → synthetic still appended; original error propagates", async () => {
+    // The newLabel-collision lookup runs inside the salvage try as the
     // first step. If it throws (e.g. malformed branch traversal),
     // setLabel cannot run — but the synthetic append still must, so
     // pi's appended tool_result has a matching tool_use on the new
@@ -3613,9 +3754,9 @@ describe("dispatch: rewind salvage path", () => {
 
     // Trip `getBranch` ONLY after a `branch_summary` entry exists on
     // the active branch — i.e. after `sm.branchWithSummary` ran. The
-    // labelEnd-collision lookup (`findLabeledEntry(sm, fullLabelEnd)`)
+    // newLabel-collision lookup (`findLabeledEntry(sm, fullLabelEnd)`)
     // is the first call past that point in the rewind handler. The
-    // labelStart lookup, beforeTokens, and collectEntriesForBranchSummary
+    // rewindTo lookup, beforeTokens, and collectEntriesForBranchSummary
     // all run BEFORE the move and thus before the trip is armed.
     const origGetBranch = sm.getBranch.bind(sm);
     let thrown: unknown;
@@ -3632,8 +3773,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "start",
-          labelEnd: "end",
+          rewindTo: "start",
+          newLabel: "end",
           summaryFocus: "Preserve user instructions and continue.",
         },
         undefined,
@@ -3654,7 +3795,7 @@ describe("dispatch: rewind salvage path", () => {
     // setLabel-retry path).
     assert.match(msg, /getBranch boom/);
     assert.ok(
-      !/salvage:.*labelEnd retry failed/.test(msg),
+      !/salvage:.*newLabel retry failed/.test(msg),
       "lookup-throw must not trigger the setLabel-retry diagnostic",
     );
 
@@ -3676,10 +3817,10 @@ describe("dispatch: rewind salvage path", () => {
     }
   });
 
-  it("prior-clear (clearPrior) throws once → retry succeeds; new labelEnd lives, prior label is cleared, no salvage detail", async () => {
+  it("prior-clear (clearPrior) throws once → retry succeeds; the new `newLabel` label lives, prior label is cleared, no salvage detail", async () => {
     // The move-on-collision pair is two distinct setLabel calls.
-    // (A) writes the new labelEnd onto the summary; (B) clears the
-    // prior entry's labelEnd. If (A) succeeds and (B) throws, the
+    // (A) writes the new label (`newLabel`) onto the summary; (B) clears the
+    // prior entry's newLabel. If (A) succeeds and (B) throws, the
     // salvage retry must re-run (B) — not (A) — so the duplicate-label
     // state doesn't survive. Discriminator is `failedStep` (`setLabelEnd`
     // vs `clearPrior`); without the split, the retry would re-run the
@@ -3700,7 +3841,7 @@ describe("dispatch: rewind salvage path", () => {
     appendTurn(sm, "u4", "a4", 28_000);
 
     // Patch AFTER the pre-anchor writes so the counter starts at 0.
-    // Call #1 inside execute = (A) the new labelEnd write; call #2 = (B)
+    // Call #1 inside execute = (A) the new `newLabel` write; call #2 = (B)
     // the prior-clear (throws once); call #3 = the salvage retry of (B)
     // (succeeds).
     throwOnNthSetLabel(pi, 2, new Error("transient prior-clear boom"));
@@ -3711,8 +3852,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "a",
-          labelEnd: "b",
+          rewindTo: "a",
+          newLabel: "b",
           summaryFocus:
             "Preserve the user's instruction and continue the work.",
         },
@@ -3784,11 +3925,11 @@ describe("dispatch: rewind salvage path", () => {
     }
   });
 
-  it("prior-clear (clearPrior) throws on every call → salvage detail surfaces 'prior-clear retry failed'; new labelEnd still lives", async () => {
+  it("prior-clear (clearPrior) throws on every call → salvage detail surfaces 'prior-clear retry failed'; the new `newLabel` label still lives", async () => {
     // Sister test to the retry-succeeds case above: when BOTH the
     // original (B) prior-clear AND the salvage retry of (B) throw,
     // the wrapped error must surface a salvage detail that names the
-    // prior-clear (NOT "labelEnd retry failed" — that diagnostic is
+    // prior-clear (NOT "newLabel retry failed" — that diagnostic is
     // for the (A) failure mode and would be misleading here). This
     // pins the salvage-detail prose introduced by the failedStep
     // split: a regression that re-conflated the discriminants would
@@ -3821,8 +3962,8 @@ describe("dispatch: rewind salvage path", () => {
         "tc-rewind",
         {
           action: "rewind",
-          labelStart: "a",
-          labelEnd: "b",
+          rewindTo: "a",
+          newLabel: "b",
           summaryFocus:
             "Preserve the user's instruction and continue the work.",
         },
@@ -3837,13 +3978,13 @@ describe("dispatch: rewind salvage path", () => {
     const msg = thrown instanceof Error ? thrown.message : String(thrown);
     // Original (B) error propagates verbatim as the base.
     assert.match(msg, /prior-clear boom #2/);
-    // Salvage detail names the prior-clear, NOT the labelEnd retry.
+    // Salvage detail names the prior-clear, NOT the newLabel retry.
     // Tight on both sides: the correct diagnostic must be present, and
-    // the wrong (labelEnd-retry) diagnostic must NOT be present.
+    // the wrong (newLabel-retry) diagnostic must NOT be present.
     assert.match(msg, /salvage:.*prior-clear retry failed/);
     assert.ok(
-      !/labelEnd retry failed/.test(msg),
-      `prior-clear failure must not surface a labelEnd-retry diagnostic; got: ${msg}`,
+      !/newLabel retry failed/.test(msg),
+      `prior-clear failure must not surface a newLabel-retry diagnostic; got: ${msg}`,
     );
     // Three setLabel calls fired: (A), original (B), retry of (B).
     assert.equal(
@@ -3897,12 +4038,12 @@ describe("dispatch: rewind salvage path", () => {
 // =============================================================================
 
 describe("dispatch: rewind error branches", () => {
-  it("'Already at <labelStart>' fires when the labelStart anchor is on the leaf", async () => {
+  it("'Already at <rewindTo>' fires when the rewindTo anchor is on the leaf", async () => {
     // setLabel itself advances the leaf (it appends a label-type entry as
     // child of the prior leaf), so anchoring then driving rewind doesn't
     // naturally hit `oldLeaf === target`. Reset the leaf back to the
     // labeled assistant via `sm.branch(...)` so the guard fires. This is
-    // the contract the message pins ("Already at <labelStart>"); the
+    // the contract the message pins ("Already at <rewindTo>"); the
     // path-construction is test-internal.
     const { sm, pi, tool, ctx } = setup();
     const t1 = appendTurn(sm, "u1", "a1", 100);
@@ -3912,8 +4053,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "here",
-        labelEnd: "after",
+        rewindTo: "here",
+        newLabel: "after",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -3941,8 +4082,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -3968,8 +4109,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -3994,8 +4135,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4025,8 +4166,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "a",
-        labelEnd: "b",
+        rewindTo: "a",
+        newLabel: "b",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4042,8 +4183,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-2",
       {
         action: "rewind",
-        labelStart: "b",
-        labelEnd: "c",
+        rewindTo: "b",
+        newLabel: "c",
         summaryFocus: "Preserve user instructions across the second rewind.",
       },
       undefined,
@@ -4129,8 +4270,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "b",
-        labelEnd: "c",
+        rewindTo: "b",
+        newLabel: "c",
         summaryFocus:
           "Preserve user instructions and continue past the real navigate_tree call.",
       },
@@ -4211,8 +4352,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "b",
-        labelEnd: "c",
+        rewindTo: "b",
+        newLabel: "c",
         summaryFocus:
           "Preserve user instructions and continue past the text-only intervening assistant.",
       },
@@ -4301,8 +4442,8 @@ describe("dispatch: rewind error branches", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "b",
-        labelEnd: "c",
+        rewindTo: "b",
+        newLabel: "c",
         summaryFocus:
           "Preserve user instructions and continue past the non-navigate_tree intervening toolCall.",
       },
@@ -4357,7 +4498,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     return { stub, count: () => calls };
   }
 
-  /** No labelEnd may survive a rejected rewind — the label isn't consumed. */
+  /** No newLabel may survive a rejected rewind — the label isn't consumed. */
   function assertLabelAbsent(sm: SessionManager, label: string): void {
     for (const e of sm.getBranch()) {
       assert.notEqual(sm.getLabel(e.id), label);
@@ -4382,8 +4523,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       "tc-floor-a",
       {
         action: "rewind",
-        labelStart: "impl-start",
-        labelEnd: "done",
+        rewindTo: "impl-start",
+        newLabel: "done",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4396,8 +4537,11 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.ok(typeof r.details.apparentSavings === "number");
     const text = r.content[0].text;
     assert.match(text, /would free only/);
+    // Movement-order copy (#43): rewind TO the anchor, collapsed AS the new
+    // label. An arrow reading `'impl-start' → 'done'` inverts the operation.
+    assert.match(text, /Rewinding to 'impl-start' \(as 'done'\)/);
     // Variant A guidance + the full chronological anchor list, including
-    // labelStart itself.
+    // rewindTo itself.
     assert.match(text, /Rewind further back to actually free context/);
     assert.match(text, /'kickoff'/);
     assert.match(text, /'impl-start'/);
@@ -4406,7 +4550,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       !text.includes(String(MIN_REWIND_SAVINGS_TOKENS)),
       "rejection copy must not print the floor value",
     );
-    // Zero summarizer calls; labelEnd not consumed; tree untouched.
+    // Zero summarizer calls; newLabel not consumed; tree untouched.
     assert.equal(count(), 0);
     assertLabelAbsent(sm, "anchor:done");
     assert.deepEqual(
@@ -4428,8 +4572,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       "tc-floor-b",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "done",
+        rewindTo: "start",
+        newLabel: "done",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4463,8 +4607,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       "tc-floor-bpin",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4473,7 +4617,10 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     );
 
     assert.equal(r.isError, undefined);
-    assert.match(r.content[0].text, /\[rewind 'start' \u2192 'end'\]/);
+    assert.match(
+      r.content[0].text,
+      /\[rewind to 'start' · collapsed as 'end'\]/,
+    );
     // Apparent savings = contextBefore − anchor-time total (6_000).
     const before = r.details.contextBefore as number;
     assert.ok(
@@ -4498,8 +4645,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "a",
-        labelEnd: "b",
+        rewindTo: "a",
+        newLabel: "b",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4514,8 +4661,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       "tc-2",
       {
         action: "rewind",
-        labelStart: "b",
-        labelEnd: "c",
+        rewindTo: "b",
+        newLabel: "c",
         summaryFocus: "Preserve user instructions across the second rewind.",
       },
       undefined,
@@ -4549,8 +4696,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     }
     const rewindArgs = {
       action: "rewind",
-      labelStart: "start",
-      labelEnd: "end",
+      rewindTo: "start",
+      newLabel: "end",
       summaryFocus: "Preserve user instructions and continue.",
     } as const;
 
@@ -4603,8 +4750,8 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       "tc-order",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "done",
+        rewindTo: "start",
+        newLabel: "done",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4704,8 +4851,8 @@ describe("dispatch: rewind beforeTokens fallback", () => {
       "tc-1",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -4949,8 +5096,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus:
           "Preserve the latest instruction, note done work, list what remains.",
       },
@@ -5032,8 +5179,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5070,8 +5217,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5103,8 +5250,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5132,8 +5279,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5161,8 +5308,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5215,8 +5362,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5264,8 +5411,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve the raw branch evidence and continue.",
       },
       undefined,
@@ -5320,8 +5467,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve the live evidence and continue.",
       },
       undefined,
@@ -5359,8 +5506,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve the live evidence and continue.",
       },
       undefined,
@@ -5402,8 +5549,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve the raw branch evidence and continue.",
       },
       undefined,
@@ -5442,8 +5589,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5473,8 +5620,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5516,8 +5663,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5550,8 +5697,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5588,8 +5735,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
@@ -5623,8 +5770,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       "tc-rewind",
       {
         action: "rewind",
-        labelStart: "start",
-        labelEnd: "end",
+        rewindTo: "start",
+        newLabel: "end",
         summaryFocus: "Preserve user instructions and continue.",
       },
       undefined,
