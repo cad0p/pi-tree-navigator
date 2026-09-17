@@ -13,6 +13,10 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* Rename params labelStart/labelEnd to rewindTo/newLabel (closes #43)
 - *(rewind)* Context-pressure rewind hint (config-gated, default off) (closes #44) (closes #42)
 
+### 🐛 Bug Fixes
+
+- *(hint)* Guard the rewind-hint fallback + hoist LABEL_PREFIX + TUI-proof docs rule (closes #48)
+
 
 ## [0.2.0] - 2026-09-15
 
