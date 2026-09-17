@@ -37,6 +37,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import {
   type AgentTool,
   estimateContextTokens,
@@ -46,9 +47,11 @@ import {
 import {
   AgentSession,
   buildSessionContext,
+  CONFIG_DIR_NAME,
   collectEntriesForBranchSummary,
   type ExtensionAPI,
   generateBranchSummary,
+  getAgentDir,
   keyHint,
   type ModelRegistry,
   type SessionEntry,
@@ -67,6 +70,10 @@ import {
   resolveSummaryCacheRetention,
 } from "./cache-summary.ts";
 import {
+  loadTreeNavigatorConfig,
+  TREE_NAVIGATOR_CONFIG_FILENAME,
+} from "./config.ts";
+import {
   extractTextContent,
   formatContextDelta,
   formatPct1,
@@ -74,11 +81,18 @@ import {
   isValidName,
   MAX_NAME_LENGTH,
   stripBranchSummaryBoilerplate,
+  TOOL_NAME,
   toOneLine,
 } from "./helpers.ts";
+import {
+  buildNoAnchorText,
+  buildRewindHintText,
+  collectAnchorNames,
+  REWIND_HINT_CUSTOM_TYPE,
+  RewindHintTracker,
+} from "./rewind-hint.ts";
 
 const LABEL_PREFIX = "anchor:";
-const TOOL_NAME = "navigate_tree";
 
 /**
  * Always-on anchor mandate appended to the system prompt on every agent
@@ -698,6 +712,50 @@ export default function (
   const summarize = opts?.summarize ?? generateBranchSummary;
   patchAgentSessionPrototype();
 
+  // Rewind-hint closure state (#44): fresh per factory invocation and reset
+  // on every `session_start`, so `/new` / `/resume` / `/reload` sessions
+  // never inherit a spent crossing or another session's config. `toolActive`
+  // fails open until `before_agent_start` says otherwise.
+  let toolActive = true;
+  let rewindHintAtPercent: number | null = null;
+  let hintTracker = new RewindHintTracker();
+
+  // Rewind-hint config (#44): load once per session start. Every ctx getter
+  // is read BEFORE the first await — `ctx.ui` / `isProjectTrusted` / `cwd` /
+  // `hasUI` assert against the live session (pi-steering precedent), and
+  // `loadTreeNavigatorConfig` is async.
+  pi.on("session_start", async (_event, ctx) => {
+    const cwd = ctx.cwd;
+    const projectTrusted = ctx.isProjectTrusted();
+    const hasUI = ctx.hasUI;
+    const ui = ctx.ui;
+    rewindHintAtPercent = null;
+    hintTracker = new RewindHintTracker();
+    toolActive = true;
+    let threshold: number | null = null;
+    let warnings: string[] = [];
+    try {
+      const loaded = await loadTreeNavigatorConfig({
+        agentDir: getAgentDir(),
+        projectPath: join(cwd, CONFIG_DIR_NAME, TREE_NAVIGATOR_CONFIG_FILENAME),
+        projectTrusted,
+      });
+      threshold = loaded.config.rewindHintAtPercent;
+      warnings = loaded.warnings;
+    } catch {
+      // The loader is fail-closed and should never throw; this guard exists
+      // so a loader bug can never break session start. Silent: every loader
+      // failure already carries a user-facing warning, and a new string here
+      // would only fire on an unreachable path.
+      threshold = null;
+      warnings = [];
+    }
+    rewindHintAtPercent = threshold;
+    if (hasUI) {
+      for (const warning of warnings) ui.notify(warning, "warning");
+    }
+  });
+
   // Public context event: replace the wire messages with the session-tree
   // projection before every LLM call. This is the public-API replacement for
   // the deleted `agent.prepareNextTurnWithContext` per-turn refresh — it
@@ -714,9 +772,12 @@ export default function (
   // re-applied on every prompt instead of living in the conversation. Skip
   // only when the tool is verifiably absent from the active set; fail-open
   // when `selectedTools` is undefined (this extension always registers it).
+  // The same check gates the rewind hint (#44): an inactive tool must not
+  // fire `turn_end` nudges the model can't act on.
   pi.on("before_agent_start", async (event) => {
     const selected = event.systemPromptOptions?.selectedTools;
-    if (Array.isArray(selected) && !selected.includes(TOOL_NAME)) return {};
+    toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
+    if (!toolActive) return {};
     return { systemPrompt: `${event.systemPrompt}\n\n${ANCHOR_MANDATE}` };
   });
 
@@ -734,6 +795,65 @@ export default function (
     return details?.refusal === true ? { isError: true } : undefined;
   });
 
+  // Rewind hint (#44): one check per turn, after the turn's tool results and
+  // before the agent loop's steering drain — so a `pi.sendMessage` from this
+  // handler is delivered in the same run. Synchronous by design: no await
+  // before any ctx use. Fires once per threshold crossing; see
+  // `RewindHintTracker` for the re-arm semantics.
+  pi.on("turn_end", (_event, ctx) => {
+    if (!toolActive || rewindHintAtPercent === null) return;
+    const usage = ctx.getContextUsage();
+    // `percent == null` is pi's post-compaction state (unknown tokens), and
+    // `contextWindow <= 0` has no meaningful bar to compare against. Both
+    // are no-ops that leave the crossing unspent.
+    if (!usage || usage.percent == null || usage.contextWindow <= 0) return;
+    if (usage.percent < rewindHintAtPercent) {
+      // Below the bar: re-arm only.
+      hintTracker.observe(usage.percent, rewindHintAtPercent);
+      return;
+    }
+    // Collect anchors BEFORE marking the crossing spent: a throwing
+    // `getBranch` / `getLabel` must leave the crossing unspent so the next
+    // turn can retry — never burn the one shot on a failed state read.
+    let anchorNames: string[];
+    try {
+      anchorNames = collectAnchorNames(ctx.sessionManager);
+    } catch {
+      return;
+    }
+    if (!hintTracker.observe(usage.percent, rewindHintAtPercent)) return;
+    if (anchorNames.length > 0) {
+      const text = buildRewindHintText(usage.percent, usage.contextWindow);
+      try {
+        // Pinned delivery semantics — do not "improve": NO options bag
+        // (never `triggerTurn`, never `sendUserMessage`). Streaming → the
+        // loop steers and reacts once in the same run; idle → a plain
+        // append, no turn started (the user-confirmation property is
+        // intentional).
+        pi.sendMessage({
+          customType: REWIND_HINT_CUSTOM_TYPE,
+          content: text,
+          display: true,
+        });
+      } catch {
+        // Only a synchronous stale-runtime throw (`assertActive`) is
+        // catchable here; async delivery failures go to pi's own
+        // send_message error channel. The direct append is safe in this
+        // extension because the `context` handler rebuilds wire messages
+        // from the session tree — the text still reaches the next LLM call;
+        // only the live TUI render is deferred.
+        (
+          ctx.sessionManager as Partial<SessionManager>
+        ).appendCustomMessageEntry?.(REWIND_HINT_CUSTOM_TYPE, text, true);
+      }
+    } else if (ctx.hasUI) {
+      ctx.ui.notify(
+        buildNoAnchorText(usage.percent, usage.contextWindow),
+        "warning",
+      );
+    }
+  });
+
   pi.registerTool({
     name: TOOL_NAME,
     label: "Navigate Tree",
@@ -742,6 +862,8 @@ export default function (
     executionMode: "sequential",
     promptGuidelines: [
       `${TOOL_NAME}: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.`,
+      `${TOOL_NAME}: persist durable findings to files before rewinding — the summary replaces the collapsed work, so anything unwritten is lost.`,
+      `${TOOL_NAME}: don't rewind while a user decision or unresolved question is pending — ask the user instead.`,
     ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
 \`rewind\` does not restore prior state: it forks a sibling branch from the anchor and continues forward from a model-generated summary.

@@ -9,7 +9,8 @@
  */
 
 // ---------------------------------------------------------------------------
-// Exported boundary constants below (MAX_NAME_LENGTH, MAX_BOILERPLATE_LEAD_IN).
+// Exported boundary constants below (TOOL_NAME, MAX_NAME_LENGTH,
+// MAX_BOILERPLATE_LEAD_IN).
 //
 // Stability: these are internal tunables. Exported only so the test suite
 // can pin boundary cases by constant rather than literal. Re-tuning is
@@ -17,6 +18,11 @@
 // should rely on the registered `navigate_tree` tool surface, not import
 // these constants directly.
 // ---------------------------------------------------------------------------
+
+// The registered tool name. Lives here (not index.ts) so the tool definition
+// and the rewind-hint copy builders import the same string — a rename can't
+// desync the `[navigate_tree hint]` copy from the tool the model calls.
+export const TOOL_NAME = "navigate_tree";
 
 // Hard cap on label-name length. 40 chars accommodates descriptive names
 // (e.g. 'parser-edge-case-investigation', 31 chars) while keeping list

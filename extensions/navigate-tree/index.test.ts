@@ -20,15 +20,21 @@
  */
 
 import * as assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, before, describe, it } from "node:test";
 import {
   type AgentSession,
+  CONFIG_DIR_NAME,
+  type ContextUsage,
   type ExtensionAPI,
   generateBranchSummary,
   initTheme,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { MAX_NAME_LENGTH } from "./helpers.ts";
+import { TREE_NAVIGATOR_CONFIG_FILENAME } from "./config.ts";
+import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTree, {
   __testHooks,
   ANCHOR_MANDATE,
@@ -38,6 +44,11 @@ import navigateTree, {
   MIN_REWIND_SAVINGS_TOKENS,
   MIN_SUMMARY_FOCUS_LENGTH,
 } from "./index.ts";
+import {
+  buildNoAnchorText,
+  buildRewindHintText,
+  REWIND_HINT_CUSTOM_TYPE,
+} from "./rewind-hint.ts";
 
 afterEach(() => {
   __testHooks.resetPrototype();
@@ -72,6 +83,13 @@ interface FakePi {
   registered: CapturedTool[];
   /** Captured `on(event, handler)` registrations, keyed by event name. */
   onCalls: Map<string, Array<(e: never, c: never) => unknown>>;
+  /**
+   * Raw argument arrays for every `sendMessage` call. Storing the full args
+   * (not just the message object) is deliberate: the rewind hint's pinned
+   * contract is a ONE-argument call, so tests must be able to distinguish
+   * `sendMessage(msg)` from `sendMessage(msg, {})`.
+   */
+  sendMessageCalls: unknown[][];
 }
 
 /**
@@ -85,6 +103,7 @@ function makeFakePi(sm: SessionManager): FakePi {
   const setLabelCalls: Array<[string, string | undefined]> = [];
   const registered: CapturedTool[] = [];
   const onCalls = new Map<string, Array<(e: never, c: never) => unknown>>();
+  const sendMessageCalls: unknown[][] = [];
   const pi = {
     registerTool(tool: CapturedTool) {
       registered.push(tool);
@@ -101,12 +120,15 @@ function makeFakePi(sm: SessionManager): FakePi {
       list.push(handler);
       onCalls.set(event, list);
     },
+    sendMessage(...args: unknown[]) {
+      sendMessageCalls.push(args);
+    },
     // Public since pi 0.81.0; the cache request mirrors it as `reasoning`.
     getThinkingLevel() {
       return "medium";
     },
   } as unknown as ExtensionAPI;
-  return { pi, setLabelCalls, registered, onCalls };
+  return { pi, setLabelCalls, registered, onCalls, sendMessageCalls };
 }
 
 interface FakeCtx {
@@ -131,6 +153,21 @@ interface FakeCtx {
   };
   /** Public system-prompt accessor (0.81+); override per test as needed. */
   getSystemPrompt(): string;
+  /** UI availability as pi exposes it on the extension ctx. */
+  hasUI: boolean;
+  /** Current working directory (session_start derives the project config path). */
+  cwd: string;
+  /** Project-trust flag for the project config layer. */
+  isProjectTrusted(): boolean;
+  /** Captured `ui.notify` calls as `[message, type]`. */
+  notifyCalls: Array<[string, "info" | "warning" | "error" | undefined]>;
+  ui: {
+    notify(message: string, type?: "info" | "warning" | "error"): void;
+  };
+  /** Context-usage probe (same shape as pi's `ctx.getContextUsage()`). */
+  getContextUsage(): ContextUsage | undefined;
+  /** Test-only setter driving `getContextUsage`. */
+  setContextUsage(usage: ContextUsage | undefined): void;
 }
 
 function makeCtx(
@@ -139,6 +176,10 @@ function makeCtx(
     contextWindow?: number;
     noModel?: boolean;
     authError?: string;
+    hasUI?: boolean;
+    cwd?: string;
+    projectTrusted?: boolean;
+    contextUsage?: ContextUsage;
   } = {},
 ): FakeCtx {
   const model = opts.noModel
@@ -149,10 +190,26 @@ function makeCtx(
         id: "claude-sonnet-4-5",
         contextWindow: opts.contextWindow ?? 1_000_000,
       };
+  let usage = opts.contextUsage;
+  const notifyCalls: Array<[string, "info" | "warning" | "error" | undefined]> =
+    [];
   return {
     sessionManager: sm,
     model,
     getSystemPrompt: () => "LIVE SYSTEM PROMPT",
+    hasUI: opts.hasUI ?? true,
+    cwd: opts.cwd ?? "/tmp",
+    isProjectTrusted: () => opts.projectTrusted ?? false,
+    notifyCalls,
+    ui: {
+      notify(message: string, type?: "info" | "warning" | "error") {
+        notifyCalls.push([message, type]);
+      },
+    },
+    getContextUsage: () => usage,
+    setContextUsage(next: ContextUsage | undefined) {
+      usage = next;
+    },
     modelRegistry: {
       async getApiKeyAndHeaders(_m: unknown) {
         if (opts.authError) return { ok: false, error: opts.authError };
@@ -4794,20 +4851,33 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.ok(text.includes(`≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus`));
   });
 
-  it("registers promptGuidelines steering agents toward earliest-useful rewinds", () => {
+  it("registers the three rewind-hygiene promptGuidelines byte-exactly and in order", () => {
+    // Exact array length + per-element byte equality + order (the 2026-09-13
+    // reflection's Lesson 3: `includes`-only pins pass under reordering).
+    // These bullets are static and NOT config-gated — `registerTool` fixes
+    // the array at registration, so every active-tool session carries them
+    // (and pays the one-time prompt-cache prefix invalidation on upgrade).
     const { tool } = setup();
     const guidelines = tool.promptGuidelines as string[] | undefined;
     assert.ok(Array.isArray(guidelines), "promptGuidelines must be registered");
+    const expected = [
+      "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
+      "navigate_tree: persist durable findings to files before rewinding — the summary replaces the collapsed work, so anything unwritten is lost.",
+      "navigate_tree: don't rewind while a user decision or unresolved question is pending — ask the user instead.",
+    ];
     assert.equal(
       guidelines?.length,
-      1,
-      `promptGuidelines must carry exactly one bullet; got: ${guidelines?.length}`,
+      expected.length,
+      `promptGuidelines must carry exactly ${expected.length} bullets; got: ${guidelines?.length}`,
     );
-    assert.equal(
-      guidelines?.[0],
-      "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
-      `guidelines[0] must be the byte-exact earliest-useful-rewind bullet; got: ${guidelines?.[0]}`,
-    );
+    assert.deepEqual(guidelines, expected);
+    for (let i = 0; i < expected.length; i++) {
+      assert.equal(
+        guidelines?.[i],
+        expected[i],
+        `guidelines[${i}] must be byte-exact; got: ${guidelines?.[i]}`,
+      );
+    }
   });
 });
 
@@ -5892,5 +5962,583 @@ describe("dispatch: cache-notice transcript rendering (#33)", () => {
       true,
     );
     assert.match(out, /body\n\s*\n\s*Cache miss: 5k tokens re-billed/);
+  });
+});
+
+// =============================================================================
+// Rewind-hint integration (#44)
+//
+// The factory's hint state is closure-scoped: `session_start` is the only
+// writer, so these tests drive the real handler against a temp
+// `PI_CODING_AGENT_DIR` fixture (real loader, real fs) and then invoke the
+// captured synchronous `turn_end` handler. No LLM and no session file —
+// `SessionManager` stays in-memory, and the temp fixture is removed in a
+// `finally` so nothing leaks between tests or into the user's real agent dir.
+// =============================================================================
+
+interface ConfigFixture {
+  root: string;
+  agentDir: string;
+  projectDir: string;
+}
+
+function makeConfigFixture(): ConfigFixture {
+  const root = mkdtempSync(join(tmpdir(), "navigate-tree-hint-"));
+  const agentDir = join(root, "agent");
+  const projectDir = join(root, "project");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(projectDir, { recursive: true });
+  return { root, agentDir, projectDir };
+}
+
+function cleanupConfigFixture(fixture: ConfigFixture): void {
+  rmSync(fixture.root, { recursive: true, force: true });
+}
+
+function writeGlobalConfig(fixture: ConfigFixture, raw: string): void {
+  writeFileSync(join(fixture.agentDir, TREE_NAVIGATOR_CONFIG_FILENAME), raw);
+}
+
+function writeProjectConfig(fixture: ConfigFixture, raw: string): void {
+  const dir = join(fixture.projectDir, CONFIG_DIR_NAME);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, TREE_NAVIGATOR_CONFIG_FILENAME), raw);
+}
+
+function globalConfigPath(fixture: ConfigFixture): string {
+  return join(fixture.agentDir, TREE_NAVIGATOR_CONFIG_FILENAME);
+}
+
+function projectConfigPath(fixture: ConfigFixture): string {
+  return join(
+    fixture.projectDir,
+    CONFIG_DIR_NAME,
+    TREE_NAVIGATOR_CONFIG_FILENAME,
+  );
+}
+
+/** Context-usage shape at `percent` of `contextWindow`. */
+function usageAt(percent: number, contextWindow = 1_000_000): ContextUsage {
+  return {
+    tokens: Math.round((percent / 100) * contextWindow),
+    contextWindow,
+    percent,
+  };
+}
+
+/**
+ * Drive the captured `session_start` handler with `PI_CODING_AGENT_DIR`
+ * pointed at the fixture's agent dir (the loader reads the real fs). The env
+ * var is always restored, so the suite never touches the user's real config.
+ */
+async function runSessionStart(
+  pi: FakePi,
+  ctx: FakeCtx,
+  fixture: ConfigFixture,
+): Promise<void> {
+  const handlers = pi.onCalls.get("session_start");
+  assert.ok(handlers, "factory must register a session_start handler");
+  assert.equal(handlers.length, 1);
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
+  try {
+    await handlers[0](
+      { type: "session_start", reason: "startup" } as never,
+      ctx as never,
+    );
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  }
+}
+
+/** Fire the captured synchronous `turn_end` handler. */
+function fireTurnEnd(pi: FakePi, ctx: FakeCtx): void {
+  const handlers = pi.onCalls.get("turn_end");
+  assert.ok(handlers, "factory must register a turn_end handler");
+  assert.equal(handlers.length, 1);
+  handlers[0]({ type: "turn_end" } as never, ctx as never);
+}
+
+/** Drive the `before_agent_start` handler to (re)compute the tool gate. */
+async function fireBeforeAgentStart(
+  pi: FakePi,
+  selectedTools: string[] | undefined,
+): Promise<void> {
+  const handlers = pi.onCalls.get("before_agent_start");
+  assert.ok(handlers, "factory must register a before_agent_start handler");
+  assert.equal(handlers.length, 1);
+  await handlers[0](
+    {
+      type: "before_agent_start",
+      prompt: "p",
+      systemPrompt: "BASE",
+      systemPromptOptions: selectedTools === undefined ? {} : { selectedTools },
+    } as never,
+    {} as never,
+  );
+}
+
+/** Label the current leaf `anchor:start` so the hint path has an anchor. */
+function anchorStart(sm: SessionManager, pi: FakePi): void {
+  const t = appendTurn(sm, "u-anchor", "a-anchor");
+  pi.pi.setLabel(t.assistantId, "anchor:start");
+}
+
+describe("rewind hint: session_start config wiring (#44)", () => {
+  it("loads the global threshold and fires on the first crossing", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [], "valid config must not warn");
+
+      ctx.setContextUsage(usageAt(89.9));
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        0,
+        "below-threshold observation must not fire",
+      );
+
+      ctx.setContextUsage(usageAt(90));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      // Real call arity: exactly one argument (no options bag).
+      assert.equal(pi.sendMessageCalls[0].length, 1);
+      assert.deepEqual(pi.sendMessageCalls[0], [
+        {
+          customType: REWIND_HINT_CUSTOM_TYPE,
+          content: buildRewindHintText(90, 1_000_000),
+          display: true,
+        },
+      ]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("project layer overrides global when trusted; untrusted ignores the file", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeProjectConfig(fixture, JSON.stringify({ rewindHintAtPercent: 50 }));
+
+      // Trusted: the project's 50 wins over the global 90.
+      {
+        const { sm, pi, ctx } = setup();
+        anchorStart(sm, pi);
+        ctx.cwd = fixture.projectDir;
+        ctx.isProjectTrusted = () => true;
+        await runSessionStart(pi, ctx, fixture);
+        ctx.setContextUsage(usageAt(50));
+        fireTurnEnd(pi, ctx);
+        assert.equal(pi.sendMessageCalls.length, 1);
+        assert.deepEqual(ctx.notifyCalls, []);
+      }
+
+      // Untrusted: the project file is ignored silently; 50 does not fire,
+      // 90 does.
+      {
+        const { sm, pi, ctx } = setup();
+        anchorStart(sm, pi);
+        ctx.cwd = fixture.projectDir;
+        await runSessionStart(pi, ctx, fixture);
+        ctx.setContextUsage(usageAt(50));
+        fireTurnEnd(pi, ctx);
+        assert.equal(pi.sendMessageCalls.length, 0);
+        assert.deepEqual(ctx.notifyCalls, []);
+        ctx.setContextUsage(usageAt(90));
+        fireTurnEnd(pi, ctx);
+        assert.equal(pi.sendMessageCalls.length, 1);
+      }
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("invalid config disables the hint and surfaces one warning per layer", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, "{ not json");
+      writeProjectConfig(
+        fixture,
+        JSON.stringify({ rewindHintAtPercent: true }),
+      );
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      ctx.cwd = fixture.projectDir;
+      ctx.isProjectTrusted = () => true;
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [
+        [
+          `navigate_tree: invalid JSON in global config at ${globalConfigPath(fixture)} — that layer was ignored.`,
+          "warning",
+        ],
+        [
+          `navigate_tree: invalid rewindHintAtPercent in project config at ${projectConfigPath(fixture)} — expected integer 20-95 or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
+          "warning",
+        ],
+      ]);
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.equal(
+        ctx.notifyCalls.length,
+        2,
+        "the turn must not add config warnings",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("suppresses config warnings when the session has no UI", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, "{ not json");
+      const { pi, ctx } = setup();
+      ctx.hasUI = false;
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, []);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("is default-off when no config exists (ENOENT is silent)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, []);
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("reload resets the tracker and the toolActive gate", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        1,
+        "spent crossing must not re-fire",
+      );
+
+      // Tool gate off: no fire, even across the threshold.
+      await fireBeforeAgentStart(pi, ["read", "bash"]);
+      ctx.setContextUsage(usageAt(10));
+      fireTurnEnd(pi, ctx);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      // session_start resets both: gate back on, tracker re-armed.
+      await runSessionStart(pi, ctx, fixture);
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        2,
+        "reload must re-arm the tracker",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+});
+
+describe("rewind hint: turn_end handler (#44)", () => {
+  const ENABLED_CONFIG = JSON.stringify({ rewindHintAtPercent: "90" });
+
+  async function enabledSetup(): Promise<{
+    fixture: ConfigFixture;
+    sm: SessionManager;
+    pi: FakePi;
+    ctx: FakeCtx;
+  }> {
+    const fixture = makeConfigFixture();
+    writeGlobalConfig(fixture, ENABLED_CONFIG);
+    const { sm, pi, ctx } = setup();
+    anchorStart(sm, pi);
+    await runSessionStart(pi, ctx, fixture);
+    return { fixture, sm, pi, ctx };
+  }
+
+  it("does not fire when disabled by a sentinel", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: null }));
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("does not fire when the tool is inactive", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      await fireBeforeAgentStart(pi, ["read"]);
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("no-ops on missing/percent-null/zero-window usage without spending the crossing", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      ctx.setContextUsage(undefined);
+      fireTurnEnd(pi, ctx);
+      ctx.setContextUsage({
+        tokens: null,
+        contextWindow: 1_000_000,
+        percent: null,
+      });
+      fireTurnEnd(pi, ctx);
+      ctx.setContextUsage({ tokens: 100, contextWindow: 0, percent: 95 });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+
+      // The crossing is still unspent — the first valid observation fires.
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("fires once per crossing and re-arms only after a drop below the bar", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "20" }));
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(19));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+
+      ctx.setContextUsage(usageAt(20));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      ctx.setContextUsage(usageAt(45));
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        1,
+        "spent crossing must not re-fire",
+      );
+
+      ctx.setContextUsage(usageAt(12));
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        1,
+        "re-arming alone must not fire",
+      );
+
+      ctx.setContextUsage(usageAt(21));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 2);
+      assert.deepEqual(pi.sendMessageCalls[1], [
+        {
+          customType: REWIND_HINT_CUSTOM_TYPE,
+          content: buildRewindHintText(21, 1_000_000),
+          display: true,
+        },
+      ]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("with no anchors: TUI notify with the exact copy, no model message", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { pi, ctx } = setup();
+      // Deliberately NO anchor.
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, [
+        [buildNoAnchorText(95, 1_000_000), "warning"],
+      ]);
+
+      // Spent: no second toast while still above.
+      fireTurnEnd(pi, ctx);
+      assert.equal(ctx.notifyCalls.length, 1);
+
+      // Drop + re-cross re-arms.
+      ctx.setContextUsage(usageAt(10));
+      fireTurnEnd(pi, ctx);
+      ctx.setContextUsage(usageAt(96));
+      fireTurnEnd(pi, ctx);
+      assert.equal(ctx.notifyCalls.length, 2);
+      assert.deepEqual(ctx.notifyCalls[1], [
+        buildNoAnchorText(96, 1_000_000),
+        "warning",
+      ]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("with no anchors and no UI: silent", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { pi, ctx } = setup();
+      ctx.hasUI = false;
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("sendMessage throw falls back to appendCustomMessageEntry(customType, text, true)", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      const appendCalls: unknown[][] = [];
+      (
+        sm as unknown as {
+          appendCustomMessageEntry: (...args: unknown[]) => string;
+        }
+      ).appendCustomMessageEntry = (...args: unknown[]) => {
+        appendCalls.push(args);
+        return "custom-id";
+      };
+      (
+        pi.pi as unknown as { sendMessage: (...args: unknown[]) => void }
+      ).sendMessage = () => {
+        throw new Error("stale session runtime");
+      };
+
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.deepEqual(appendCalls, [
+        [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
+      ]);
+
+      // The crossing is spent even on the fallback path.
+      ctx.setContextUsage(usageAt(96));
+      fireTurnEnd(pi, ctx);
+      assert.equal(appendCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a throwing anchor collection leaves the crossing unspent for a retry", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      const originalGetBranch = sm.getBranch;
+      (sm as unknown as { getBranch: () => never }).getBranch = () => {
+        throw new Error("getBranch exploded");
+      };
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+
+      (sm as unknown as { getBranch: typeof originalGetBranch }).getBranch =
+        originalGetBranch;
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        1,
+        "a successful retry must still fire the crossing",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("the fired custom message is projected by the existing context handler", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      // pi's runtime persists a sent custom message as a `custom_message`
+      // entry via `appendCustomMessageEntry`; emulate that write, then run
+      // the extension's own `context` projection and assert the hint text
+      // survives (no customType filtering in `buildContextMessages`).
+      const text = buildRewindHintText(95, 1_000_000);
+      sm.appendCustomMessageEntry(REWIND_HINT_CUSTOM_TYPE, text, true);
+      const contextHandlers = pi.onCalls.get("context");
+      assert.ok(contextHandlers, "factory must register a context handler");
+      const projected = contextHandlers[0](
+        { type: "context", messages: [] } as never,
+        { sessionManager: sm } as never,
+      ) as { messages: unknown[] };
+      assert.ok(
+        JSON.stringify(projected.messages).includes(text),
+        "the rewind hint custom_message must survive the context projection",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("fails open when selectedTools is undefined (gate stays on)", async () => {
+    // Complement to the earlier "tool inactive" case: an undefined
+    // `selectedTools` (the fail-open branch) must leave the gate ON.
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      await fireBeforeAgentStart(pi, undefined);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("fires while TOOL_NAME is in the selected set", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      await fireBeforeAgentStart(pi, ["read", TOOL_NAME]);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
   });
 });
