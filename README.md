@@ -61,6 +61,44 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 
 **Anchoring is mandated, not suggested.** On every agent start the extension appends a one-line mandate to the end of the system prompt (`before_agent_start`), gated on the tool being active: `navigate_tree: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end.` The append lands after project context and skills, is re-applied on every prompt, and survives compaction — unlike the `promptGuidelines` bullet it replaced. ~35 tokens, constant for prompt caching.
 
+## Rewind hint (optional)
+
+Long autonomous sessions can blow through context silently — the model can't read pi's footer, and `rewind` is a targeted alternative to pi's lossy auto-compaction, but nothing tells the agent *when* to use it. The rewind hint is an opt-in `turn_end` observer that fires **once per crossing**: when context reaches the configured percentage, the agent gets a persisted nudge to persist what matters to files and rewind to an anchor. Default: **disabled**.
+
+Enable it with a `tree-navigator.json` config in either layer:
+
+| Layer | Path |
+|---|---|
+| Global | `join(getAgentDir(), "tree-navigator.json")` (`PI_CODING_AGENT_DIR`-aware) |
+| Project | `join(cwd, CONFIG_DIR_NAME, "tree-navigator.json")` (`.pi/` by default; read only when the project is trusted — untrusted projects are ignored silently) |
+
+```json
+{ "rewindHintAtPercent": "90" }
+```
+
+- Value: integer **20–95** inclusive. The canonical form is a string (`"90"`); a bare number (`90`) is also accepted.
+- Explicit-disable sentinels: `null`, `false`, `"off"`, `"disabled"` (case-insensitive) — the project layer can switch off a global value.
+- Precedence: a project key, when present, wins (including sentinels). Absent → global. Absent everywhere → disabled.
+- Invalid value (out of range, decimal, non-numeric string, `true`, object): the hint stays off for the session — no fallback to the other layer's threshold — and a warning is shown when the session has a UI (silent headless, like every `ui.notify`). A malformed file (non-ENOENT read error, invalid JSON, non-object root) warns and makes that layer contribute nothing, so the other layer still applies; a missing file is silent.
+- One hint per crossing: fires when `percent >= threshold`, re-arms only after percent drops back below it (a rewind or compaction); no escalation, no re-fire while spent.
+
+When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message. Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
+
+```text
+[navigate_tree hint] Context is at 90.0% of 1.0M — running low. Persist what
+matters to files now, then list anchors and rewind to the appropriate one.
+```
+
+With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
+
+### Rewind hygiene (always on)
+
+Independent of the hint, the tool ships three static `promptGuidelines` bullets, present whenever `navigate_tree` is active: pick the earliest anchor that still preserves what you need; **persist durable findings to files before rewinding** (the summary replaces the collapsed work, so anything unwritten is lost); and **don't rewind while a user decision or unresolved question is pending** — ask the user instead. The bullets are not config-gated (`registerTool` fixes the array at registration), cost ~62 tokens per request, and change the cached system-prompt prefix once per active session on upgrade (the provider-facing tool schema is unchanged).
+
+### Compaction guidance
+
+The hint is an alternative to auto-compaction. Auto-compaction fires at `contextWindow − reserveTokens` (`compaction.reserveTokens`, default 16384) — ~98.4% of a 1M window, ~91.8% of 200k, ~87.2% of 128k — so on small windows a 90% hint can land at or after the compaction point. Recommended: disable auto-compaction (`"compaction": { "enabled": false }`) so running out mid-persist produces pi's loud context-window error instead of a silent lossy compaction. Keep compaction enabled only as a safety net if you'd rather the model continue and compact mid-write; the hint never overrides it.
+
 ## How it works
 
 A typical autonomous-loop pattern:
