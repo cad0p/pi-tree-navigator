@@ -6453,11 +6453,157 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.deepEqual(appendCalls, [
         [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
       ]);
+      assert.deepEqual(
+        ctx.notifyCalls,
+        [],
+        "a successful fallback must not warn",
+      );
 
       // The crossing is spent even on the fallback path.
       ctx.setContextUsage(usageAt(96));
       fireTurnEnd(pi, ctx);
       assert.equal(appendCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("sendMessage + append double throw: warns with the exact copy, never throws", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      (
+        sm as unknown as {
+          appendCustomMessageEntry: (...args: unknown[]) => string;
+        }
+      ).appendCustomMessageEntry = () => {
+        throw new Error("append exploded");
+      };
+      (
+        pi.pi as unknown as { sendMessage: (...args: unknown[]) => void }
+      ).sendMessage = () => {
+        throw new Error("stale session runtime");
+      };
+
+      ctx.setContextUsage(usageAt(95));
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx));
+      assert.deepEqual(ctx.notifyCalls, [
+        [
+          `${TOOL_NAME}: could not deliver the rewind hint (append exploded).`,
+          "warning",
+        ],
+      ]);
+
+      // The crossing is spent even on the double-failure path.
+      fireTurnEnd(pi, ctx);
+      assert.equal(ctx.notifyCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("double throw with no UI: silent, no throw, crossing spent", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      ctx.hasUI = false;
+      let sendAttempts = 0;
+      (
+        sm as unknown as {
+          appendCustomMessageEntry: (...args: unknown[]) => string;
+        }
+      ).appendCustomMessageEntry = () => {
+        throw new Error("append exploded");
+      };
+      (
+        pi.pi as unknown as { sendMessage: (...args: unknown[]) => void }
+      ).sendMessage = () => {
+        sendAttempts += 1;
+        throw new Error("stale session runtime");
+      };
+
+      ctx.setContextUsage(usageAt(95));
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx));
+      assert.equal(sendAttempts, 1);
+      assert.deepEqual(ctx.notifyCalls, []);
+
+      // The crossing is spent even on the double-failure path.
+      fireTurnEnd(pi, ctx);
+      assert.equal(sendAttempts, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a throwing ui.notify in the double-failure path cannot escape", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      (
+        sm as unknown as {
+          appendCustomMessageEntry: (...args: unknown[]) => string;
+        }
+      ).appendCustomMessageEntry = () => {
+        throw new Error("append exploded");
+      };
+      (
+        pi.pi as unknown as { sendMessage: (...args: unknown[]) => void }
+      ).sendMessage = () => {
+        throw new Error("stale session runtime");
+      };
+      let notifyAttempts = 0;
+      ctx.ui.notify = () => {
+        notifyAttempts += 1;
+        throw new Error("notify exploded");
+      };
+
+      ctx.setContextUsage(usageAt(95));
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx));
+      assert.equal(notifyAttempts, 1);
+
+      // The crossing is spent even when the warning itself fails.
+      fireTurnEnd(pi, ctx);
+      assert.equal(notifyAttempts, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("captures sessionManager before sendMessage (post-throw ctx reads fail)", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      const appendCalls: unknown[][] = [];
+      (
+        sm as unknown as {
+          appendCustomMessageEntry: (...args: unknown[]) => string;
+        }
+      ).appendCustomMessageEntry = (...args: unknown[]) => {
+        appendCalls.push(args);
+        return "custom-id";
+      };
+      (
+        pi.pi as unknown as { sendMessage: (...args: unknown[]) => void }
+      ).sendMessage = () => {
+        throw new Error("stale session runtime");
+      };
+
+      // `sessionManager` serves exactly one read (the capture); a second
+      // read is the stale-getter failure the fix must not depend on.
+      let reads = 0;
+      const proxyCtx = {
+        get sessionManager(): SessionManager {
+          reads += 1;
+          if (reads > 1) throw new Error("stale session runtime");
+          return sm;
+        },
+        getContextUsage: ctx.getContextUsage,
+        hasUI: ctx.hasUI,
+        ui: ctx.ui,
+      } as unknown as FakeCtx;
+
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, proxyCtx);
+      assert.equal(reads, 1, "sessionManager must be read exactly once");
+      assert.deepEqual(appendCalls, [
+        [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
+      ]);
     } finally {
       cleanupConfigFixture(fixture);
     }

@@ -79,6 +79,7 @@ import {
   formatPct1,
   formatWindow,
   isValidName,
+  LABEL_PREFIX,
   MAX_NAME_LENGTH,
   stripBranchSummaryBoilerplate,
   TOOL_NAME,
@@ -91,8 +92,6 @@ import {
   REWIND_HINT_CUSTOM_TYPE,
   RewindHintTracker,
 } from "./rewind-hint.ts";
-
-const LABEL_PREFIX = "anchor:";
 
 /**
  * Always-on anchor mandate appended to the system prompt on every agent
@@ -815,9 +814,15 @@ export default function (
     // Collect anchors BEFORE marking the crossing spent: a throwing
     // `getBranch` / `getLabel` must leave the crossing unspent so the next
     // turn can retry — never burn the one shot on a failed state read.
+    // `sm` is captured BEFORE the throw-capable `pi.sendMessage` below, so
+    // the fallback append never re-reads a lazy ctx getter after the throw.
+    // Typed via `typeof ctx.sessionManager` (ReadonlySessionManager, not
+    // re-exported from the package root).
+    let sm: typeof ctx.sessionManager;
     let anchorNames: string[];
     try {
-      anchorNames = collectAnchorNames(ctx.sessionManager);
+      sm = ctx.sessionManager;
+      anchorNames = collectAnchorNames(sm);
     } catch {
       return;
     }
@@ -836,15 +841,36 @@ export default function (
           display: true,
         });
       } catch {
-        // Only a synchronous stale-runtime throw (`assertActive`) is
-        // catchable here; async delivery failures go to pi's own
-        // send_message error channel. The direct append is safe in this
-        // extension because the `context` handler rebuilds wire messages
-        // from the session tree — the text still reaches the next LLM call;
-        // only the live TUI render is deferred.
-        (
-          ctx.sessionManager as Partial<SessionManager>
-        ).appendCustomMessageEntry?.(REWIND_HINT_CUSTOM_TYPE, text, true);
+        // Defensively unreachable by construction on pi 0.84.2 / 0.85.1:
+        // `ctx.getContextUsage()` — this handler's first API touch — asserts
+        // the same staleness flag as `pi.sendMessage`, and after `bindCore`
+        // `sendMessage`'s only synchronous throw is that flag (delivery
+        // delegates to an async wrapper that catches). Kept as
+        // defense-in-depth for host drift or a future async window in this
+        // handler: the captured SessionManager outlives `assertActive()`,
+        // the lazy ctx getters do not. The direct append is safe — the
+        // `context` handler rebuilds wire messages from the session tree, so
+        // the text still reaches the next LLM call; only the live TUI render
+        // is deferred. Unlike pi-napkin's `onFallbackFailure`, the notify
+        // below is itself try-guarded: a failure path must never throw.
+        try {
+          (sm as Partial<SessionManager>).appendCustomMessageEntry?.(
+            REWIND_HINT_CUSTOM_TYPE,
+            text,
+            true,
+          );
+        } catch (err) {
+          try {
+            if (ctx.hasUI) {
+              ctx.ui.notify(
+                `${TOOL_NAME}: could not deliver the rewind hint (${err instanceof Error ? err.message : String(err)}).`,
+                "warning",
+              );
+            }
+          } catch {
+            // Stale ctx getters — nothing left to surface with.
+          }
+        }
       }
     } else if (ctx.hasUI) {
       ctx.ui.notify(
@@ -873,7 +899,7 @@ Operations (set \`action\`):
   • 'rewind', rewindTo='<existing>', newLabel='<new>': collapse work between rewindTo and the current leaf into a branch_summary labeled newLabel, so rewinds can chain.
   • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
 
-\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`anchor:\` prefix.`,
+\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`${LABEL_PREFIX}\` prefix.`,
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
