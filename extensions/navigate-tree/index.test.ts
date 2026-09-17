@@ -648,11 +648,11 @@ describe("schema shape \u2014 Kiro compatibility", () => {
     assert.ok("newLabel" in props, "newLabel must be a schema property");
     assert.ok(
       !(legacyRewindTo in props),
-      "no legacy rewindTo alias in the schema",
+      `no legacy ${legacyRewindTo} alias in the schema`,
     );
     assert.ok(
       !(legacyNewLabel in props),
-      "no legacy newLabel alias in the schema",
+      `no legacy ${legacyNewLabel} alias in the schema`,
     );
   });
 
@@ -1403,29 +1403,55 @@ describe("dispatch: rewind validation guards", () => {
     });
   }
 
-  it("old-name rewind call reaches execute and is refused by the rewindTo guard (clean break)", async () => {
+  it("old-name rewind calls reach execute and are refused by the new-name guards (clean break)", async () => {
     // #43 clean break: pi-ai's argument validation passes unknown keys
     // through (the schema has no `additionalProperties`), so a resumed
     // session replaying old-name params still reaches `execute` — the
-    // runtime guard is the path exercised here, representative of the
-    // live one-retry self-heal (the error names the new param). Legacy
-    // key names are assembled at runtime so the repo's zero-hit ref
-    // audit stays clean.
+    // runtime guards are the path exercised here, representative of the
+    // live one-retry self-heal (each error names the new param). An
+    // execute-level alias fallback would not add a schema key, so the
+    // second row is the only guard against it. Legacy key names are
+    // assembled at runtime so the repo's zero-hit ref audit stays clean.
     const legacyRewindTo = `label${"Start"}`;
-    const { sm, tool, ctx } = setup();
-    appendTurn(sm, "u", "a");
-    const result = await tool.execute(
-      "tc-old-name",
-      { action: "rewind", [legacyRewindTo]: "ok" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.equal(result.isError, true);
-    assert.match(
-      (result.content[0] as { text: string }).text,
-      /rewind requires `rewindTo` in kebab-case/,
-    );
+    const legacyNewLabel = `label${"End"}`;
+    const cases: Array<{
+      name: string;
+      params: Record<string, unknown>;
+      want: RegExp;
+    }> = [
+      {
+        name: "legacy rewindTo key only",
+        params: { action: "rewind", [legacyRewindTo]: "ok" },
+        want: /rewind requires `rewindTo` in kebab-case/,
+      },
+      {
+        name: "legacy newLabel key only (valid rewindTo + summaryFocus)",
+        params: {
+          action: "rewind",
+          rewindTo: "ok",
+          [legacyNewLabel]: "ok2",
+          summaryFocus: "x".repeat(MIN_SUMMARY_FOCUS_LENGTH),
+        },
+        want: /rewind requires `newLabel` in kebab-case/,
+      },
+    ];
+    for (const c of cases) {
+      const { sm, tool, ctx } = setup();
+      appendTurn(sm, "u", "a");
+      const result = await tool.execute(
+        "tc-old-name",
+        c.params,
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, true, `${c.name}: must be refused`);
+      assert.match(
+        (result.content[0] as { text: string }).text,
+        c.want,
+        `${c.name}: refusal must name the new param`,
+      );
+    }
   });
 
   it("summaryFocus exactly 20 chars after trim passes the guard", async () => {
@@ -1745,6 +1771,11 @@ describe("dispatch: rewind happy path", () => {
       result.content[0].text,
       /\[rewind to 'start' · collapsed as 'end'\]/,
     );
+    // #43: the structured details keys carry the new param names and the
+    // fixture's values. This is the machine-read JSONL surface, so it is
+    // pinned alongside the model-visible prose above.
+    assert.equal(result.details.rewindTo, "start");
+    assert.equal(result.details.newLabel, "end");
     assert.match(result.content[0].text, /### Done/);
     assert.match(result.content[0].text, /### In Progress/);
     assert.match(result.content[0].text, /### Blocked/);
@@ -2205,27 +2236,32 @@ describe("dispatch: rewind happy path", () => {
     assert.ok(leafId);
     const leaf = sm.getEntry(leafId as string);
     assert.ok(leaf && leaf.type === "message");
-    if (leaf?.type === "message" && leaf.message.role === "assistant") {
-      const c0 = (
-        leaf.message.content as Array<{
-          type: string;
-          arguments?: Record<string, unknown>;
-        }>
-      )[0];
-      assert.equal(c0.type, "toolCall");
-      assert.deepEqual(Object.keys(c0.arguments ?? {}).sort(), [
-        "action",
-        "newLabel",
-        "rewindTo",
-        "summaryFocus",
-      ]);
-      assert.deepEqual(c0.arguments, {
-        action: "rewind",
-        rewindTo: "start",
-        newLabel: "end",
-        summaryFocus: "Preserve user instructions and continue.",
-      });
+    if (leaf?.type !== "message") {
+      assert.fail("expected the kept leaf to be a message entry");
     }
+    // Unconditional role pin: without it, a regression leaving a
+    // non-assistant leaf would skip the shape assertions below and pass
+    // vacuously.
+    assert.equal(leaf.message.role, "assistant");
+    const c0 = (
+      leaf.message.content as Array<{
+        type: string;
+        arguments?: Record<string, unknown>;
+      }>
+    )[0];
+    assert.equal(c0.type, "toolCall");
+    assert.deepEqual(Object.keys(c0.arguments ?? {}).sort(), [
+      "action",
+      "newLabel",
+      "rewindTo",
+      "summaryFocus",
+    ]);
+    assert.deepEqual(c0.arguments, {
+      action: "rewind",
+      rewindTo: "start",
+      newLabel: "end",
+      summaryFocus: "Preserve user instructions and continue.",
+    });
   });
 
   it("wraps the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
@@ -3781,9 +3817,9 @@ describe("dispatch: rewind salvage path", () => {
     }
   });
 
-  it("prior-clear (clearPrior) throws once → retry succeeds; new newLabel lives, prior label is cleared, no salvage detail", async () => {
+  it("prior-clear (clearPrior) throws once → retry succeeds; the new `newLabel` label lives, prior label is cleared, no salvage detail", async () => {
     // The move-on-collision pair is two distinct setLabel calls.
-    // (A) writes the new newLabel onto the summary; (B) clears the
+    // (A) writes the new label (`newLabel`) onto the summary; (B) clears the
     // prior entry's newLabel. If (A) succeeds and (B) throws, the
     // salvage retry must re-run (B) — not (A) — so the duplicate-label
     // state doesn't survive. Discriminator is `failedStep` (`setLabelEnd`
@@ -3805,7 +3841,7 @@ describe("dispatch: rewind salvage path", () => {
     appendTurn(sm, "u4", "a4", 28_000);
 
     // Patch AFTER the pre-anchor writes so the counter starts at 0.
-    // Call #1 inside execute = (A) the new newLabel write; call #2 = (B)
+    // Call #1 inside execute = (A) the new `newLabel` write; call #2 = (B)
     // the prior-clear (throws once); call #3 = the salvage retry of (B)
     // (succeeds).
     throwOnNthSetLabel(pi, 2, new Error("transient prior-clear boom"));
@@ -3889,7 +3925,7 @@ describe("dispatch: rewind salvage path", () => {
     }
   });
 
-  it("prior-clear (clearPrior) throws on every call → salvage detail surfaces 'prior-clear retry failed'; new newLabel still lives", async () => {
+  it("prior-clear (clearPrior) throws on every call → salvage detail surfaces 'prior-clear retry failed'; the new `newLabel` label still lives", async () => {
     // Sister test to the retry-succeeds case above: when BOTH the
     // original (B) prior-clear AND the salvage retry of (B) throw,
     // the wrapped error must surface a salvage detail that names the
