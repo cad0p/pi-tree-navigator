@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(rewind)* Rename params labelStart/labelEnd to rewindTo/newLabel (closes #43)
+
+
 ## [0.2.0] - 2026-09-15
 
 <!-- USER-EDITABLE SECTION START -->
