@@ -66,14 +66,14 @@ describe("buildRewindHintText", () => {
   it("is byte-exact at 91.2% of a 1M window", () => {
     assert.equal(
       buildRewindHintText(91.2, 1_000_000),
-      "[navigate_tree hint] Context is at 91.2% of 1.0M — running low. Persist what matters to files now, then list anchors and rewind to the appropriate one.",
+      "[navigate_tree hint] Context is at 91.2% of 1.0M — running low. Persist what matters to files now, then list anchors and rewind to the oldest appropriate one.",
     );
   });
 
   it("is byte-exact at a 200k window (k-window formatting)", () => {
     assert.equal(
       buildRewindHintText(87.5, 200_000),
-      "[navigate_tree hint] Context is at 87.5% of 200k — running low. Persist what matters to files now, then list anchors and rewind to the appropriate one.",
+      "[navigate_tree hint] Context is at 87.5% of 200k — running low. Persist what matters to files now, then list anchors and rewind to the oldest appropriate one.",
     );
   });
 

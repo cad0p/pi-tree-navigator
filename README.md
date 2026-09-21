@@ -59,7 +59,7 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 
 `name` (written by `anchor`) and `newLabel` (written by `rewind`) both share the reserved `anchor:` label prefix; `rewindTo` resolves against that same namespace. Every label written by `anchor` and every `newLabel` written by `rewind` is referenceable by any subsequent `rewind`'s `rewindTo`, and `list` shows all of them.
 
-**Anchoring is mandated, not suggested.** On every agent start the extension appends a one-line mandate to the end of the system prompt (`before_agent_start`), gated on the tool being active: `navigate_tree: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end.` The append lands after project context and skills, is re-applied on every prompt, and survives compaction — unlike the `promptGuidelines` bullet it replaced. ~35 tokens, constant for prompt caching.
+**Anchoring is mandated, not suggested.** On every agent start the extension appends a one-line mandate to the end of the system prompt (`before_agent_start`), gated on the tool being active: `navigate_tree: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end to keep context low.` The append lands after project context and skills, is re-applied on every prompt, and survives compaction — unlike the `promptGuidelines` bullet it replaced. ~40 tokens (159 chars / 4), constant for prompt caching.
 
 ## Rewind hint (optional)
 
@@ -86,14 +86,14 @@ When the crossing has at least one `anchor:` label on the active branch, the age
 
 ```text
 [navigate_tree hint] Context is at 90.0% of 1.0M — running low. Persist what
-matters to files now, then list anchors and rewind to the appropriate one.
+matters to files now, then list anchors and rewind to the oldest appropriate one.
 ```
 
 With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
 
 ### Rewind hygiene (always on)
 
-Independent of the hint, the tool ships three static `promptGuidelines` bullets, present whenever `navigate_tree` is active: pick the earliest anchor that still preserves what you need; **persist durable findings to files before rewinding** (the summary replaces the collapsed work, so anything unwritten is lost); and **don't rewind while a user decision or unresolved question is pending** — ask the user instead. The bullets are not config-gated (`registerTool` fixes the array at registration), cost ~62 tokens per request, and change the cached system-prompt prefix once per active session on upgrade (the provider-facing tool schema is unchanged).
+Independent of the hint, the tool ships two static `promptGuidelines` bullets, present whenever `navigate_tree` is active: **when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive**, persisting durable findings to files first; and **don't rewind while a user decision or unresolved question is pending** — ask the user instead. The bullets are not config-gated (`registerTool` fixes the array at registration), cost ~64 tokens per request (257 chars / 4), and change the cached system-prompt prefix once per active session on upgrade (the provider-facing tool schema is unchanged).
 
 ### Compaction guidance
 
