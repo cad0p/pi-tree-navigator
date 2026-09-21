@@ -101,7 +101,7 @@ import {
  * skills, and is re-applied on every prompt (never compacted). Byte-stable
  * (module constant, no per-session interpolation) for provider caching.
  */
-export const ANCHOR_MANDATE = `${TOOL_NAME}: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end.`;
+export const ANCHOR_MANDATE = `${TOOL_NAME}: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end to keep context low.`;
 
 // ---------------------------------------------------------------------------
 // Exported boundary constants below (MAX_SESSION_REFS, MAX_HINT_WALK_DEPTH,
@@ -887,8 +887,7 @@ export default function (
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
     promptGuidelines: [
-      `${TOOL_NAME}: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.`,
-      `${TOOL_NAME}: persist durable findings to files before rewinding — the summary replaces the collapsed work, so anything unwritten is lost.`,
+      `${TOOL_NAME}: when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive; persist durable findings to files first.`,
       `${TOOL_NAME}: don't rewind while a user decision or unresolved question is pending — ask the user instead.`,
     ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
@@ -1026,7 +1025,7 @@ Operations (set \`action\`):
               type: "text",
               text:
                 `[anchor '${p.name}'] set at ${positionLine}${hintLine}\n\n` +
-                `Once real work has accumulated after this anchor, collapse it into a summary with: ${TOOL_NAME}(action='rewind', rewindTo='${p.name}', newLabel='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
+                `Once real work has accumulated after this anchor, collapse it into a summary with: ${TOOL_NAME}(action='rewind', rewindTo='<oldest appropriate anchor>', newLabel='<milestone-name>', summaryFocus='<≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus: latest user instruction + done + remaining>').`,
             },
           ],
           details: {

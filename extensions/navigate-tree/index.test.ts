@@ -596,7 +596,7 @@ describe("before_agent_start anchor mandate", () => {
     );
     assert.deepEqual(out, {
       systemPrompt:
-        "BASE\n\nnavigate_tree: gather all context, then anchor `context-gathered`; list anchors and rewind after every milestone or rabbit hole / dead end.",
+        "BASE\n\nnavigate_tree: gather all context, then anchor `context-gathered`; list anchors and rewind after every milestone or rabbit hole / dead end to keep context low.",
     });
   });
 
@@ -1183,7 +1183,7 @@ describe("dispatch: anchor action", () => {
     // accuracy on the very first rewind.
     const text = (result.content[0] as { text: string }).text;
     assert.match(text, /navigate_tree\(action='rewind'/);
-    assert.match(text, /rewindTo='impl-start'/);
+    assert.match(text, /rewindTo='<oldest appropriate anchor>'/);
     assert.match(text, /summaryFocus=/);
     assert.match(text, new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`));
   });
@@ -4851,7 +4851,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.ok(text.includes(`≥${MIN_SUMMARY_FOCUS_LENGTH}-char focus`));
   });
 
-  it("registers the three rewind-hygiene promptGuidelines byte-exactly and in order", () => {
+  it("registers the two rewind-hygiene promptGuidelines byte-exactly and in order", () => {
     // Exact array length + per-element byte equality + order (the 2026-09-13
     // reflection's Lesson 3: `includes`-only pins pass under reordering).
     // These bullets are static and NOT config-gated — `registerTool` fixes
@@ -4861,8 +4861,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     const guidelines = tool.promptGuidelines as string[] | undefined;
     assert.ok(Array.isArray(guidelines), "promptGuidelines must be registered");
     const expected = [
-      "navigate_tree: the further back you rewind, the more you free but the more collapses into the summary; pick the earliest anchor that still preserves what you need next.",
-      "navigate_tree: persist durable findings to files before rewinding — the summary replaces the collapsed work, so anything unwritten is lost.",
+      "navigate_tree: when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive; persist durable findings to files first.",
       "navigate_tree: don't rewind while a user decision or unresolved question is pending — ask the user instead.",
     ];
     assert.equal(

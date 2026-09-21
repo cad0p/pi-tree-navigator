@@ -50,7 +50,7 @@ export function buildRewindHintText(
   percent: number,
   contextWindow: number,
 ): string {
-  return `[${TOOL_NAME} hint] Context is at ${percent.toFixed(1)}% of ${formatWindow(contextWindow)} — running low. Persist what matters to files now, then list anchors and rewind to the appropriate one.`;
+  return `[${TOOL_NAME} hint] Context is at ${percent.toFixed(1)}% of ${formatWindow(contextWindow)} — running low. Persist what matters to files now, then list anchors and rewind to the oldest appropriate one.`;
 }
 
 /** The TUI-only warning shown when a crossing has no anchor to rewind to. */
