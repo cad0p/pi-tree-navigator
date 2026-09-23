@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(rewind)* Rename params labelStart/labelEnd to rewindTo/newLabel (closes #43)
+- *(rewind)* Context-pressure rewind hint (config-gated, default off) (closes #44) (closes #42)
+
+### 🐛 Bug Fixes
+
+- *(hint)* Guard the rewind-hint fallback + hoist LABEL_PREFIX + TUI-proof docs rule (closes #48)
+- *(guidance)* Rewind to the oldest appropriate anchor (closes #51)
+
+### 📚 Documentation
+
+- AGENTS.md — pinned base text (drop Goldmine variant) (closes #53) ([#54](https://github.com/cad0p/pi-tree-navigator/pull/54))
+
+
 ## [0.2.0] - 2026-09-15
 
 <!-- USER-EDITABLE SECTION START -->
