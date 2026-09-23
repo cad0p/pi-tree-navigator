@@ -18,6 +18,10 @@ All notable changes to this project will be documented in this file.
 - *(hint)* Guard the rewind-hint fallback + hoist LABEL_PREFIX + TUI-proof docs rule (closes #48)
 - *(guidance)* Rewind to the oldest appropriate anchor (closes #51)
 
+### 📚 Documentation
+
+- AGENTS.md — pinned base text (drop Goldmine variant) (closes #53) ([#54](https://github.com/cad0p/pi-tree-navigator/pull/54))
+
 
 ## [0.2.0] - 2026-09-15
 
