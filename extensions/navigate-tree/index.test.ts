@@ -6817,6 +6817,43 @@ describe("automatic start anchor (#55)", () => {
     }
   });
 
+  it("appendLabelChange fallback preserves the method receiver (this === SessionManager)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const leaf = sm.getLeafId();
+      const origAppend = sm.appendLabelChange.bind(sm);
+      // Prototype-style method that needs its receiver: an unbound
+      // `append(...)` call loses `this` and throws instead of writing.
+      (
+        sm as unknown as {
+          appendLabelChange: (this: unknown, ...args: unknown[]) => string;
+        }
+      ).appendLabelChange = function (
+        this: unknown,
+        entryId: string,
+        label: string | undefined,
+      ) {
+        if (this !== sm) {
+          throw new Error("appendLabelChange lost its receiver");
+        }
+        return origAppend(entryId, label);
+      };
+      (
+        pi.pi as unknown as { setLabel: (...args: unknown[]) => void }
+      ).setLabel = () => {
+        throw new Error("stale session runtime");
+      };
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx, 1));
+      assert.equal(sm.getLabel(leaf as string), START_ANCHOR_LABEL);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("per-session config: a later session_start must not retune an earlier session", async () => {
     const fixtureA = makeConfigFixture();
     const fixtureB = makeConfigFixture();
