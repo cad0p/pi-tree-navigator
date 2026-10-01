@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 - *(rewind)* Rename params labelStart/labelEnd to rewindTo/newLabel (closes #43)
 - *(rewind)* Context-pressure rewind hint (config-gated, default off) (closes #44) (closes #42)
+- *(anchor)* Automatic low-floor anchor:start (closes #55)
 
 ### 🐛 Bug Fixes
 
@@ -21,6 +22,10 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - AGENTS.md — pinned base text (drop Goldmine variant) (closes #53) ([#54](https://github.com/cad0p/pi-tree-navigator/pull/54))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Drop macos-latest from the PR test matrix (closes #57)
 
 
 ## [0.2.0] - 2026-09-15
