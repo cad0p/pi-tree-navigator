@@ -12,7 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Ubuntu-only since #57: the package is platform-neutral (no native
+        # deps, no `process.platform` branches) and local development is
+        # macOS, so every local gate already covers that OS. Keeping the
+        # single-entry matrix preserves the `test (ubuntu-latest)` check name.
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6

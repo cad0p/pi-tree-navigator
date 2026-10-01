@@ -17,7 +17,7 @@ PR checks (`.github/workflows/ci.yml`, `validate-package-version.yml`, `validate
 
 | Check | What it proves |
 |---|---|
-| `test (ubuntu-latest)` / `test (macos-latest)` | Matrix job: `biome check extensions/` (lint), `tsc --noEmit` (typecheck), `node --test extensions/**/*.test.ts` (full suite). Node 24 + pnpm 11, `pnpm install --frozen-lockfile`. |
+| `test (ubuntu-latest)` | Matrix job: `biome check extensions/` (lint), `tsc --noEmit` (typecheck), `node --test extensions/**/*.test.ts` (full suite). Node 24 + pnpm 11, `pnpm install --frozen-lockfile`. Ubuntu-only since #57 — the package is platform-neutral (no native deps, no `process.platform` branches) and local development is macOS, so every local gate already covers that OS. |
 | `validate` (Validate Package Version) | `cad0p/semver-calver-release/validate-package-version` — feature PRs must **not** bump `package.json` version; release PRs (`release/from-v*`) own it. |
 | `validate` (Validate Release PR) | `cad0p/semver-calver-release/validate-release-pr` — release-PR shape only; green/skip on ordinary PRs. |
 
