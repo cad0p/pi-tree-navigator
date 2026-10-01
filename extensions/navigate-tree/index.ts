@@ -71,6 +71,7 @@ import {
 } from "./cache-summary.ts";
 import {
   loadTreeNavigatorConfig,
+  START_ANCHOR_DEFAULT_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
 import {
@@ -102,6 +103,12 @@ import {
  * (module constant, no per-session interpolation) for provider caching.
  */
 export const ANCHOR_MANDATE = `${TOOL_NAME}: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end to keep context low.`;
+
+/**
+ * Label written by the automatic start anchor (#55). Exported for the test
+ * suite; production callers should rely on the registered tool surface.
+ */
+export const START_ANCHOR_LABEL = `${LABEL_PREFIX}start`;
 
 // ---------------------------------------------------------------------------
 // Exported boundary constants below (MAX_SESSION_REFS, MAX_HINT_WALK_DEPTH,
@@ -719,19 +726,101 @@ export default function (
   let rewindHintAtPercent: number | null = null;
   let hintTracker = new RewindHintTracker();
 
-  // Rewind-hint config (#44): load once per session start. Every ctx getter
-  // is read BEFORE the first await — `ctx.ui` / `isProjectTrusted` / `cwd` /
-  // `hasUI` assert against the live session (pi-steering precedent), and
-  // `loadTreeNavigatorConfig` is async.
+  // Auto start-anchor closure state (#55). All of it is keyed by session id
+  // and NEVER cleared in-process: once a session has settled (write or
+  // found-existing), no later prompt / agent loop re-inserts the label.
+  // `/reload` builds a fresh closure, so a reloaded session re-settles once
+  // via the existence check (no duplicate write). The per-session maps keep
+  // two in-process sessions (e.g. the main session and a subagent) from
+  // sharing each other's config value, tool-active gate, or settle marker.
+  const anchorStartSettled = new Set<string>();
+  const anchorStartTurnsBySession = new Map<string, number>();
+  const toolActiveBySession = new Map<string, boolean>();
+
+  // Auto start anchor (#55): silent `anchor:start` write, shared by the
+  // `turn_end` trigger and the `agent_end` fallback. `completedTurns` is the
+  // number of finished turns in the current agent run
+  // (`Number.POSITIVE_INFINITY` for the run-end fallback). Fail-open
+  // everywhere: any read/write failure leaves the session unsettled so the
+  // next turn or run end retries, and nothing throws into the agent loop.
+  function writeStartAnchorIfNeeded(
+    sm: SessionManager,
+    completedTurns: number,
+  ): void {
+    // Kill switch read at write time (mirrors PI_NAVIGATE_TREE_SUMMARY_CACHE):
+    // a mid-process change applies without an extension reload.
+    if (process.env.PI_NAVIGATE_TREE_START_ANCHOR === "0") return;
+    let sessionId: string;
+    try {
+      sessionId = sm.getSessionId();
+    } catch {
+      return;
+    }
+    // Per-session tool gate (#55): a sibling session's `before_agent_start`
+    // (e.g. a subagent whose tool subset omits `navigate_tree`) must not
+    // clear this session's gate. Absent = fail-open until a gate is set.
+    if (toolActiveBySession.get(sessionId) === false) return;
+    if (anchorStartSettled.has(sessionId)) return;
+    // Per-session threshold (#55): two sessions started with different
+    // project configs must not share one closure value.
+    const startAfterTurns =
+      anchorStartTurnsBySession.get(sessionId) ?? START_ANCHOR_DEFAULT_TURNS;
+    if (completedTurns < startAfterTurns) return;
+    try {
+      // The existence check is authoritative: a `start` already on the
+      // active branch (manual `/tree` label, pre-reload write, prior
+      // settle) wins and settles the session without another write.
+      if (findLabeledEntry(sm, START_ANCHOR_LABEL)) {
+        anchorStartSettled.add(sessionId);
+        return;
+      }
+    } catch {
+      return;
+    }
+    let leafId: string | null;
+    try {
+      leafId = sm.getLeafId();
+    } catch {
+      return;
+    }
+    if (!leafId) return;
+    try {
+      pi.setLabel(leafId, START_ANCHOR_LABEL);
+      anchorStartSettled.add(sessionId);
+    } catch {
+      // Loader-level setLabel can throw on a stale runtime while the
+      // captured SessionManager still writes; same fallback shape as the
+      // hint's appendCustomMessageEntry path. A successful direct append
+      // settles; a missing or throwing append stays unsettled and retries
+      // later (an optional call on a missing method must NOT read as a
+      // successful write).
+      try {
+        const append = (sm as Partial<SessionManager>).appendLabelChange;
+        if (typeof append !== "function") return;
+        append.call(sm, leafId, START_ANCHOR_LABEL);
+        anchorStartSettled.add(sessionId);
+      } catch {
+        // Fail-open: never throw into the agent loop.
+      }
+    }
+  }
+
+  // Config (#44 hint + #55 start anchor): load once per session start. Every
+  // ctx getter is read BEFORE the first await — `ctx.ui` / `isProjectTrusted`
+  // / `cwd` / `hasUI` assert against the live session (pi-steering
+  // precedent), and `loadTreeNavigatorConfig` is async. The settled set is
+  // deliberately NOT reset: it is per-session state keyed by session id.
   pi.on("session_start", async (_event, ctx) => {
     const cwd = ctx.cwd;
     const projectTrusted = ctx.isProjectTrusted();
     const hasUI = ctx.hasUI;
     const ui = ctx.ui;
+    const sessionId = ctx.sessionManager.getSessionId();
     rewindHintAtPercent = null;
     hintTracker = new RewindHintTracker();
     toolActive = true;
     let threshold: number | null = null;
+    let startTurns = START_ANCHOR_DEFAULT_TURNS;
     let warnings: string[] = [];
     try {
       const loaded = await loadTreeNavigatorConfig({
@@ -740,6 +829,7 @@ export default function (
         projectTrusted,
       });
       threshold = loaded.config.rewindHintAtPercent;
+      startTurns = loaded.config.anchorStartAfterTurns;
       warnings = loaded.warnings;
     } catch {
       // The loader is fail-closed and should never throw; this guard exists
@@ -747,9 +837,14 @@ export default function (
       // failure already carries a user-facing warning, and a new string here
       // would only fire on an unreachable path.
       threshold = null;
+      startTurns = START_ANCHOR_DEFAULT_TURNS;
       warnings = [];
     }
     rewindHintAtPercent = threshold;
+    anchorStartTurnsBySession.set(sessionId, startTurns);
+    // Fresh leg: the per-session gate re-arms on the next
+    // `before_agent_start`; absent = fail-open in the meantime.
+    toolActiveBySession.delete(sessionId);
     if (hasUI) {
       for (const warning of warnings) ui.notify(warning, "warning");
     }
@@ -773,9 +868,17 @@ export default function (
   // when `selectedTools` is undefined (this extension always registers it).
   // The same check gates the rewind hint (#44): an inactive tool must not
   // fire `turn_end` nudges the model can't act on.
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const selected = event.systemPromptOptions?.selectedTools;
     toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
+    // Per-session copy of the gate (#55): the shared `toolActive` above
+    // drives the hint, but an in-process sibling session must not clear this
+    // session's auto-anchor gate.
+    try {
+      toolActiveBySession.set(ctx.sessionManager.getSessionId(), toolActive);
+    } catch {
+      // Fail-open: the per-session gate stays absent.
+    }
     if (!toolActive) return {};
     return { systemPrompt: `${event.systemPrompt}\n\n${ANCHOR_MANDATE}` };
   });
@@ -799,7 +902,25 @@ export default function (
   // handler is delivered in the same run. Synchronous by design: no await
   // before any ctx use. Fires once per threshold crossing; see
   // `RewindHintTracker` for the re-arm semantics.
-  pi.on("turn_end", (_event, ctx) => {
+  pi.on("turn_end", (event, ctx) => {
+    // Single `sessionManager` capture shared by the auto start-anchor and
+    // the rewind hint: the stale-ctx contract is exactly one read, before
+    // any throw-capable call. A throwing getter (replaced session) skips
+    // both paths without throwing into the loop.
+    let sm: typeof ctx.sessionManager | null;
+    try {
+      sm = ctx.sessionManager;
+    } catch {
+      sm = null;
+    }
+    // Auto start anchor (#55): fires at the X-th turn of the run. Runs
+    // BEFORE and independently of the hint block — the two fields have
+    // separate config semantics (the hint can be off/null while the start
+    // anchor still applies). Native per-run `turnIndex` is 0-based, hence
+    // the pre-increment. This is the only TurnEndEvent field read here: it
+    // exists on both pi 0.84.2 (dev-dep) and 0.99.2 (host); host-only
+    // fields (`messageEntryId` / `outcome`) must never be read.
+    if (sm) writeStartAnchorIfNeeded(sm as SessionManager, event.turnIndex + 1);
     if (!toolActive || rewindHintAtPercent === null) return;
     const usage = ctx.getContextUsage();
     // `percent == null` is pi's post-compaction state (unknown tokens), and
@@ -813,15 +934,12 @@ export default function (
     }
     // Collect anchors BEFORE marking the crossing spent: a throwing
     // `getBranch` / `getLabel` must leave the crossing unspent so the next
-    // turn can retry — never burn the one shot on a failed state read.
-    // `sm` is captured BEFORE the throw-capable `pi.sendMessage` below, so
-    // the fallback append never re-reads a lazy ctx getter after the throw.
-    // Typed via `typeof ctx.sessionManager` (ReadonlySessionManager, not
-    // re-exported from the package root).
-    let sm: typeof ctx.sessionManager;
+    // turn can retry — never burn the one shot on a failed state read. The
+    // shared `sm` was captured before any throw-capable call, so the
+    // fallback append never re-reads a lazy ctx getter after a throw.
+    if (!sm) return;
     let anchorNames: string[];
     try {
-      sm = ctx.sessionManager;
       anchorNames = collectAnchorNames(sm);
     } catch {
       return;
@@ -880,6 +998,20 @@ export default function (
     }
   });
 
+  // Auto start anchor (#55) run-end fallback: a run that finishes before its
+  // X-th turn still settles (a one-turn first run anchors at turn 1).
+  // `agent_end` fires on complete / aborted / errored runs; the settled set
+  // makes this a no-op once the turn trigger already wrote.
+  pi.on("agent_end", (_event, ctx) => {
+    let sm: typeof ctx.sessionManager;
+    try {
+      sm = ctx.sessionManager;
+    } catch {
+      return;
+    }
+    writeStartAnchorIfNeeded(sm as SessionManager, Number.POSITIVE_INFINITY);
+  });
+
   pi.registerTool({
     name: TOOL_NAME,
     label: "Navigate Tree",
@@ -898,7 +1030,7 @@ Operations (set \`action\`):
   • 'rewind', rewindTo='<existing>', newLabel='<new>': collapse work between rewindTo and the current leaf into a branch_summary labeled newLabel, so rewinds can chain.
   • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
 
-\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`${LABEL_PREFIX}\` prefix.`,
+\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: labels are unique on the active branch — both actions refuse a name that already exists — and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`${LABEL_PREFIX}\` prefix.`,
     promptSnippet:
       "Use to anchor named milestones and rewind the conversation tree to a prior point with a model-generated summary, for token-efficient long autonomous sessions.",
     // The schema is intentionally a flat `Type.Object` with everything-but-
@@ -1000,20 +1132,17 @@ Operations (set \`action\`):
         if (!leafId) {
           return toolError("No session entries yet — nothing to anchor.");
         }
-        // Write the new label first, then clear the prior. If the second
-        // setLabel throws, two labels of the same name briefly coexist on
-        // the active branch — `findLabeledEntry` walks leaf→root and
-        // returns the leaf-side match, so navigation behavior is correct
-        // during the overlap. The pre-PR "no enforcement" semantics already
-        // tolerated this. The reverse order (clear-then-set) was move-then-
-        // lose under failure: a partial collapse left the active branch
-        // with no anchor of the requested name at all.
+        // Labels are unique on the active branch (issue #55, C8): an
+        // existing label is never moved or overwritten, and the caller
+        // must pick a fresh name. Manual `/tree` duplicates are the only
+        // duplicate path; move-on-collision is retired for both writers.
         const fullLabel = LABEL_PREFIX + p.name;
-        const prior = findLabeledEntry(sm, fullLabel);
-        pi.setLabel(leafId, fullLabel);
-        if (prior && prior !== leafId) {
-          pi.setLabel(prior, undefined);
+        if (findLabeledEntry(sm, fullLabel)) {
+          return toolError(
+            `A label '${p.name}' already exists on the active branch — labels are unique and immutable once written. Use action='list' to review the active labels, then pick a fresh name.`,
+          );
         }
+        pi.setLabel(leafId, fullLabel);
         const cw = ctx.model?.contextWindow ?? 0;
         const tokensHere = estimateActiveBranchTokens(sm);
         const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
@@ -1033,7 +1162,6 @@ Operations (set \`action\`):
             entryId: leafId,
             contextTokens: tokensHere,
             labelHint,
-            movedFromPriorEntry: prior && prior !== leafId ? prior : null,
           },
         };
       }
@@ -1060,6 +1188,18 @@ Operations (set \`action\`):
             `  1. the user's most recent instruction verbatim,\n` +
             `  2. which parts have already been done in the work being collapsed,\n` +
             `  3. which parts remain unactioned.`,
+        );
+      }
+
+      // Label uniqueness (issue #55, C8): a `newLabel` already on the
+      // active branch is refused BEFORE any summarization or mutation —
+      // labels are immutable once written, so the anchor→rewind
+      // rename-forward idiom is retired. The check sits with the
+      // name/summaryFocus validations so no summarizer call is wasted; the
+      // existing label stays addressable via `rewindTo`.
+      if (findLabeledEntry(sm, LABEL_PREFIX + p.newLabel)) {
+        return toolError(
+          `A label '${p.newLabel}' already exists on the active branch — labels are unique and immutable once written, so rewind requires a fresh \`newLabel\`. The existing '${p.newLabel}' label stays addressable via \`rewindTo\`. Use action='list' to review the active labels, then pick a fresh newLabel.`,
         );
       }
 
@@ -1465,31 +1605,17 @@ Operations (set \`action\`):
       // stopReason: "toolUse" (survives Kiro's normalizeMessages filter
       // — see `buildSyntheticAssistant` JSDoc). The synthetic append
       // sits OUTSIDE the try so it runs exactly once regardless of
-      // which earlier step threw. newLabel write moves before clear,
-      // mirroring `anchor`'s move-on-collision so duplicate anchors
-      // can't survive a chained rewind.
+      // which earlier step threw. `summaryId` was freshly allocated by
+      // branchWithSummary above, so no pre-existing label can point at it
+      // and there is no prior label to clear (labels are unique; #55).
       const fullLabelEnd = LABEL_PREFIX + p.newLabel;
-      let priorLabelEnd: ReturnType<typeof findLabeledEntry> = null;
       let tokensAtNewLeaf = 0;
       let originalErr: unknown;
       let salvageDetail = "";
-      let failedStep:
-        | "lookup"
-        | "setLabelEnd"
-        | "clearPrior"
-        | "estimate"
-        | null = null;
+      let failedStep: "setLabelEnd" | "estimate" | null = null;
       try {
-        failedStep = "lookup";
-        priorLabelEnd = findLabeledEntry(sm, fullLabelEnd);
         failedStep = "setLabelEnd";
         pi.setLabel(summaryId, fullLabelEnd);
-        // `summaryId` was freshly allocated by branchWithSummary above;
-        // no pre-existing label can already point at it.
-        if (priorLabelEnd) {
-          failedStep = "clearPrior";
-          pi.setLabel(priorLabelEnd, undefined);
-        }
 
         // Compute afterTokens NOW — before we append the synthetic. This
         // captures the chain size at the new leaf (branch_summary) using
@@ -1502,23 +1628,13 @@ Operations (set \`action\`):
         // Best-effort retry of the specific failed step (pi.setLabel is
         // idempotent under re-application). Per-step recovery shape:
         //   - setLabelEnd: retry pi.setLabel(summaryId, fullLabelEnd).
-        //   - clearPrior:  retry pi.setLabel(priorLabelEnd, undefined).
-        //   - lookup / estimate: no retry — either prior state unknown
-        //     or both labels already wrote; redundant retry would mask
-        //     the real cause.
+        //   - estimate:    no retry — the label already wrote; a
+        //     redundant retry would mask the real cause.
         if (failedStep === "setLabelEnd") {
           try {
             pi.setLabel(summaryId, fullLabelEnd);
           } catch (retryErr) {
             salvageDetail = `newLabel retry failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`;
-          }
-        } else if (failedStep === "clearPrior" && priorLabelEnd) {
-          try {
-            pi.setLabel(priorLabelEnd, undefined);
-          } catch (retryErr) {
-            salvageDetail = `prior-clear retry failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
             }`;
           }
