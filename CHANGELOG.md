@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 
 - *(hint)* Guard the rewind-hint fallback + hoist LABEL_PREFIX + TUI-proof docs rule (closes #48)
 - *(guidance)* Rewind to the oldest appropriate anchor (closes #51)
+- *(hint)* Keep the tool-active gate per-session (closes #58)
 
 ### 📚 Documentation
 
