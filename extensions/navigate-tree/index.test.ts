@@ -23,7 +23,7 @@ import * as assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, before, describe, it } from "node:test";
+import { afterEach, before, beforeEach, describe, it } from "node:test";
 import {
   type AgentSession,
   CONFIG_DIR_NAME,
@@ -33,7 +33,12 @@ import {
   initTheme,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { TREE_NAVIGATOR_CONFIG_FILENAME } from "./config.ts";
+import {
+  START_ANCHOR_DEFAULT_TURNS,
+  START_ANCHOR_MAX_TURNS,
+  START_ANCHOR_MIN_TURNS,
+  TREE_NAVIGATOR_CONFIG_FILENAME,
+} from "./config.ts";
 import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTree, {
   __testHooks,
@@ -43,6 +48,7 @@ import navigateTree, {
   MAX_SYNTHETIC_FOCUS_LENGTH,
   MIN_REWIND_SAVINGS_TOKENS,
   MIN_SUMMARY_FOCUS_LENGTH,
+  START_ANCHOR_LABEL,
 } from "./index.ts";
 import {
   buildNoAnchorText,
@@ -783,7 +789,7 @@ Operations (set \`action\`):
   • 'rewind', rewindTo='<existing>', newLabel='<new>': collapse work between rewindTo and the current leaf into a branch_summary labeled newLabel, so rewinds can chain.
   • 'list': show all anchors on the active branch, oldest first, with cumulative context % at each.
 
-\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: re-using an existing label moves it to the new entry, and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`anchor:\` prefix.`;
+\`name\` (anchor) and \`newLabel\` (rewind) write into one shared anchor namespace: labels are unique on the active branch — both actions refuse a name that already exists — and everything written there is addressable as a future \`rewindTo\`. Avoid the reserved \`anchor:\` prefix.`;
 
   it("description byte-equals the issue-approved trimmed string", () => {
     // Byte-exact snapshot: any wording change to the tool description must
@@ -1188,19 +1194,23 @@ describe("dispatch: anchor action", () => {
     assert.match(text, new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`));
   });
 
-  it("move-on-collision: re-anchoring the same name moves the label off the prior entry", async () => {
-    // First anchor at the leaf, append more turns, then re-anchor with the
-    // same name. The prior label should be cleared and the new leaf labeled.
+  it("duplicate refusal: re-anchoring an existing name is refused with no write and no prior-clear", async () => {
+    // Issue #55 (C8): labels are unique on the active branch and immutable
+    // once written. Re-anchoring the same name must be refused BEFORE any
+    // write; the prior label stays exactly where it was (retired
+    // move-on-collision).
     const { sm, pi, tool, ctx } = setup();
     const t1 = appendTurn(sm, "u1", "a1");
-    await tool.execute(
+    const first = await tool.execute(
       "tc-1",
       { action: "anchor", name: "iter-start" },
       undefined,
       undefined,
       ctx,
     );
+    assert.equal(first.isError, undefined);
     assert.equal(sm.getLabel(t1.assistantId), "anchor:iter-start");
+    const setLabelCountBefore = pi.setLabelCalls.length;
 
     const t2 = appendTurn(sm, "u2", "a2");
     const result = await tool.execute(
@@ -1210,122 +1220,67 @@ describe("dispatch: anchor action", () => {
       undefined,
       ctx,
     );
-    assert.equal(result.isError, undefined);
-    assert.equal(sm.getLabel(t1.assistantId), undefined);
-    assert.equal(sm.getLabel(t2.assistantId), "anchor:iter-start");
-    assert.equal(result.details.movedFromPriorEntry, t1.assistantId);
-    // Verify the move actually went through pi.setLabel as a clear + set
-    // pair (not a single in-place move).
-    const clearCall = pi.setLabelCalls.find(
-      ([id, lbl]) => id === t1.assistantId && lbl === undefined,
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /already exists on the active branch/);
+    assert.match(result.content[0].text, /labels are unique/);
+    assert.match(result.content[0].text, /action='list'/);
+    assert.match(result.content[0].text, /fresh name/);
+    assert.equal(result.details.refusal, true);
+    // No write at all: no set, no clear, and the prior label and the new
+    // leaf are untouched.
+    assert.equal(
+      pi.setLabelCalls.length,
+      setLabelCountBefore,
+      "a refused anchor must not call setLabel",
     );
-    assert.ok(clearCall, "expected a clear of the prior label");
-    // Pin write-before-clear ordering: setLabel(newLeaf, fullLabel) MUST
-    // land before setLabel(prior, undefined). The reverse order leaves a
-    // "prior cleared, new failed to install" window if the second call
-    // throws — source comment at the anchor handler documents this as
-    // load-bearing. A regression to clear-then-set would still produce
-    // the right end state but lose the rollback property.
-    const setIdx = pi.setLabelCalls.findIndex(
-      ([id, lbl]) => id === t2.assistantId && lbl === "anchor:iter-start",
-    );
-    const clearIdx = pi.setLabelCalls.findIndex(
-      ([id, lbl]) => id === t1.assistantId && lbl === undefined,
-    );
-    assert.ok(setIdx >= 0, "expected the new-leaf set call");
-    assert.ok(clearIdx >= 0, "expected the prior-clear call");
-    assert.ok(
-      setIdx < clearIdx,
-      `expected set-before-clear; got setIdx=${setIdx} clearIdx=${clearIdx}`,
-    );
+    assert.equal(sm.getLabel(t1.assistantId), "anchor:iter-start");
+    assert.equal(sm.getLabel(t2.assistantId), undefined);
+    assert.equal(result.details.movedFromPriorEntry, undefined);
   });
 
-  it("re-anchor on the same leaf with the same name is idempotent: no spurious clear", async () => {
-    // Defensive `prior !== leafId` guard: if we capture `prior` for the
-    // requested label and find it points at the very leaf we're about
-    // to label, skip the prior-clear (otherwise we'd issue setLabel(leaf,
-    // undefined) immediately after setLabel(leaf, fullLabel), wiping the
-    // label we just wrote).
-    //
-    // Production pi's `setLabel` always advances the leaf (it appends
-    // a label-change entry via `appendLabelChange`), so `prior === leafId`
-    // doesn't normally arise. The default `makeFakePi` mirrors that
-    // behavior. To exercise the guard directly, swap in an in-place
-    // setLabel that mutates `labelsById` WITHOUT advancing the leaf —
-    // this models a hypothetical future pi (or extension-runner) where
-    // setLabel is leaf-stable. The guard's correctness should not depend
-    // on which behavior pi exposes.
-    const { sm, ctx } = setup();
-    const t1 = appendTurn(sm, "u", "a");
-
-    // In-place pi: setLabel mutates labelsById directly, no leaf advance.
-    const setLabelCalls: Array<[string, string | undefined]> = [];
-    const inPlacePi = {
-      registerTool() {},
-      on() {
-        // Factory registers the context handler via on; this test only
-        // exercises anchor semantics, so a no-op collector suffices.
-      },
-      setLabel(entryId: string, label: string | undefined) {
-        setLabelCalls.push([entryId, label]);
-        // Reach into the SM's internal map to set the label without
-        // appending a new entry. The map is exposed for tests via the
-        // SessionManager surface.
-        const labelsMap = (sm as unknown as { labelsById: Map<string, string> })
-          .labelsById;
-        if (label === undefined) labelsMap.delete(entryId);
-        else labelsMap.set(entryId, label);
-      },
-    } as unknown as ExtensionAPI;
-    // Re-register the tool with the in-place pi.
-    const inPlaceRegistered: CapturedTool[] = [];
-    (
-      inPlacePi as unknown as {
-        registerTool: (t: CapturedTool) => void;
-      }
-    ).registerTool = (t: CapturedTool) => {
-      inPlaceRegistered.push(t);
-    };
-    navigateTree(inPlacePi, { summarize: fakeSummarize as never });
-    const inPlaceTool = inPlaceRegistered[0];
-
-    // First anchor: leaf is the assistant entry t1.assistantId.
-    await inPlaceTool.execute(
+  it("refusal copy names the colliding name and points at list + a fresh name", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    appendTurn(sm, "u1", "a1");
+    await tool.execute(
       "tc-1",
-      { action: "anchor", name: "foo" },
+      { action: "anchor", name: "phase1" },
       undefined,
       undefined,
       ctx,
     );
-    // Verify the label landed on t1.assistantId and the leaf did NOT
-    // advance (the precondition for the guard branch).
-    assert.equal(sm.getLabel(t1.assistantId), "anchor:foo");
-    assert.equal(sm.getLeafId(), t1.assistantId);
-
-    // Second anchor: leaf is STILL t1.assistantId, prior also points
-    // at t1.assistantId — prior === leafId, the guard branch fires.
-    setLabelCalls.length = 0;
-    await inPlaceTool.execute(
+    appendTurn(sm, "u2", "a2");
+    const result = await tool.execute(
       "tc-2",
-      { action: "anchor", name: "foo" },
+      { action: "anchor", name: "phase1" },
       undefined,
       undefined,
       ctx,
     );
-    // Pin: exactly one setLabel call (the re-set of the same label),
-    // and zero clears. A regression that drops the `prior !== leafId`
-    // guard would issue a setLabel(t1.assistantId, undefined) clearing
-    // the label we just (re-)wrote.
-    assert.equal(setLabelCalls.length, 1, "expected exactly one setLabel");
-    assert.deepEqual(setLabelCalls[0], [t1.assistantId, "anchor:foo"]);
-    const clears = setLabelCalls.filter(([, lbl]) => lbl === undefined);
+    assert.equal(result.isError, true);
+    const text = result.content[0].text;
+    // Byte-exact copy pin (same string the source builds).
     assert.equal(
-      clears.length,
-      0,
-      "no clear should fire when prior === leafId",
+      text,
+      "A label 'phase1' already exists on the active branch — labels are unique and immutable once written. Use action='list' to review the active labels, then pick a fresh name.",
     );
-    // Label still present.
-    assert.equal(sm.getLabel(t1.assistantId), "anchor:foo");
+    void pi;
+  });
+
+  it("manual /tree duplicate labels remain possible and resolve leaf-most", async () => {
+    // Issue #55 (C8): the tool never creates duplicates, but a manual
+    // `/tree` label can put the same name on two entries. `findLabeledEntry`
+    // walks leaf→root, so `rewindTo` resolves to the leaf-most match —
+    // documented and accepted.
+    const { sm, pi } = setup();
+    const t1 = appendTurn(sm, "u1", "a1");
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    const t2 = appendTurn(sm, "u2", "a2");
+    pi.pi.setLabel(t2.assistantId, "anchor:start");
+    assert.equal(
+      __testHooks.findLabeledEntry(sm, "anchor:start"),
+      t2.assistantId,
+      "duplicate labels must resolve leaf-most",
+    );
   });
 
   it("falls through with a misleading rewind error on unknown `action`", async () => {
@@ -2008,26 +1963,25 @@ describe("dispatch: rewind happy path", () => {
     }
   });
 
-  it("newLabel collides with an existing anchor: rewind moves the anchor to the new summary (mirrors anchor's move-on-collision)", async () => {
-    // Namespace symmetry: anchor.name and rewind.newLabel both write into
-    // the `anchor:` namespace, so a `rewind` whose newLabel already labels
-    // another entry on the *post-move active branch* must move the label
-    // to the new summary — mirroring `anchor`'s write-before-clear
-    // move-on-collision. Without the move, two entries on the same active
-    // branch would both carry `anchor:b`, breaking `findLabeledEntry`'s
-    // uniqueness invariant.
-    //
-    // Setup ordering matters: the prior `anchor:b` must be on the
-    // ancestral side of `rewindTo` (= tA), so that branchWithSummary
-    // leaves it on the *active* branch (between root and the new
-    // summary), NOT on the abandoned one. We anchor 'b' on the FIRST
-    // turn and 'a' on the SECOND turn:
+  it("newLabel collision: rewind refuses before summarization and mutates nothing", async () => {
+    // Issue #55 (C8): a `newLabel` already on the active branch is refused
+    // BEFORE any summarization or tree mutation. Setup ordering mirrors
+    // the retired move-on-collision test: the prior `anchor:b` sits on the
+    // ancestral side of `rewindTo` (= tA), so the old behavior would have
+    // moved it to the new summary.
     //   root → tB(anchor:b) → tA(anchor:a) → t3 → leaf
-    // Then rewind a→b collapses [tA-child … leaf] into summaryId, leaving
-    //   root → tB(anchor:b) → tA(anchor:a) → summaryId(anchor:b)
-    // — anchor:b lives on both tB and summaryId on the active branch.
-    // The move-on-collision clears tB's label.
-    const { sm, pi, tool, ctx } = setup();
+    const summarizeCalls: unknown[] = [];
+    const { sm, pi, tool, ctx } = setup({
+      summarize: (async (...args: unknown[]) => {
+        summarizeCalls.push(args);
+        return {
+          summary: "must never run",
+          readFiles: [],
+          modifiedFiles: [],
+          aborted: false,
+        };
+      }) as never,
+    });
     const tB = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(tB.assistantId, "anchor:b");
     const tA = appendTurn(sm, "u2", "a2", 16_000);
@@ -2038,12 +1992,8 @@ describe("dispatch: rewind happy path", () => {
     const fake = makeFakeSession(sm);
     __testHooks.captureSession(fake as unknown as AgentSession);
 
-    // Sanity: pre-move, anchor:b resolves to tB.
-    assert.equal(
-      __testHooks.findLabeledEntry(sm, "anchor:b"),
-      tB.assistantId,
-      "pre-move sanity: anchor:b lives on tB",
-    );
+    const entriesBefore = sm.getEntries().length;
+    const leafBefore = sm.getLeafId();
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2057,30 +2007,53 @@ describe("dispatch: rewind happy path", () => {
       undefined,
       ctx,
     );
-    assert.equal(result.isError, undefined);
-    const summaryId = result.details.summaryId as string;
-
-    // The new summary carries 'anchor:b'.
+    assert.equal(result.isError, true);
+    assert.equal(result.details.refusal, true);
+    assert.match(
+      result.content[0].text,
+      /A label 'b' already exists on the active branch/,
+    );
+    assert.match(result.content[0].text, /fresh `newLabel`/);
+    assert.match(result.content[0].text, /stays addressable via `rewindTo`/);
+    // Refusal-before-summarization: the stub must never have been invoked.
     assert.equal(
-      sm.getLabel(summaryId),
-      "anchor:b",
-      "new branch_summary must carry the newLabel anchor",
+      summarizeCalls.length,
+      0,
+      "summarize must not run on a duplicate-newLabel refusal",
     );
-    // The prior 'b'-labeled entry lost its label — cleared by the
-    // move-on-collision branch in rewind. (Only its label was cleared;
-    // the entry itself is still in storage.)
-    assert.notEqual(
-      sm.getLabel(tB.assistantId),
-      "anchor:b",
-      "prior 'anchor:b' entry must be cleared after the move",
-    );
-    // findLabeledEntry resolves 'anchor:b' uniquely to the new summary.
-    // (Walks leaf→root and the active branch now passes through summaryId
-    // with the label cleared on tB — only the new write remains.)
+    // No mutation: entry count, leaf, and both labels are untouched.
+    assert.equal(sm.getEntries().length, entriesBefore);
+    assert.equal(sm.getLeafId(), leafBefore);
+    assert.equal(sm.getLabel(tB.assistantId), "anchor:b");
+    assert.equal(sm.getLabel(tA.assistantId), "anchor:a");
     assert.equal(
       __testHooks.findLabeledEntry(sm, "anchor:b"),
-      summaryId,
-      "findLabeledEntry must resolve 'anchor:b' to the moved summary",
+      tB.assistantId,
+      "the existing label must stay where it was",
+    );
+  });
+
+  it("newLabel collision refusal copy is byte-exact", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:taken");
+    appendTurn(sm, "u2", "a2", 16_000);
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "taken",
+        newLabel: "taken",
+        summaryFocus: "Preserve the user's instruction and continue the work.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, true);
+    assert.equal(
+      result.content[0].text,
+      "A label 'taken' already exists on the active branch — labels are unique and immutable once written, so rewind requires a fresh `newLabel`. The existing 'taken' label stays addressable via `rewindTo`. Use action='list' to review the active labels, then pick a fresh newLabel.",
     );
   });
 
@@ -3793,300 +3766,6 @@ describe("dispatch: rewind salvage path", () => {
     // would still match a /appendMessage boom/ regex, defeating the
     // "no recovery, no double-handling" claim. Exact equality pins it.
     assert.equal(msg, "appendMessage boom");
-  });
-
-  it("findLabeledEntry(newLabel) throws → synthetic still appended; original error propagates", async () => {
-    // The newLabel-collision lookup runs inside the salvage try as the
-    // first step. If it throws (e.g. malformed branch traversal),
-    // setLabel cannot run — but the synthetic append still must, so
-    // pi's appended tool_result has a matching tool_use on the new
-    // branch. Without the in-try lookup, an upstream throw from
-    // findLabeledEntry would orphan the tool_result.
-    const { sm, pi, tool, ctx } = setup();
-    setupRewindable(sm, pi, {
-      capture: true,
-      turnsAfter: 2,
-      tokenCounts: [6_000, 14_000, 22_000],
-    });
-
-    // Trip `getBranch` ONLY after a `branch_summary` entry exists on
-    // the active branch — i.e. after `sm.branchWithSummary` ran. The
-    // newLabel-collision lookup (`findLabeledEntry(sm, fullLabelEnd)`)
-    // is the first call past that point in the rewind handler. The
-    // rewindTo lookup, beforeTokens, and collectEntriesForBranchSummary
-    // all run BEFORE the move and thus before the trip is armed.
-    const origGetBranch = sm.getBranch.bind(sm);
-    let thrown: unknown;
-    (sm as { getBranch: typeof sm.getBranch }).getBranch = (...args) => {
-      const branch = origGetBranch(...args);
-      if (branch.some((e) => e.type === "branch_summary")) {
-        throw new Error("getBranch boom");
-      }
-      return branch;
-    };
-
-    try {
-      await tool.execute(
-        "tc-rewind",
-        {
-          action: "rewind",
-          rewindTo: "start",
-          newLabel: "end",
-          summaryFocus: "Preserve user instructions and continue.",
-        },
-        undefined,
-        undefined,
-        ctx,
-      );
-    } catch (e) {
-      thrown = e;
-    }
-
-    // Restore for cleanliness.
-    (sm as { getBranch: typeof sm.getBranch }).getBranch = origGetBranch;
-
-    assert.ok(thrown, "rewind should re-throw the original error");
-    const msg = thrown instanceof Error ? thrown.message : String(thrown);
-    // Pin: original error from the lookup throw propagates verbatim,
-    // no salvage-detail wrapping (lookup-throw doesn't trigger the
-    // setLabel-retry path).
-    assert.match(msg, /getBranch boom/);
-    assert.ok(
-      !/salvage:.*newLabel retry failed/.test(msg),
-      "lookup-throw must not trigger the setLabel-retry diagnostic",
-    );
-
-    // Synthetic still landed. Find the leaf assistant whose toolCall id
-    // matches our in-flight `toolCallId='tc-rewind'`.
-    const leafId = sm.getLeafId();
-    assert.ok(leafId, "expected a leaf after lookup-throw salvage");
-    if (leafId) {
-      const leaf = sm.getEntry(leafId);
-      assert.ok(leaf && leaf.type === "message");
-      if (leaf && leaf.type === "message") {
-        assert.equal(leaf.message.role, "assistant");
-        const c0 = (
-          leaf.message.content as Array<{ type: string; id?: string }>
-        )[0];
-        assert.equal(c0.type, "toolCall");
-        assert.equal(c0.id, "tc-rewind");
-      }
-    }
-  });
-
-  it("prior-clear (clearPrior) throws once → retry succeeds; the new `newLabel` label lives, prior label is cleared, no salvage detail", async () => {
-    // The move-on-collision pair is two distinct setLabel calls.
-    // (A) writes the new label (`newLabel`) onto the summary; (B) clears the
-    // prior entry's newLabel. If (A) succeeds and (B) throws, the
-    // salvage retry must re-run (B) — not (A) — so the duplicate-label
-    // state doesn't survive. Discriminator is `failedStep` (`setLabelEnd`
-    // vs `clearPrior`); without the split, the retry would re-run the
-    // already-succeeded (A) and silently leave both entries labeled.
-    //
-    // Setup mirrors the move-on-collision happy-path test:
-    //   root → tB(anchor:b) → tA(anchor:a) → t3 → leaf
-    // Rewind a→b: branchWithSummary collapses [tA-child … leaf] into
-    // summaryId; (A) writes anchor:b onto summaryId; (B) clears anchor:b
-    // off tB. We arm setLabel to throw on call #2 (B) only — #1 (A)
-    // succeeds, #3 (the salvage retry of B) succeeds.
-    const { sm, pi, tool, ctx } = setup();
-    const tB = appendTurn(sm, "u1", "a1", 6_000);
-    pi.pi.setLabel(tB.assistantId, "anchor:b");
-    const tA = appendTurn(sm, "u2", "a2", 16_000);
-    pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u3", "a3", 22_000);
-    appendTurn(sm, "u4", "a4", 28_000);
-
-    // Patch AFTER the pre-anchor writes so the counter starts at 0.
-    // Call #1 inside execute = (A) the new `newLabel` write; call #2 = (B)
-    // the prior-clear (throws once); call #3 = the salvage retry of (B)
-    // (succeeds).
-    throwOnNthSetLabel(pi, 2, new Error("transient prior-clear boom"));
-
-    let thrown: unknown;
-    try {
-      await tool.execute(
-        "tc-rewind",
-        {
-          action: "rewind",
-          rewindTo: "a",
-          newLabel: "b",
-          summaryFocus:
-            "Preserve the user's instruction and continue the work.",
-        },
-        undefined,
-        undefined,
-        ctx,
-      );
-    } catch (e) {
-      thrown = e;
-    }
-    assert.ok(thrown, "rewind should re-throw the original (B) error");
-    const msg = thrown instanceof Error ? thrown.message : String(thrown);
-    assert.match(msg, /transient prior-clear boom/);
-    // Retry succeeded — no salvage detail.
-    assert.ok(
-      !/salvage:/.test(msg),
-      `expected no salvage detail when prior-clear retry succeeds; got: ${msg}`,
-    );
-    // Error.cause preserves the original (B) throw.
-    assert.ok(thrown instanceof Error);
-    if (thrown instanceof Error) {
-      assert.ok(
-        thrown.cause instanceof Error,
-        "thrown.cause must preserve the original (B) Error",
-      );
-      if (thrown.cause instanceof Error) {
-        assert.match(thrown.cause.message, /transient prior-clear boom/);
-      }
-    }
-    // (A) wrote successfully on the first call: anchor:b lives on the
-    // new summary entry (the leaf-side synthetic's parent).
-    let summaryWithLabelEnd: string | null = null;
-    for (const e of sm.getBranch()) {
-      if (e.type === "branch_summary" && sm.getLabel(e.id) === "anchor:b") {
-        summaryWithLabelEnd = e.id;
-        break;
-      }
-    }
-    assert.ok(
-      summaryWithLabelEnd,
-      "the new branch_summary must carry anchor:b (call #1 succeeded)",
-    );
-    // (B) RETRY succeeded: the prior tB lost its label. Without the
-    // discriminant split, the retry would re-run (A) instead, leaving
-    // tB still labeled — anchor:b would resolve to two entries.
-    assert.notEqual(
-      sm.getLabel(tB.assistantId),
-      "anchor:b",
-      "prior anchor:b must be cleared by the salvage retry of (B)",
-    );
-    // findLabeledEntry resolves anchor:b uniquely to the new summary.
-    assert.equal(
-      __testHooks.findLabeledEntry(sm, "anchor:b"),
-      summaryWithLabelEnd,
-      "anchor:b must resolve uniquely to the new summary post-salvage",
-    );
-    // Synthetic landed on the chain so pi's tool_result will pair correctly.
-    const leafId = sm.getLeafId();
-    assert.ok(leafId);
-    const leaf = sm.getEntry(leafId as string);
-    assert.ok(leaf && leaf.type === "message");
-    if (leaf && leaf.type === "message") {
-      assert.equal(leaf.message.role, "assistant");
-      const c0 = (
-        leaf.message.content as Array<{ type: string; id?: string }>
-      )[0];
-      assert.equal(c0.type, "toolCall");
-      assert.equal(c0.id, "tc-rewind");
-    }
-  });
-
-  it("prior-clear (clearPrior) throws on every call → salvage detail surfaces 'prior-clear retry failed'; the new `newLabel` label still lives", async () => {
-    // Sister test to the retry-succeeds case above: when BOTH the
-    // original (B) prior-clear AND the salvage retry of (B) throw,
-    // the wrapped error must surface a salvage detail that names the
-    // prior-clear (NOT "newLabel retry failed" — that diagnostic is
-    // for the (A) failure mode and would be misleading here). This
-    // pins the salvage-detail prose introduced by the failedStep
-    // split: a regression that re-conflated the discriminants would
-    // either retry (A) (silently succeeding, no detail) or surface
-    // the wrong salvage-detail string.
-    const { sm, pi, tool, ctx } = setup();
-    const tB = appendTurn(sm, "u1", "a1", 6_000);
-    pi.pi.setLabel(tB.assistantId, "anchor:b");
-    const tA = appendTurn(sm, "u2", "a2", 16_000);
-    pi.pi.setLabel(tA.assistantId, "anchor:a");
-    appendTurn(sm, "u3", "a3", 22_000);
-    appendTurn(sm, "u4", "a4", 28_000);
-
-    // Patch after pre-anchors. Throw on call #2 onward (B and the
-    // retry of B). Call #1 (A) succeeds.
-    let calls = 0;
-    const origSetLabel = pi.pi.setLabel.bind(pi.pi);
-    (pi.pi as { setLabel: typeof pi.pi.setLabel }).setLabel = (
-      entryId: string,
-      label: string | undefined,
-    ) => {
-      calls++;
-      if (calls >= 2) throw new Error(`prior-clear boom #${calls}`);
-      return origSetLabel(entryId, label);
-    };
-
-    let thrown: unknown;
-    try {
-      await tool.execute(
-        "tc-rewind",
-        {
-          action: "rewind",
-          rewindTo: "a",
-          newLabel: "b",
-          summaryFocus:
-            "Preserve the user's instruction and continue the work.",
-        },
-        undefined,
-        undefined,
-        ctx,
-      );
-    } catch (e) {
-      thrown = e;
-    }
-    assert.ok(thrown);
-    const msg = thrown instanceof Error ? thrown.message : String(thrown);
-    // Original (B) error propagates verbatim as the base.
-    assert.match(msg, /prior-clear boom #2/);
-    // Salvage detail names the prior-clear, NOT the newLabel retry.
-    // Tight on both sides: the correct diagnostic must be present, and
-    // the wrong (newLabel-retry) diagnostic must NOT be present.
-    assert.match(msg, /salvage:.*prior-clear retry failed/);
-    assert.ok(
-      !/newLabel retry failed/.test(msg),
-      `prior-clear failure must not surface a newLabel-retry diagnostic; got: ${msg}`,
-    );
-    // Three setLabel calls fired: (A), original (B), retry of (B).
-    assert.equal(
-      calls,
-      3,
-      "setLabel was called three times: (A) write + (B) original + (B) retry",
-    );
-    // Error.cause preserves the original (B) throw.
-    assert.ok(thrown instanceof Error);
-    if (thrown instanceof Error) {
-      assert.ok(
-        thrown.cause instanceof Error,
-        "thrown.cause must preserve the original (B) Error",
-      );
-      if (thrown.cause instanceof Error) {
-        assert.match(thrown.cause.message, /prior-clear boom #2/);
-      }
-    }
-    // (A) succeeded: the new summary still carries anchor:b. Even when
-    // the prior-clear permanently fails, the new write survives so
-    // single-call navigation still resolves correctly via
-    // findLabeledEntry's leaf→root walk.
-    let summaryWithLabelEnd: string | null = null;
-    for (const e of sm.getBranch()) {
-      if (e.type === "branch_summary" && sm.getLabel(e.id) === "anchor:b") {
-        summaryWithLabelEnd = e.id;
-        break;
-      }
-    }
-    assert.ok(
-      summaryWithLabelEnd,
-      "the new branch_summary must carry anchor:b (call #1 succeeded before (B) threw)",
-    );
-    // Synthetic landed.
-    const leafId = sm.getLeafId();
-    assert.ok(leafId);
-    const leaf = sm.getEntry(leafId as string);
-    assert.ok(leaf && leaf.type === "message");
-    if (leaf?.type === "message" && leaf.message.role === "assistant") {
-      const c0 = (
-        leaf.message.content as Array<{ type: string; id?: string }>
-      )[0];
-      assert.equal(c0.type, "toolCall");
-      assert.equal(c0.id, "tc-rewind");
-    }
   });
 });
 
@@ -6034,6 +5713,7 @@ async function runSessionStart(
   pi: FakePi,
   ctx: FakeCtx,
   fixture: ConfigFixture,
+  reason: "startup" | "reload" | "new" | "resume" | "fork" = "startup",
 ): Promise<void> {
   const handlers = pi.onCalls.get("session_start");
   assert.ok(handlers, "factory must register a session_start handler");
@@ -6041,10 +5721,7 @@ async function runSessionStart(
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
   try {
-    await handlers[0](
-      { type: "session_start", reason: "startup" } as never,
-      ctx as never,
-    );
+    await handlers[0]({ type: "session_start", reason } as never, ctx as never);
   } finally {
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -6052,11 +5729,19 @@ async function runSessionStart(
 }
 
 /** Fire the captured synchronous `turn_end` handler. */
-function fireTurnEnd(pi: FakePi, ctx: FakeCtx): void {
+function fireTurnEnd(pi: FakePi, ctx: FakeCtx, turnIndex = 0): void {
   const handlers = pi.onCalls.get("turn_end");
   assert.ok(handlers, "factory must register a turn_end handler");
   assert.equal(handlers.length, 1);
-  handlers[0]({ type: "turn_end" } as never, ctx as never);
+  handlers[0]({ type: "turn_end", turnIndex } as never, ctx as never);
+}
+
+/** Fire the captured `agent_end` handler (run-end fallback). */
+function fireAgentEnd(pi: FakePi, ctx: FakeCtx): void {
+  const handlers = pi.onCalls.get("agent_end");
+  assert.ok(handlers, "factory must register an agent_end handler");
+  assert.equal(handlers.length, 1);
+  handlers[0]({ type: "agent_end", messages: [] } as never, ctx as never);
 }
 
 /** Drive the `before_agent_start` handler to (re)compute the tool gate. */
@@ -6682,6 +6367,486 @@ describe("rewind hint: turn_end handler (#44)", () => {
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+});
+
+// =============================================================================
+// automatic start anchor (#55)
+//
+// The extension writes a silent `anchor:start` label at the X-th turn of the
+// agent run (config `anchorStartAfterTurns`, default 2), or at the run's end
+// when the run finishes earlier. Per-session settled state is keyed by
+// session id; the `findLabeledEntry` existence check on the active branch is
+// authoritative. These tests drive the real session_start / turn_end /
+// agent_end handlers against temp config fixtures (real loader, real fs) and
+// in-memory SessionManagers. No LLM is involved.
+// =============================================================================
+
+describe("automatic start anchor (#55)", () => {
+  const ENV_KEY = "PI_NAVIGATE_TREE_START_ANCHOR";
+  let savedEnv: string | undefined;
+
+  beforeEach(() => {
+    savedEnv = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = savedEnv;
+    savedEnv = undefined;
+  });
+
+  it("registers exactly one agent_end handler", () => {
+    const { pi } = setup();
+    const handlers = pi.onCalls.get("agent_end");
+    assert.ok(handlers, "factory must register an agent_end handler");
+    assert.equal(handlers.length, 1);
+  });
+
+  it("defaults to X=2 with no config: silent write at the 2nd turn, no model message, no UI", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [], "absent config must not warn");
+
+      appendTurn(sm, "u1", "a1");
+      const leaf1 = sm.getLeafId();
+      fireTurnEnd(pi, ctx, 0); // turn 1: below X
+      assert.equal(pi.setLabelCalls.length, 0);
+      assert.equal(sm.getLabel(leaf1 as string), undefined);
+
+      appendTurn(sm, "u2", "a2");
+      const leaf2 = sm.getLeafId();
+      fireTurnEnd(pi, ctx, 1); // turn 2: triggers
+      assert.equal(pi.setLabelCalls.length, 1);
+      assert.deepEqual(pi.setLabelCalls[0], [leaf2, START_ANCHOR_LABEL]);
+      assert.equal(sm.getLabel(leaf2 as string), START_ANCHOR_LABEL);
+      assert.equal(__testHooks.findLabeledEntry(sm, START_ANCHOR_LABEL), leaf2);
+      // Silent: label entry only — no model message, no UI.
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("honors a configured X and anchors the X-th turn's persisted tail", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 3 }));
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+
+      appendTurn(sm, "u1", "a1");
+      fireTurnEnd(pi, ctx, 0);
+      assert.equal(pi.setLabelCalls.length, 0, "turn 1 must not fire at X=3");
+      appendTurn(sm, "u2", "a2");
+      fireTurnEnd(pi, ctx, 1);
+      assert.equal(pi.setLabelCalls.length, 0, "turn 2 must not fire at X=3");
+      appendTurn(sm, "u3", "a3");
+      const leaf = sm.getLeafId();
+      fireTurnEnd(pi, ctx, 2);
+      assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("project X overrides global when trusted; an untrusted project is ignored", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 5 }));
+      writeProjectConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 2 }));
+
+      // Trusted: project 2 fires at the 2nd turn.
+      {
+        const { sm, pi, ctx } = setup();
+        ctx.cwd = fixture.projectDir;
+        ctx.isProjectTrusted = () => true;
+        await runSessionStart(pi, ctx, fixture);
+        appendTurn(sm, "u1", "a1");
+        appendTurn(sm, "u2", "a2");
+        fireTurnEnd(pi, ctx, 1);
+        assert.equal(pi.setLabelCalls.length, 1);
+      }
+
+      // Untrusted: global 5 applies; the 2nd turn must not fire.
+      {
+        const { sm, pi, ctx } = setup();
+        ctx.cwd = fixture.projectDir;
+        await runSessionStart(pi, ctx, fixture);
+        appendTurn(sm, "u1", "a1");
+        appendTurn(sm, "u2", "a2");
+        fireTurnEnd(pi, ctx, 1);
+        assert.equal(pi.setLabelCalls.length, 0);
+      }
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("invalid project X warns and falls through to the valid global layer", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 3 }));
+      writeProjectConfig(
+        fixture,
+        JSON.stringify({ anchorStartAfterTurns: "nope" }),
+      );
+      const { sm, pi, ctx } = setup();
+      ctx.cwd = fixture.projectDir;
+      ctx.isProjectTrusted = () => true;
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [
+        [
+          `navigate_tree: invalid anchorStartAfterTurns in project config at ${projectConfigPath(fixture)} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`,
+          "warning",
+        ],
+      ]);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const leaf = sm.getLeafId();
+      fireTurnEnd(pi, ctx, 2); // global X=3
+      assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("loads the field for all five session_start reasons", async () => {
+    const reasons = ["startup", "reload", "new", "resume", "fork"] as const;
+    for (const reason of reasons) {
+      const fixture = makeConfigFixture();
+      try {
+        writeGlobalConfig(
+          fixture,
+          JSON.stringify({ anchorStartAfterTurns: 4 }),
+        );
+        const { sm, pi, ctx } = setup();
+        await runSessionStart(pi, ctx, fixture, reason);
+        assert.deepEqual(
+          ctx.notifyCalls,
+          [],
+          `${reason}: valid config must not warn`,
+        );
+        for (let i = 0; i < 3; i++) {
+          appendTurn(sm, `u${i}`, `a${i}`);
+          fireTurnEnd(pi, ctx, i);
+        }
+        assert.equal(pi.setLabelCalls.length, 0, `${reason}: below X`);
+        appendTurn(sm, "u4", "a4");
+        fireTurnEnd(pi, ctx, 3);
+        assert.equal(pi.setLabelCalls.length, 1, `${reason}: X-th turn writes`);
+      } finally {
+        cleanupConfigFixture(fixture);
+      }
+    }
+  });
+
+  it("agent_end fallback settles a run shorter than X at the run's end", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 5 }));
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      fireTurnEnd(pi, ctx, 0);
+      appendTurn(sm, "u2", "a2");
+      fireTurnEnd(pi, ctx, 1);
+      const leaf = sm.getLeafId();
+      assert.equal(pi.setLabelCalls.length, 0);
+      fireAgentEnd(pi, ctx);
+      assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
+      assert.equal(sm.getLabel(leaf as string), START_ANCHOR_LABEL);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("agent_end after a run with no turns anchors the last persisted entry (user message)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      const userId = sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "only a user message" }],
+      } as never);
+      fireAgentEnd(pi, ctx);
+      assert.deepEqual(pi.setLabelCalls, [[userId, START_ANCHOR_LABEL]]);
+      assert.equal(sm.getLabel(userId), START_ANCHOR_LABEL);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("settles after the first write: later turns and a second agent run never re-insert", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const firstLeaf = sm.getLeafId();
+      fireTurnEnd(pi, ctx, 1);
+      assert.equal(pi.setLabelCalls.length, 1);
+      fireAgentEnd(pi, ctx); // same run's end: settled, no-op
+      appendTurn(sm, "u3", "a3");
+      fireTurnEnd(pi, ctx, 1); // second run's 2nd turn: no-op
+      fireAgentEnd(pi, ctx);
+      assert.equal(pi.setLabelCalls.length, 1, "must never re-insert");
+      assert.equal(
+        __testHooks.findLabeledEntry(sm, START_ANCHOR_LABEL),
+        firstLeaf,
+        "the original label target must not move",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("an existing anchor:start wins (manual /tree label): skip + settle, never write", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      const t = appendTurn(sm, "u1", "a1");
+      pi.pi.setLabel(t.assistantId, START_ANCHOR_LABEL);
+      appendTurn(sm, "u2", "a2");
+      const writesBefore = pi.setLabelCalls.length;
+      fireTurnEnd(pi, ctx, 1);
+      fireAgentEnd(pi, ctx);
+      appendTurn(sm, "u3", "a3");
+      fireTurnEnd(pi, ctx, 1);
+      assert.equal(
+        pi.setLabelCalls.length,
+        writesBefore,
+        "an existing label must settle the session without a write",
+      );
+      assert.equal(sm.getLabel(t.assistantId), START_ANCHOR_LABEL);
+      assert.equal(
+        __testHooks.findLabeledEntry(sm, START_ANCHOR_LABEL),
+        t.assistantId,
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("toolActive gate: inactive tool skips; reactivated tool writes", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      await fireBeforeAgentStart(pi, ["read"]);
+      fireTurnEnd(pi, ctx, 1);
+      fireAgentEnd(pi, ctx);
+      assert.equal(pi.setLabelCalls.length, 0);
+      await fireBeforeAgentStart(pi, ["read", TOOL_NAME]);
+      fireAgentEnd(pi, ctx);
+      assert.equal(pi.setLabelCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("kill switch is read at write time: =0 skips both triggers; unset retries", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const leaf = sm.getLeafId();
+      process.env[ENV_KEY] = "0";
+      fireTurnEnd(pi, ctx, 1);
+      fireAgentEnd(pi, ctx);
+      assert.equal(
+        pi.setLabelCalls.length,
+        0,
+        "kill switch must suppress both triggers",
+      );
+      delete process.env[ENV_KEY];
+      // A skipped settle left the session unsettled: the next trigger retries.
+      fireAgentEnd(pi, ctx);
+      assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("setLabel throw falls back to appendLabelChange(leafId, 'anchor:start') and settles", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const leaf = sm.getLeafId();
+      const appendCalls: unknown[][] = [];
+      const origAppend = sm.appendLabelChange.bind(sm);
+      (
+        sm as unknown as {
+          appendLabelChange: (...args: unknown[]) => string;
+        }
+      ).appendLabelChange = (...args: unknown[]) => {
+        appendCalls.push(args);
+        return origAppend(args[0] as string, args[1] as string | undefined);
+      };
+      (
+        pi.pi as unknown as { setLabel: (...args: unknown[]) => void }
+      ).setLabel = () => {
+        throw new Error("stale session runtime");
+      };
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx, 1));
+      assert.deepEqual(appendCalls, [[leaf, START_ANCHOR_LABEL]]);
+      assert.equal(sm.getLabel(leaf as string), START_ANCHOR_LABEL);
+      // Settled via the fallback: later triggers are no-ops.
+      fireTurnEnd(pi, ctx, 1);
+      fireAgentEnd(pi, ctx);
+      assert.equal(appendCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("double write failure stays fail-open and unsettled for the next retry", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const origSetLabel = pi.pi.setLabel.bind(pi.pi);
+      const origAppend = sm.appendLabelChange.bind(sm);
+      (
+        pi.pi as unknown as { setLabel: (...args: unknown[]) => void }
+      ).setLabel = () => {
+        throw new Error("stale session runtime");
+      };
+      (
+        sm as unknown as {
+          appendLabelChange: (...args: unknown[]) => string;
+        }
+      ).appendLabelChange = () => {
+        throw new Error("append exploded");
+      };
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx, 1));
+      assert.equal(pi.setLabelCalls.length, 0);
+      // Restore both: the unsettled session retries and succeeds at the
+      // run end.
+      (pi.pi as unknown as { setLabel: typeof pi.pi.setLabel }).setLabel =
+        origSetLabel;
+      (
+        sm as unknown as { appendLabelChange: typeof sm.appendLabelChange }
+      ).appendLabelChange = origAppend;
+      fireAgentEnd(pi, ctx);
+      assert.equal(pi.setLabelCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("existence-check read failure leaves the session unsettled (retries later)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const origGetBranch = sm.getBranch.bind(sm);
+      let armed = true;
+      (sm as unknown as { getBranch: () => unknown }).getBranch = () => {
+        if (armed) throw new Error("getBranch boom");
+        return origGetBranch();
+      };
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx, 1));
+      assert.equal(pi.setLabelCalls.length, 0);
+      armed = false;
+      fireAgentEnd(pi, ctx);
+      assert.equal(pi.setLabelCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("per-session keying: interleaved sessions settle independently", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const smA = SessionManager.inMemory("/tmp");
+      const smB = SessionManager.inMemory("/tmp");
+      const pi = makeFakePi(smA);
+      navigateTree(pi.pi, { summarize: fakeSummarize as never });
+      const ctxA = makeCtx(smA);
+      const ctxB = makeCtx(smB);
+      const writes: Array<[string, string | undefined]> = [];
+      let target = smA;
+      (
+        pi.pi as unknown as {
+          setLabel: (entryId: string, label: string | undefined) => void;
+        }
+      ).setLabel = (entryId, label) => {
+        writes.push([entryId, label]);
+        target.appendLabelChange(entryId, label);
+      };
+      await runSessionStart(pi, ctxA, fixture);
+      await runSessionStart(pi, ctxB, fixture);
+
+      appendTurn(smA, "a-u1", "a-a1");
+      appendTurn(smB, "b-u1", "b-a1");
+      appendTurn(smA, "a-u2", "a-a2");
+      appendTurn(smB, "b-u2", "b-a2");
+
+      // B settles first; that must not suppress A's independent settle.
+      target = smB;
+      fireTurnEnd(pi, ctxB, 1);
+      assert.equal(writes.length, 1);
+      target = smA;
+      fireTurnEnd(pi, ctxA, 1);
+      assert.equal(writes.length, 2);
+
+      // Both settled: interleaved re-fires are no-ops.
+      fireTurnEnd(pi, ctxB, 1);
+      fireTurnEnd(pi, ctxA, 1);
+      fireAgentEnd(pi, ctxB);
+      fireAgentEnd(pi, ctxA);
+      assert.equal(writes.length, 2);
+      assert.ok(__testHooks.findLabeledEntry(smA, START_ANCHOR_LABEL));
+      assert.ok(__testHooks.findLabeledEntry(smB, START_ANCHOR_LABEL));
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("anchor(name='start') is refused when the automatic label exists (reservation moot)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, tool, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      fireTurnEnd(pi, ctx, 1);
+      assert.equal(pi.setLabelCalls.length, 1);
+      appendTurn(sm, "u3", "a3");
+      const result = await tool.execute(
+        "tc-1",
+        { action: "anchor", name: "start" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, true);
+      assert.match(
+        result.content[0].text,
+        /A label 'start' already exists on the active branch/,
+      );
     } finally {
       cleanupConfigFixture(fixture);
     }
