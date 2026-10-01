@@ -6830,7 +6830,10 @@ describe("automatic start anchor (#55)", () => {
       // `append(...)` call loses `this` and throws instead of writing.
       (
         sm as unknown as {
-          appendLabelChange: (this: unknown, ...args: unknown[]) => string;
+          appendLabelChange: (
+            entryId: string,
+            label: string | undefined,
+          ) => string;
         }
       ).appendLabelChange = function (
         this: unknown,
