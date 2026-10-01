@@ -1942,8 +1942,8 @@ describe("dispatch: rewind happy path", () => {
     assert.ok(bEntry, "b-summary entry still present in storage");
     // Pin label retention explicitly: the b-summary keeps its 'anchor:b'
     // label across the second rewind. Nothing in the rewind path clears
-    // rewindTo's label (it's only newLabel that gets the new write +
-    // move-on-collision), so the prior label survives. A regression that
+    // rewindTo's label (it only writes the fresh newLabel onto the new
+    // summary), so the prior label survives. A regression that
     // accidentally cleared rewindTo on rewind would surface here.
     assert.equal(
       sm.getLabel(sumB),
