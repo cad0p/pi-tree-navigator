@@ -59,18 +59,30 @@ A single agent-callable tool, `navigate_tree`, with three actions:
 
 `name` (written by `anchor`) and `newLabel` (written by `rewind`) both share the reserved `anchor:` label prefix; `rewindTo` resolves against that same namespace. Every label written by `anchor` and every `newLabel` written by `rewind` is referenceable by any subsequent `rewind`'s `rewindTo`, and `list` shows all of them.
 
+Labels are unique on the active branch: `anchor` refuses a `name` and `rewind` refuses a `newLabel` that already exists (the `rewind` check runs before summarization), and an existing label is never moved or cleared. The old move-on-collision rename-forward idiom (`anchor x` → `rewind(newLabel=x)`) is retired — a rewind needs a fresh `newLabel`; the existing label stays addressable via `rewindTo`. Manual `/tree` labels can still duplicate; `list` shows every match and `rewindTo` resolves leaf-most. The extension itself also writes one silent label per session leg: `anchor:start` (see [Automatic start anchor](#automatic-start-anchor)).
+
 **Anchoring is mandated, not suggested.** On every agent start the extension appends a one-line mandate to the end of the system prompt (`before_agent_start`), gated on the tool being active: `navigate_tree: gather all context, then anchor \`context-gathered\`; list anchors and rewind after every milestone or rabbit hole / dead end to keep context low.` The append lands after project context and skills, is re-applied on every prompt, and survives compaction — unlike the `promptGuidelines` bullet it replaced. ~40 tokens (159 chars / 4), constant for prompt caching.
 
-## Rewind hint (optional)
+## Configuration (`tree-navigator.json`)
 
-Long autonomous sessions can blow through context silently — the model can't read pi's footer, and `rewind` is a targeted alternative to pi's lossy auto-compaction, but nothing tells the agent *when* to use it. The rewind hint is an opt-in `turn_end` observer that fires **once per crossing**: when context reaches the configured percentage, the agent gets a persisted nudge to persist what matters to files and rewind to an anchor. Default: **disabled**.
-
-Enable it with a `tree-navigator.json` config in either layer:
+Both the rewind hint and the automatic start anchor read one two-layer config file:
 
 | Layer | Path |
 |---|---|
 | Global | `join(getAgentDir(), "tree-navigator.json")` (`PI_CODING_AGENT_DIR`-aware) |
 | Project | `join(cwd, CONFIG_DIR_NAME, "tree-navigator.json")` (`.pi/` by default; read only when the project is trusted — untrusted projects are ignored silently) |
+
+```json
+{ "rewindHintAtPercent": "90", "anchorStartAfterTurns": 2 }
+```
+
+A project key, when present, wins (including the hint's disable sentinels); absent → global; absent everywhere → the field's default. File-level problems (non-ENOENT read error, invalid JSON, non-object root) warn and make that layer contribute nothing for *every* field, so the other layer still applies; a missing file is silent. Each field-level invalid value emits its own field-scoped warning when the session has a UI (headless sessions stay silent, like every `ui.notify`).
+
+## Rewind hint (optional)
+
+Long autonomous sessions can blow through context silently — the model can't read pi's footer, and `rewind` is a targeted alternative to pi's lossy auto-compaction, but nothing tells the agent *when* to use it. The rewind hint is an opt-in `turn_end` observer that fires **once per crossing**: when context reaches the configured percentage, the agent gets a persisted nudge to persist what matters to files and rewind to an anchor. Default: **disabled**.
+
+Enable it with `rewindHintAtPercent` (see [Configuration](#configuration-tree-navigatorjson) for the layer paths and the shared file-level failure semantics):
 
 ```json
 { "rewindHintAtPercent": "90" }
@@ -79,7 +91,7 @@ Enable it with a `tree-navigator.json` config in either layer:
 - Value: integer **20–95** inclusive. The canonical form is a string (`"90"`); a bare number (`90`) is also accepted.
 - Explicit-disable sentinels: `null`, `false`, `"off"`, `"disabled"` (case-insensitive) — the project layer can switch off a global value.
 - Precedence: a project key, when present, wins (including sentinels). Absent → global. Absent everywhere → disabled.
-- Invalid value (out of range, decimal, non-numeric string, `true`, object): the hint stays off for the session — no fallback to the other layer's threshold — and a warning is shown when the session has a UI (silent headless, like every `ui.notify`). A malformed file (non-ENOENT read error, invalid JSON, non-object root) warns and makes that layer contribute nothing, so the other layer still applies; a missing file is silent.
+- Invalid value (out of range, decimal, non-numeric string, `true`, object): the hint stays off for the session — no fallback to the other layer's threshold — and its field-scoped warning is shown when the session has a UI.
 - One hint per crossing: fires when `percent >= threshold`, re-arms only after percent drops back below it (a rewind or compaction); no escalation, no re-fire while spent.
 
 When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message. Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
@@ -98,6 +110,26 @@ Independent of the hint, the tool ships two static `promptGuidelines` bullets, p
 ### Compaction guidance
 
 The hint is an alternative to auto-compaction. Auto-compaction fires at `contextWindow − reserveTokens` (`compaction.reserveTokens`, default 16384) — ~98.4% of a 1M window, ~91.8% of 200k, ~87.2% of 128k — so on small windows a 90% hint can land at or after the compaction point. Recommended: disable auto-compaction (`"compaction": { "enabled": false }`) so running out mid-persist produces pi's loud context-window error instead of a silent lossy compaction. Keep compaction enabled only as a safety net if you'd rather the model continue and compact mid-write; the hint never overrides it.
+
+## Automatic start anchor
+
+Independent of the hint, the extension writes a silent `anchor:start` label at the X-th turn of the agent run (or at the run's end if it finishes earlier), so every session leg has a guaranteed low-floor fallback rewind target (typically ~4% of the window) with no user action. `start` shows up in `list` output like any other anchor; nothing else model-visible changes in v1.
+
+`anchorStartAfterTurns` (see [Configuration](#configuration-tree-navigatorjson)):
+
+- Value: integer **1–50** inclusive. A bare number is canonical (`2`); numeric strings (`"2"`) are accepted. Default **2**.
+- **Non-optional**: unlike the hint, an absent `anchorStartAfterTurns` — or no config file at all — still fires at the default; absence is never a warning.
+- Invalid value (out of range, decimal, non-numeric string, `null`, `false`, object): a field-scoped warning, then the other layer's valid value applies, else the default 2 — a touched-but-invalid value must not disable a non-optional feature.
+- Precedence: trusted project > global > default 2.
+- Kill switch: `PI_NAVIGATE_TREE_START_ANCHOR=0` suppresses the write, read at write time (a mid-process change applies without `/reload`), matching the `PI_NAVIGATE_TREE_SUMMARY_CACHE=0` precedent.
+
+Behavior and edge cases:
+
+- **Run-bounded**: X counts native turns of the current agent run. A run shorter than X anchors at its end (`agent_end`); `agent_end` fires on completed, aborted, and errored runs, so settlement always happens by the end of the first run (with X=2, even a one-turn run anchors at turn 1).
+- **Once per session**: `start` marks the start of the current session leg. Once the label is written — or found already on the active branch (e.g. a manual `/tree` label) — the extension never writes it again in that session, including later prompts and agent loops. `/reload` re-evaluates only via the existence check, so no duplicate is ever written.
+- **Every session**, including subagents, gated only on `navigate_tree` being in the active tool set (headless included).
+- **Labels are unique** (see [What you get](#what-you-get)): the tool refuses a duplicate `name`/`newLabel`, so `start` is never moved or overwritten by the agent. A manual `/tree` duplicate remains possible; `list` shows both and `rewindTo` resolves leaf-most.
+- Silent by design: a label entry only — no model message, no UI.
 
 ## How it works
 
