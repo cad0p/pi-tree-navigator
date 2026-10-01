@@ -726,39 +726,46 @@ export default function (
   let rewindHintAtPercent: number | null = null;
   let hintTracker = new RewindHintTracker();
 
-  // Auto start-anchor closure state (#55). The settled set is keyed by
-  // session id and NEVER cleared in-process: once a session has settled
-  // (write or found-existing), no later prompt / agent loop re-inserts the
-  // label. `/reload` builds a fresh closure, so a reloaded session
-  // re-settles once via the existence check (no duplicate write).
-  let anchorStartAfterTurns = START_ANCHOR_DEFAULT_TURNS;
+  // Auto start-anchor closure state (#55). All of it is keyed by session id
+  // and NEVER cleared in-process: once a session has settled (write or
+  // found-existing), no later prompt / agent loop re-inserts the label.
+  // `/reload` builds a fresh closure, so a reloaded session re-settles once
+  // via the existence check (no duplicate write). The per-session maps keep
+  // two in-process sessions (e.g. the main session and a subagent) from
+  // sharing each other's config value, tool-active gate, or settle marker.
   const anchorStartSettled = new Set<string>();
+  const anchorStartTurnsBySession = new Map<string, number>();
+  const toolActiveBySession = new Map<string, boolean>();
 
   // Auto start anchor (#55): silent `anchor:start` write, shared by the
-  // `turn_end` trigger and the `agent_end` fallback. Fail-open everywhere:
-  // any read/write failure leaves the session unsettled so the next turn or
-  // run end retries, and nothing throws into the agent loop.
-  function writeStartAnchorIfNeeded(ctx: {
-    sessionManager: {
-      getSessionId(): string;
-      getLeafId(): string | null;
-      getBranch(): SessionEntry[];
-      getLabel(id: string): string | undefined;
-    };
-  }): void {
-    if (!toolActive) return;
+  // `turn_end` trigger and the `agent_end` fallback. `completedTurns` is the
+  // number of finished turns in the current agent run
+  // (`Number.POSITIVE_INFINITY` for the run-end fallback). Fail-open
+  // everywhere: any read/write failure leaves the session unsettled so the
+  // next turn or run end retries, and nothing throws into the agent loop.
+  function writeStartAnchorIfNeeded(
+    sm: SessionManager,
+    completedTurns: number,
+  ): void {
     // Kill switch read at write time (mirrors PI_NAVIGATE_TREE_SUMMARY_CACHE):
     // a mid-process change applies without an extension reload.
     if (process.env.PI_NAVIGATE_TREE_START_ANCHOR === "0") return;
-    let sm: SessionManager;
     let sessionId: string;
     try {
-      sm = ctx.sessionManager as SessionManager;
       sessionId = sm.getSessionId();
     } catch {
       return;
     }
+    // Per-session tool gate (#55): a sibling session's `before_agent_start`
+    // (e.g. a subagent whose tool subset omits `navigate_tree`) must not
+    // clear this session's gate. Absent = fail-open until a gate is set.
+    if (toolActiveBySession.get(sessionId) === false) return;
     if (anchorStartSettled.has(sessionId)) return;
+    // Per-session threshold (#55): two sessions started with different
+    // project configs must not share one closure value.
+    const startAfterTurns =
+      anchorStartTurnsBySession.get(sessionId) ?? START_ANCHOR_DEFAULT_TURNS;
+    if (completedTurns < startAfterTurns) return;
     try {
       // The existence check is authoritative: a `start` already on the
       // active branch (manual `/tree` label, pre-reload write, prior
@@ -784,12 +791,13 @@ export default function (
       // Loader-level setLabel can throw on a stale runtime while the
       // captured SessionManager still writes; same fallback shape as the
       // hint's appendCustomMessageEntry path. A successful direct append
-      // settles; a double failure stays unsettled and retries later.
+      // settles; a missing or throwing append stays unsettled and retries
+      // later (an optional call on a missing method must NOT read as a
+      // successful write).
       try {
-        (sm as Partial<SessionManager>).appendLabelChange?.(
-          leafId,
-          START_ANCHOR_LABEL,
-        );
+        const append = (sm as Partial<SessionManager>).appendLabelChange;
+        if (typeof append !== "function") return;
+        append.call(sm, leafId, START_ANCHOR_LABEL);
         anchorStartSettled.add(sessionId);
       } catch {
         // Fail-open: never throw into the agent loop.
@@ -807,8 +815,8 @@ export default function (
     const projectTrusted = ctx.isProjectTrusted();
     const hasUI = ctx.hasUI;
     const ui = ctx.ui;
+    const sessionId = ctx.sessionManager.getSessionId();
     rewindHintAtPercent = null;
-    anchorStartAfterTurns = START_ANCHOR_DEFAULT_TURNS;
     hintTracker = new RewindHintTracker();
     toolActive = true;
     let threshold: number | null = null;
@@ -833,7 +841,10 @@ export default function (
       warnings = [];
     }
     rewindHintAtPercent = threshold;
-    anchorStartAfterTurns = startTurns;
+    anchorStartTurnsBySession.set(sessionId, startTurns);
+    // Fresh leg: the per-session gate re-arms on the next
+    // `before_agent_start`; absent = fail-open in the meantime.
+    toolActiveBySession.delete(sessionId);
     if (hasUI) {
       for (const warning of warnings) ui.notify(warning, "warning");
     }
@@ -857,9 +868,17 @@ export default function (
   // when `selectedTools` is undefined (this extension always registers it).
   // The same check gates the rewind hint (#44): an inactive tool must not
   // fire `turn_end` nudges the model can't act on.
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const selected = event.systemPromptOptions?.selectedTools;
     toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
+    // Per-session copy of the gate (#55): the shared `toolActive` above
+    // drives the hint, but an in-process sibling session must not clear this
+    // session's auto-anchor gate.
+    try {
+      toolActiveBySession.set(ctx.sessionManager.getSessionId(), toolActive);
+    } catch {
+      // Fail-open: the per-session gate stays absent.
+    }
     if (!toolActive) return {};
     return { systemPrompt: `${event.systemPrompt}\n\n${ANCHOR_MANDATE}` };
   });
@@ -884,6 +903,16 @@ export default function (
   // before any ctx use. Fires once per threshold crossing; see
   // `RewindHintTracker` for the re-arm semantics.
   pi.on("turn_end", (event, ctx) => {
+    // Single `sessionManager` capture shared by the auto start-anchor and
+    // the rewind hint: the stale-ctx contract is exactly one read, before
+    // any throw-capable call. A throwing getter (replaced session) skips
+    // both paths without throwing into the loop.
+    let sm: typeof ctx.sessionManager | null;
+    try {
+      sm = ctx.sessionManager;
+    } catch {
+      sm = null;
+    }
     // Auto start anchor (#55): fires at the X-th turn of the run. Runs
     // BEFORE and independently of the hint block — the two fields have
     // separate config semantics (the hint can be off/null while the start
@@ -891,9 +920,7 @@ export default function (
     // the pre-increment. This is the only TurnEndEvent field read here: it
     // exists on both pi 0.84.2 (dev-dep) and 0.99.2 (host); host-only
     // fields (`messageEntryId` / `outcome`) must never be read.
-    if (event.turnIndex + 1 >= anchorStartAfterTurns) {
-      writeStartAnchorIfNeeded(ctx);
-    }
+    if (sm) writeStartAnchorIfNeeded(sm as SessionManager, event.turnIndex + 1);
     if (!toolActive || rewindHintAtPercent === null) return;
     const usage = ctx.getContextUsage();
     // `percent == null` is pi's post-compaction state (unknown tokens), and
@@ -907,15 +934,12 @@ export default function (
     }
     // Collect anchors BEFORE marking the crossing spent: a throwing
     // `getBranch` / `getLabel` must leave the crossing unspent so the next
-    // turn can retry — never burn the one shot on a failed state read.
-    // `sm` is captured BEFORE the throw-capable `pi.sendMessage` below, so
-    // the fallback append never re-reads a lazy ctx getter after the throw.
-    // Typed via `typeof ctx.sessionManager` (ReadonlySessionManager, not
-    // re-exported from the package root).
-    let sm: typeof ctx.sessionManager;
+    // turn can retry — never burn the one shot on a failed state read. The
+    // shared `sm` was captured before any throw-capable call, so the
+    // fallback append never re-reads a lazy ctx getter after a throw.
+    if (!sm) return;
     let anchorNames: string[];
     try {
-      sm = ctx.sessionManager;
       anchorNames = collectAnchorNames(sm);
     } catch {
       return;
@@ -979,7 +1003,13 @@ export default function (
   // `agent_end` fires on complete / aborted / errored runs; the settled set
   // makes this a no-op once the turn trigger already wrote.
   pi.on("agent_end", (_event, ctx) => {
-    writeStartAnchorIfNeeded(ctx);
+    let sm: typeof ctx.sessionManager;
+    try {
+      sm = ctx.sessionManager;
+    } catch {
+      return;
+    }
+    writeStartAnchorIfNeeded(sm as SessionManager, Number.POSITIVE_INFINITY);
   });
 
   pi.registerTool({

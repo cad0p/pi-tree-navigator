@@ -5747,6 +5747,7 @@ function fireAgentEnd(pi: FakePi, ctx: FakeCtx): void {
 /** Drive the `before_agent_start` handler to (re)compute the tool gate. */
 async function fireBeforeAgentStart(
   pi: FakePi,
+  ctx: FakeCtx,
   selectedTools: string[] | undefined,
 ): Promise<void> {
   const handlers = pi.onCalls.get("before_agent_start");
@@ -5759,7 +5760,7 @@ async function fireBeforeAgentStart(
       systemPrompt: "BASE",
       systemPromptOptions: selectedTools === undefined ? {} : { selectedTools },
     } as never,
-    {} as never,
+    ctx as never,
   );
 }
 
@@ -5926,7 +5927,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       );
 
       // Tool gate off: no fire, even across the threshold.
-      await fireBeforeAgentStart(pi, ["read", "bash"]);
+      await fireBeforeAgentStart(pi, ctx, ["read", "bash"]);
       ctx.setContextUsage(usageAt(10));
       fireTurnEnd(pi, ctx);
       ctx.setContextUsage(usageAt(95));
@@ -5983,7 +5984,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
   it("does not fire when the tool is inactive", async () => {
     const { fixture, pi, ctx } = await enabledSetup();
     try {
-      await fireBeforeAgentStart(pi, ["read"]);
+      await fireBeforeAgentStart(pi, ctx, ["read"]);
       ctx.setContextUsage(usageAt(99));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 0);
@@ -6351,7 +6352,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
     // `selectedTools` (the fail-open branch) must leave the gate ON.
     const { fixture, pi, ctx } = await enabledSetup();
     try {
-      await fireBeforeAgentStart(pi, undefined);
+      await fireBeforeAgentStart(pi, ctx, undefined);
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
@@ -6363,7 +6364,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
   it("fires while TOOL_NAME is in the selected set", async () => {
     const { fixture, pi, ctx } = await enabledSetup();
     try {
-      await fireBeforeAgentStart(pi, ["read", TOOL_NAME]);
+      await fireBeforeAgentStart(pi, ctx, ["read", TOOL_NAME]);
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
@@ -6378,11 +6379,12 @@ describe("rewind hint: turn_end handler (#44)", () => {
 //
 // The extension writes a silent `anchor:start` label at the X-th turn of the
 // agent run (config `anchorStartAfterTurns`, default 2), or at the run's end
-// when the run finishes earlier. Per-session settled state is keyed by
-// session id; the `findLabeledEntry` existence check on the active branch is
-// authoritative. These tests drive the real session_start / turn_end /
-// agent_end handlers against temp config fixtures (real loader, real fs) and
-// in-memory SessionManagers. No LLM is involved.
+// when the run finishes earlier. Per-session state (settle marker, config
+// value, tool-active gate) is keyed by session id; the `findLabeledEntry`
+// existence check on the active branch is authoritative. These tests drive
+// the real session_start / turn_end / agent_end handlers against temp config
+// fixtures (real loader, real fs) and in-memory SessionManagers. No LLM is
+// involved.
 // =============================================================================
 
 describe("automatic start anchor (#55)", () => {
@@ -6645,11 +6647,11 @@ describe("automatic start anchor (#55)", () => {
       await runSessionStart(pi, ctx, fixture);
       appendTurn(sm, "u1", "a1");
       appendTurn(sm, "u2", "a2");
-      await fireBeforeAgentStart(pi, ["read"]);
+      await fireBeforeAgentStart(pi, ctx, ["read"]);
       fireTurnEnd(pi, ctx, 1);
       fireAgentEnd(pi, ctx);
       assert.equal(pi.setLabelCalls.length, 0);
-      await fireBeforeAgentStart(pi, ["read", TOOL_NAME]);
+      await fireBeforeAgentStart(pi, ctx, ["read", TOOL_NAME]);
       fireAgentEnd(pi, ctx);
       assert.equal(pi.setLabelCalls.length, 1);
     } finally {
@@ -6772,6 +6774,133 @@ describe("automatic start anchor (#55)", () => {
       armed = false;
       fireAgentEnd(pi, ctx);
       assert.equal(pi.setLabelCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("setLabel throw with a missing appendLabelChange stays unsettled and retries", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      appendTurn(sm, "u2", "a2");
+      const leaf = sm.getLeafId();
+      const origSetLabel = pi.pi.setLabel.bind(pi.pi);
+      const origAppend = sm.appendLabelChange.bind(sm);
+      (
+        pi.pi as unknown as { setLabel: (...args: unknown[]) => void }
+      ).setLabel = () => {
+        throw new Error("stale session runtime");
+      };
+      (sm as unknown as { appendLabelChange: unknown }).appendLabelChange =
+        undefined;
+      // A missing fallback method is NOT a successful write: no label, no
+      // settle, and nothing throws into the loop.
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx, 1));
+      assert.equal(
+        sm.getLabel(leaf as string),
+        undefined,
+        "no write may be recorded",
+      );
+      // Restore both: the still-unsettled session retries at the run end.
+      (pi.pi as unknown as { setLabel: typeof pi.pi.setLabel }).setLabel =
+        origSetLabel;
+      (
+        sm as unknown as { appendLabelChange: typeof sm.appendLabelChange }
+      ).appendLabelChange = origAppend;
+      fireAgentEnd(pi, ctx);
+      assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("per-session config: a later session_start must not retune an earlier session", async () => {
+    const fixtureA = makeConfigFixture();
+    const fixtureB = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixtureA, JSON.stringify({ anchorStartAfterTurns: 5 }));
+      writeGlobalConfig(fixtureB, JSON.stringify({ anchorStartAfterTurns: 1 }));
+      const smA = SessionManager.inMemory("/tmp");
+      const smB = SessionManager.inMemory("/tmp");
+      const pi = makeFakePi(smA);
+      navigateTree(pi.pi, { summarize: fakeSummarize as never });
+      const ctxA = makeCtx(smA);
+      const ctxB = makeCtx(smB);
+      const writes: Array<[string, string | undefined]> = [];
+      let target = smA;
+      (
+        pi.pi as unknown as {
+          setLabel: (entryId: string, label: string | undefined) => void;
+        }
+      ).setLabel = (entryId, label) => {
+        writes.push([entryId, label]);
+        target.appendLabelChange(entryId, label);
+      };
+      // B starts second and loads X=1; A must keep its own X=5.
+      await runSessionStart(pi, ctxA, fixtureA);
+      await runSessionStart(pi, ctxB, fixtureB);
+
+      appendTurn(smA, "a-u1", "a-a1");
+      appendTurn(smA, "a-u2", "a-a2");
+      appendTurn(smB, "b-u1", "b-a1");
+
+      fireTurnEnd(pi, ctxA, 1); // A: 2 < 5, no write
+      assert.equal(writes.length, 0, "A must keep its X=5");
+
+      target = smB;
+      const leafB = smB.getLeafId();
+      fireTurnEnd(pi, ctxB, 0); // B: 1 >= 1, writes at its first turn
+      assert.deepEqual(writes, [[leafB, START_ANCHOR_LABEL]]);
+      assert.equal(
+        __testHooks.findLabeledEntry(smA, START_ANCHOR_LABEL),
+        null,
+        "A must stay unanchored",
+      );
+    } finally {
+      cleanupConfigFixture(fixtureA);
+      cleanupConfigFixture(fixtureB);
+    }
+  });
+
+  it("per-session toolActive: a sibling session's inactive gate must not suppress this one", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const smA = SessionManager.inMemory("/tmp");
+      const smB = SessionManager.inMemory("/tmp");
+      const pi = makeFakePi(smA);
+      navigateTree(pi.pi, { summarize: fakeSummarize as never });
+      const ctxA = makeCtx(smA);
+      const ctxB = makeCtx(smB);
+      const writes: Array<[string, string | undefined]> = [];
+      let target = smA;
+      (
+        pi.pi as unknown as {
+          setLabel: (entryId: string, label: string | undefined) => void;
+        }
+      ).setLabel = (entryId, label) => {
+        writes.push([entryId, label]);
+        target.appendLabelChange(entryId, label);
+      };
+      await runSessionStart(pi, ctxA, fixture);
+      await runSessionStart(pi, ctxB, fixture);
+      appendTurn(smA, "a-u1", "a-a1");
+      appendTurn(smA, "a-u2", "a-a2");
+      appendTurn(smB, "b-u1", "b-a1");
+      appendTurn(smB, "b-u2", "b-a2");
+
+      // A has the tool active; B is a restricted sibling session.
+      await fireBeforeAgentStart(pi, ctxA, ["read", TOOL_NAME]);
+      await fireBeforeAgentStart(pi, ctxB, ["read"]);
+
+      target = smA;
+      fireTurnEnd(pi, ctxA, 1);
+      assert.equal(writes.length, 1, "A must write despite B's inactive gate");
+      target = smB;
+      fireTurnEnd(pi, ctxB, 1);
+      assert.equal(writes.length, 1, "B must stay gated");
     } finally {
       cleanupConfigFixture(fixture);
     }
