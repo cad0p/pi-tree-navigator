@@ -6010,7 +6010,8 @@ describe("rewind hint: turn_end handler (#44)", () => {
       const ctxB = makeCtx(smB);
       await fireBeforeAgentStart(pi, ctxB, ["read"]);
 
-      // A crosses the threshold: the hint must still fire.
+      // A crosses: the hint must still fire — i.e. B's `before_agent_start`
+      // did not clear A's per-session gate.
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.equal(
@@ -6019,10 +6020,22 @@ describe("rewind hint: turn_end handler (#44)", () => {
         "a sibling session's before_agent_start must not clear A's hint gate",
       );
 
-      // B itself stays gated off even above the threshold.
+      // Re-arm the shared tracker, then flip the shared fallback back on.
+      ctx.setContextUsage(usageAt(10));
+      fireTurnEnd(pi, ctx);
+      await fireBeforeAgentStart(pi, ctx, [TOOL_NAME, "read"]);
+
+      // B's own false gate must be honored (not silently fall back to the
+      // shared true): B stays silent, must not spend the crossing, and A
+      // must still fire after it.
       ctxB.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctxB);
+      assert.equal(ctxB.notifyCalls.length, 0);
       assert.equal(pi.sendMessageCalls.length, 1);
+
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 2);
     } finally {
       cleanupConfigFixture(fixture);
     }
