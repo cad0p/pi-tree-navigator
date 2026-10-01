@@ -5994,6 +5994,40 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("keeps the tool gate per-session (#58): a sibling session must not clear this session's hint", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+
+      // Session A runs with the tool active, recording A's per-session gate.
+      await fireBeforeAgentStart(pi, ctx, [TOOL_NAME, "read"]);
+
+      // Sibling session B (e.g. an in-process subagent) starts without it.
+      const smB = SessionManager.inMemory("/tmp");
+      const ctxB = makeCtx(smB);
+      await fireBeforeAgentStart(pi, ctxB, ["read"]);
+
+      // A crosses the threshold: the hint must still fire.
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        1,
+        "a sibling session's before_agent_start must not clear A's hint gate",
+      );
+
+      // B itself stays gated off even above the threshold.
+      ctxB.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctxB);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("no-ops on missing/percent-null/zero-window usage without spending the crossing", async () => {
     const { fixture, pi, ctx } = await enabledSetup();
     try {

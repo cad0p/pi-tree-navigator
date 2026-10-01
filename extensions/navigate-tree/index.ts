@@ -921,7 +921,21 @@ export default function (
     // exists on both pi 0.84.2 (dev-dep) and 0.99.2 (host); host-only
     // fields (`messageEntryId` / `outcome`) must never be read.
     if (sm) writeStartAnchorIfNeeded(sm as SessionManager, event.turnIndex + 1);
-    if (!toolActive || rewindHintAtPercent === null) return;
+    // Per-session hint gate (#58): an in-process sibling session's
+    // `before_agent_start` (e.g. a subagent whose tool subset omits
+    // `navigate_tree`) must not clear THIS session's hint. Mirrors the auto
+    // start-anchor's per-session gate; the shared `toolActive` remains the
+    // fallback for sessions with no recorded gate (fail-open).
+    let hintToolActive = toolActive;
+    if (sm) {
+      try {
+        const gated = toolActiveBySession.get(sm.getSessionId());
+        if (gated !== undefined) hintToolActive = gated;
+      } catch {
+        // Stale ctx: keep the shared fallback.
+      }
+    }
+    if (!hintToolActive || rewindHintAtPercent === null) return;
     const usage = ctx.getContextUsage();
     // `percent == null` is pi's post-compaction state (unknown tokens), and
     // `contextWindow <= 0` has no meaningful bar to compare against. Both
