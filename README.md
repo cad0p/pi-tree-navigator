@@ -191,7 +191,7 @@ Two of those fallback reasons are **evidence guards**, not param mirroring: they
 
 ### Synthetic assistant token bias
 
-The synthetic assistant we inject after each rewind carries the **post-rewind chain estimate** in `usage.totalTokens` (so `estimateContextTokens` reads a sensible baseline immediately after the move). The synthetic itself adds a ~50-token toolCall block re-emitted on every subsequent turn until the next rewind — that overhead is **not** reflected in any `usage.*` field, so future `estimateContextTokens` calls understate the chain by ~50 tokens until the next assistant turn writes a fresh usage block. Negligible at typical anchor cadence; mention if you're benchmarking exact token deltas, ignore otherwise.
+The synthetic assistant we inject after each rewind carries the **post-rewind chain estimate** in `usage.totalTokens` (so the local `estimateContextTokens` in `context-tokens.ts` reads a sensible baseline immediately after the move). The synthetic itself adds a ~50-token toolCall block re-emitted on every subsequent turn until the next rewind — that overhead is **not** reflected in any `usage.*` field, so future local `estimateContextTokens` calls understate the chain by ~50 tokens until the next assistant turn writes a fresh usage block. Negligible at typical anchor cadence; mention if you're benchmarking exact token deltas, ignore otherwise.
 
 ## Limitations
 

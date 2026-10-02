@@ -9,8 +9,9 @@
  * `runAgentLoopContinue`, `runToolCall`, `setDefaultStreamFn`, and
  * `streamProxy`). `@earendil-works/pi-coding-agent` never re-exported it at
  * the root in any version (0.87.1 / 0.99.2 / 1.0.0); its implementation
- * lives at `dist/core/compaction/compaction.js`, but the package `exports`
- * map allows only `.` and `./rpc-entry`, so it is not importable. Importing
+ * lives at `dist/core/compaction/compaction.js`, but it is not reachable
+ * through the package `exports` map (root, `./rpc-entry`, and source-only
+ * subpaths only), so it is not importable. Importing
  * the old name as a runtime value therefore left it `undefined` on pi
  * 1.0.0, and every `navigate_tree` action threw
  * `(0, _piAgentCore.estimateContextTokens) is not a function`.

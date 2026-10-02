@@ -402,22 +402,34 @@ const IMPORT_SURFACE_PACKAGES = [
   "@earendil-works/pi-tui",
   "typebox",
 ];
-const IMPORT_STATEMENT_RE = /^[ \t]*import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/gm;
+const IMPORT_STATEMENT_RE = /(?:^|;)\s*import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/gm;
+
+/** `type`-prefixed clause or member: the only value-free import form. */
+function clauseIsTypeOnly(text) {
+  return /^type\b/.test(text);
+}
 
 /**
  * Runtime (value) named imports per package found in one source file.
- * Type-only specifiers are skipped: `import type { X }` statements are
- * erased and can never be `undefined` at runtime, and `type X` members are
- * skipped inside mixed imports.
+ * Returns `found` (package -> names) and `expected` (packages whose matched
+ * statement is a runtime import, recorded even when the member parser
+ * yielded no names so the coverage guard can fail loudly). Type-only
+ * specifiers are skipped: `import type { X }` statements are erased and can
+ * never be `undefined` at runtime, and `type X` members are skipped inside
+ * mixed imports.
  */
 function extractRuntimeImports(source) {
   const found = new Map();
+  const expected = new Set();
   for (const match of source.matchAll(IMPORT_STATEMENT_RE)) {
     const clause = match[1].trim();
     const specifier = match[2];
     if (!IMPORT_SURFACE_PACKAGES.includes(specifier)) continue;
     // `import type { ... }` and namespace imports carry no named values.
-    if (clause.startsWith("type ") || clause.startsWith("*")) continue;
+    if (clauseIsTypeOnly(clause) || clause.startsWith("*")) continue;
+    // A runtime statement matched: the guard expects names for this package
+    // even if the member parser below yields none.
+    expected.add(specifier);
     const names = new Set();
     const brace = clause.indexOf("{");
     const head = (brace === -1 ? clause : clause.slice(0, brace))
@@ -429,7 +441,7 @@ function extractRuntimeImports(source) {
       const body = clause.slice(brace + 1, clause.lastIndexOf("}"));
       for (const raw of body.split(",")) {
         const member = raw.trim();
-        if (!member || member.startsWith("type ")) continue;
+        if (!member || clauseIsTypeOnly(member)) continue;
         const imported = member.split(/\s+as\s+/)[0].trim();
         if (imported) names.add(imported);
       }
@@ -439,28 +451,38 @@ function extractRuntimeImports(source) {
     for (const name of names) bucket.add(name);
     found.set(specifier, bucket);
   }
-  return found;
+  return { found, expected };
 }
 
 /**
- * Strip `//` and block comments while preserving string / template-literal
- * contents, so a commented-out `import` line is never extracted. The probe
- * runs with builtins only (no TypeScript parser in the workflow), so this is
- * a small lexer over the states that matter here.
+ * Blank `//` and block comments and the contents of string / template
+ * literals (delimiters kept), so a commented-out or string-embedded
+ * `import ... from "pkg"` can never match. Import/export module specifier
+ * literals are the one exception: their contents stay readable because the
+ * extractor needs the package name, and they cannot create a statement on
+ * their own (the `import ... from` prefix lives in code). The probe runs
+ * with builtins only (no TypeScript parser in the workflow), so this is a
+ * small lexer over the states that matter here.
  */
-function stripComments(source) {
+function maskCommentsAndLiterals(source) {
   let out = "";
   let i = 0;
   let state = "code";
+  let keepLiteral = false;
   while (i < source.length) {
     const ch = source[i];
     const next = source[i + 1];
     if (state === "code") {
       if (ch === "/" && next === "/") { state = "line"; i += 2; continue; }
       if (ch === "/" && next === "*") { state = "block"; i += 2; continue; }
-      if (ch === "'") state = "single";
-      else if (ch === '"') state = "double";
-      else if (ch === "`") state = "template";
+      if (ch === "'" || ch === '"' || ch === "`") {
+        state = ch === "'" ? "single" : ch === '"' ? "double" : "template";
+        // Module specifiers (never templates) stay readable for extraction.
+        keepLiteral = ch !== "`" && /from\s*$/.test(out);
+        out += ch;
+        i += 1;
+        continue;
+      }
       out += ch; i += 1; continue;
     }
     if (state === "line") {
@@ -471,60 +493,78 @@ function stripComments(source) {
       if (ch === "*" && next === "/") { state = "code"; i += 2; continue; }
       i += 1; continue;
     }
-    // single | double | template: keep content, honor escapes
-    out += ch;
-    if (ch === "\\") { out += next ?? ""; i += 2; continue; }
-    if (
-      (state === "single" && ch === "'") ||
-      (state === "double" && ch === '"') ||
-      (state === "template" && ch === "`")
-    ) {
-      state = "code";
+    // single | double | template
+    const closing = state === "single" ? "'" : state === "double" ? '"' : "`";
+    if (keepLiteral) {
+      out += ch;
+      if (ch === "\\") { out += next ?? ""; i += 2; continue; }
+      if (ch === closing) { state = "code"; keepLiteral = false; }
+      i += 1;
+      continue;
     }
+    if (ch === "\\") {
+      // Blank the escape pair; keep a line continuation's newline.
+      out += next === "\n" ? "\n" : "  ";
+      i += 2;
+      continue;
+    }
+    if (ch === closing) {
+      out += ch;
+      state = "code";
+      i += 1;
+      continue;
+    }
+    out += ch === "\n" ? "\n" : " ";
     i += 1;
   }
   return out;
 }
 
-/**
- * Lenient, independent scan used only as a coverage guard for
- * `extractRuntimeImports`: which surface packages have at least one
- * non-type import statement in the (comment-stripped) source. If the
- * extractor returns no names for one of these, the surface check would
- * otherwise pass vacuously — fail instead. Deliberately a different regex
- * shape from `IMPORT_STATEMENT_RE` so a drift in either is caught.
- */
-function runtimeImportedPackages(source) {
-  const found = new Set();
-  for (const match of source.matchAll(/import\s+([^;]*?)\s+from\s+["']([^"']+)["']/g)) {
-    const specifier = match[2];
-    if (!IMPORT_SURFACE_PACKAGES.includes(specifier)) continue;
-    const clause = match[1].trim();
-    if (clause.startsWith("type ") || clause.startsWith("*")) continue;
-    found.add(specifier);
+/** Parse a package dir's package.json `exports["."]` / `main` root entry. */
+function entryFromPackageJson(pkgDir) {
+  const pkgJsonPath = path.join(pkgDir, "package.json");
+  if (!existsSync(pkgJsonPath)) return null;
+  let pkg;
+  try {
+    pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+  } catch {
+    return null;
   }
-  return found;
+  const rootExport =
+    typeof pkg.exports === "string" ? pkg.exports : pkg.exports?.["."];
+  let entry;
+  if (typeof rootExport === "string") entry = rootExport;
+  else if (rootExport && typeof rootExport === "object") {
+    entry = rootExport.import ?? rootExport.default ?? rootExport.require ?? rootExport.node;
+  }
+  if (!entry && typeof pkg.main === "string") entry = pkg.main;
+  if (!entry) return null;
+  return path.join(pkgDir, entry);
 }
 
 /**
- * Resolve a host package's root entry the way the extension loader would:
- * exports-map aware, and authoritative to PROBE_NODE_MODULES when set.
- * `require.resolve` handles maps that declare a `require`/`default`
- * condition (typebox -> build/index.mjs), but the pi packages declare only
- * `import`/`types` and throw ERR_PACKAGE_PATH_NOT_EXPORTED, so fall back to
- * the package's own package.json `exports["."]` / `main`. That fallback is
- * also why the hardcoded `dist/index.js` of `resolveDist` cannot be reused.
+ * Resolve `pkgName` from one package dir the way a loader would:
+ * `require.resolve` first (exports-map aware, `require`/`default`
+ * conditions; typebox -> build/index.mjs), then the package.json
+ * `exports["."]` / `main` fallback the pi packages need because they
+ * declare only `import`/`types` and throw ERR_PACKAGE_PATH_NOT_EXPORTED.
+ * That fallback is also why `resolveDist`'s hardcoded `dist/index.js`
+ * cannot be reused.
  */
-function resolveHostPackageEntry(pkgName) {
-  const bases = process.env.PROBE_NODE_MODULES
-    ? [process.env.PROBE_NODE_MODULES]
-    : [path.join(process.cwd(), "node_modules"), path.resolve(process.cwd(), "../node_modules")];
-  const pkgDirs = [];
+function resolveFromPackageDir(pkgDir, pkgName) {
+  try {
+    return createRequire(path.join(pkgDir, "resolve.cjs")).resolve(pkgName);
+  } catch {}
+  return entryFromPackageJson(pkgDir);
+}
+
+/** Walk the probe's node_modules candidates (hoisted, then nested). */
+function resolveFromBaseWalk(pkgName, bases) {
   for (const base of bases) {
-    pkgDirs.push(path.join(base, ...pkgName.split("/")));
-    // npm can hoist a transitive host package under a direct dependency
-    // (pi-tui lands in pi-coding-agent/node_modules in the probe install).
-    pkgDirs.push(
+    const pkgDirs = [
+      path.join(base, ...pkgName.split("/")),
+      // npm can hoist a transitive host package under a direct dependency
+      // (pi-tui lands in pi-coding-agent/node_modules in the probe install).
       path.join(
         base,
         "@earendil-works",
@@ -532,33 +572,48 @@ function resolveHostPackageEntry(pkgName) {
         "node_modules",
         ...pkgName.split("/"),
       ),
-    );
-  }
-  for (const pkgDir of pkgDirs) {
-    try {
-      const fromPkgDir = createRequire(path.join(pkgDir, "resolve.cjs"));
-      return fromPkgDir.resolve(pkgName);
-    } catch {}
-    const pkgJsonPath = path.join(pkgDir, "package.json");
-    if (!existsSync(pkgJsonPath)) continue;
-    let pkg;
-    try {
-      pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
-    } catch {
-      continue;
+    ];
+    for (const pkgDir of pkgDirs) {
+      const entry = resolveFromPackageDir(pkgDir, pkgName);
+      if (entry) return entry;
     }
-    const rootExport =
-      typeof pkg.exports === "string" ? pkg.exports : pkg.exports?.["."];
-    let entry;
-    if (typeof rootExport === "string") entry = rootExport;
-    else if (rootExport && typeof rootExport === "object") {
-      entry = rootExport.import ?? rootExport.default ?? rootExport.require ?? rootExport.node;
-    }
-    if (!entry && typeof pkg.main === "string") entry = pkg.main;
-    if (!entry) continue;
-    return path.join(pkgDir, entry);
   }
   return null;
+}
+
+/**
+ * Resolve a host package's root entry the way the extension loader would:
+ * authoritative to PROBE_NODE_MODULES when set. Anchor on the host's
+ * pi-coding-agent install first, then resolve every other package from its
+ * directory so a copy nested under `pi-coding-agent/node_modules` wins over
+ * a hoisted one — that is the copy the extension loader aliases to. Only if
+ * that fails fall back to the base-dir walk.
+ */
+function resolveHostPackageEntry(pkgName) {
+  const bases = process.env.PROBE_NODE_MODULES
+    ? [process.env.PROBE_NODE_MODULES]
+    : [path.join(process.cwd(), "node_modules"), path.resolve(process.cwd(), "../node_modules")];
+
+  if (pkgName !== "@earendil-works/pi-coding-agent") {
+    const piEntry = resolveFromBaseWalk("@earendil-works/pi-coding-agent", bases);
+    if (piEntry) {
+      const fromPiDir = createRequire(
+        path.join(path.dirname(piEntry), "probe-resolve.cjs"),
+      );
+      try {
+        return fromPiDir.resolve(pkgName);
+      } catch {
+        // pi packages expose only `import`/`types`, so require.resolve throws
+        // ERR_PACKAGE_PATH_NOT_EXPORTED. Parse the package.json of the copy
+        // Node would have picked from the same search paths.
+        for (const searchPath of fromPiDir.resolve.paths(pkgName) ?? []) {
+          const entry = entryFromPackageJson(path.join(searchPath, ...pkgName.split("/")));
+          if (entry) return entry;
+        }
+      }
+    }
+  }
+  return resolveFromBaseWalk(pkgName, bases);
 }
 
 let importSurface;
@@ -569,9 +624,12 @@ try {
   const used = new Map();
   const expectedRuntime = new Set();
   for (const file of files) {
-    const source = stripComments(readFileSync(path.join(EXTENSION_SOURCE_DIR, file), "utf8"));
-    for (const pkgName of runtimeImportedPackages(source)) expectedRuntime.add(pkgName);
-    for (const [specifier, names] of extractRuntimeImports(source)) {
+    const source = maskCommentsAndLiterals(
+      readFileSync(path.join(EXTENSION_SOURCE_DIR, file), "utf8"),
+    );
+    const { found, expected } = extractRuntimeImports(source);
+    for (const pkgName of expected) expectedRuntime.add(pkgName);
+    for (const [specifier, names] of found) {
       const bucket = used.get(specifier) ?? new Set();
       for (const name of names) bucket.add(name);
       used.set(specifier, bucket);
@@ -582,7 +640,7 @@ try {
   for (const pkgName of IMPORT_SURFACE_PACKAGES) {
     if (expectedRuntime.has(pkgName) && !used.get(pkgName)?.size) {
       missing.push(
-        `${pkgName} (runtime import(s) present in source but none extracted — extraction may have drifted)`,
+        `${pkgName} (runtime import statement matched but no names extracted — clause parser may have drifted)`,
       );
     }
   }

@@ -99,6 +99,16 @@ describe("estimateContextTokens", () => {
     assert.equal(estimateContextTokens(chain), 1000 + 100 + 100);
   });
 
+  it("picks the newest valid usage, not the oldest", () => {
+    const chain = [
+      assistant(4, { totalTokens: 1000 }), // older valid usage — must be ignored
+      user(400), //                           covered by the newest baseline
+      assistant(4, { totalTokens: 2000 }), // newest valid baseline
+      user(400), //                           trailing: 100
+    ];
+    assert.equal(estimateContextTokens(chain), 2000 + 100);
+  });
+
   it("skips aborted/error/zero-usage baselines and falls through to the previous valid usage", () => {
     const chain = [
       user(4), //                                       ignored
@@ -171,6 +181,16 @@ describe("estimateContextTokens", () => {
   it("image blocks are accounted as chars in the trailing estimate", () => {
     // 400 text chars + 4800 image chars = 5200 → 1300 tokens.
     assert.equal(estimateContextTokens([userWithImage(400)]), 1300);
+  });
+
+  it("circular toolCall arguments throw (plain JSON.stringify — no safeJsonStringify guard)", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const message = assistant(4, { totalTokens: 0 });
+    (message as unknown as { content: unknown }).content = [
+      { type: "toolCall", id: "tc", name: "x", arguments: circular },
+    ];
+    assert.throws(() => estimateContextTokens([message]), TypeError);
   });
 
   it("image blocks after the baseline are counted in the trailing estimate", () => {
