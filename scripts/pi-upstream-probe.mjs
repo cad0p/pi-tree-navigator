@@ -42,7 +42,7 @@
  *
  * Exit code: 0 = all good (no upstream break), 1 = something broke.
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -402,7 +402,7 @@ const IMPORT_SURFACE_PACKAGES = [
   "@earendil-works/pi-tui",
   "typebox",
 ];
-const IMPORT_STATEMENT_RE = /(?:^|;)\s*import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/gm;
+const IMPORT_STATEMENT_RE = /(?:^|[;}\)\]])\s*import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/gm;
 
 /** `type`-prefixed clause or member: the only value-free import form. */
 function clauseIsTypeOnly(text) {
@@ -454,15 +454,26 @@ function extractRuntimeImports(source) {
   return { found, expected };
 }
 
+const SPECIFIER_BOUNDARY_CHARS = new Set([
+  ";", "{", "}", "(", ")", "[", "]", '"', "'", "\n", "\r",
+]);
+
 /**
  * Blank `//` and block comments and the contents of string / template
  * literals (delimiters kept), so a commented-out or string-embedded
  * `import ... from "pkg"` can never match. Import/export module specifier
- * literals are the one exception: their contents stay readable because the
- * extractor needs the package name, and they cannot create a statement on
- * their own (the `import ... from` prefix lives in code). The probe runs
- * with builtins only (no TypeScript parser in the workflow), so this is a
- * small lexer over the states that matter here.
+ * literals are the one exception: their path characters stay readable
+ * because the extractor needs the package name, while every character that
+ * cannot appear in a module specifier and could form a statement or quote
+ * boundary is blanked, so an inner `'`/`;` cannot smuggle an import-like
+ * run into the capture. The probe runs with builtins only (no TypeScript
+ * parser in the workflow), so this is a small lexer over the states that
+ * matter here.
+ *
+ * Regex literals are intentionally not masked: distinguishing `/.../` from
+ * division with a heuristic can blank real code and create a silent miss —
+ * the worse direction. A regex literal containing import-like text can only
+ * cause a false-positive probe failure, never a silent miss.
  */
 function maskCommentsAndLiterals(source) {
   let out = "";
@@ -496,9 +507,20 @@ function maskCommentsAndLiterals(source) {
     // single | double | template
     const closing = state === "single" ? "'" : state === "double" ? '"' : "`";
     if (keepLiteral) {
-      out += ch;
-      if (ch === "\\") { out += next ?? ""; i += 2; continue; }
-      if (ch === closing) { state = "code"; keepLiteral = false; }
+      if (ch === "\\") {
+        // An escape cannot appear in a module specifier; blank the pair.
+        out += "  ";
+        i += 2;
+        continue;
+      }
+      if (ch === closing) {
+        out += ch;
+        state = "code";
+        keepLiteral = false;
+        i += 1;
+        continue;
+      }
+      out += SPECIFIER_BOUNDARY_CHARS.has(ch) ? " " : ch;
       i += 1;
       continue;
     }
@@ -597,8 +619,12 @@ function resolveHostPackageEntry(pkgName) {
   if (pkgName !== "@earendil-works/pi-coding-agent") {
     const piEntry = resolveFromBaseWalk("@earendil-works/pi-coding-agent", bases);
     if (piEntry) {
+      // realpath: pnpm's package dirs are symlinks into the virtual store;
+      // anchoring on the symlink path misses the store's dependency
+      // siblings (e.g. pi-coding-agent's own typebox), so the repo-root
+      // copy would win. The loader sees the realpath copy.
       const fromPiDir = createRequire(
-        path.join(path.dirname(piEntry), "probe-resolve.cjs"),
+        path.join(path.dirname(realpathSync(piEntry)), "probe-resolve.cjs"),
       );
       try {
         return fromPiDir.resolve(pkgName);
