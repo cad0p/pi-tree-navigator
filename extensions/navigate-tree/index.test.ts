@@ -1194,6 +1194,51 @@ describe("dispatch: anchor action", () => {
     assert.match(text, new RegExp(`\u2265${MIN_SUMMARY_FOCUS_LENGTH}`));
   });
 
+  it("estimate throws before the label write: the error propagates and no label is written (atomic anchor)", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t = appendTurn(sm, "u1", "a1");
+
+    // Force the token estimate to throw. The old ordering wrote the label
+    // first, so a throw here still left `anchor:impl-start` on disk (the
+    // tool reported an error, and a retry with the same name was rejected
+    // as a duplicate). Compute-before-write is the fix this pins.
+    const origBuild = sm.buildSessionContext.bind(sm);
+    (
+      sm as { buildSessionContext: typeof sm.buildSessionContext }
+    ).buildSessionContext = (() => {
+      throw new Error("anchor estimate boom");
+    }) as typeof sm.buildSessionContext;
+
+    let thrown: unknown;
+    try {
+      await tool.execute(
+        "tc-1",
+        { action: "anchor", name: "impl-start" },
+        undefined,
+        undefined,
+        ctx,
+      );
+    } catch (e) {
+      thrown = e;
+    } finally {
+      (
+        sm as { buildSessionContext: typeof sm.buildSessionContext }
+      ).buildSessionContext = origBuild;
+    }
+
+    assert.ok(thrown, "the estimate throw must propagate");
+    assert.match(
+      thrown instanceof Error ? thrown.message : String(thrown),
+      /anchor estimate boom/,
+    );
+    assert.equal(
+      pi.setLabelCalls.length,
+      0,
+      "anchor must not write its label before the estimate succeeds",
+    );
+    assert.equal(sm.getLabel(t.assistantId), undefined);
+  });
+
   it("duplicate refusal: re-anchoring an existing name is refused with no write and no prior-clear", async () => {
     // Issue #55 (C8): labels are unique on the active branch and immutable
     // once written. Re-anchoring the same name must be refused BEFORE any
