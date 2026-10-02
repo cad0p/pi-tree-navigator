@@ -359,6 +359,92 @@ export function buildLiveSummaryMessages(
 }
 
 // ---------------------------------------------------------------------------
+// Forced-prompt head projection (pi 1.0.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * Structural view of the pi-1.0.0 leading system message carried in the wire
+ * transcript. `@earendil-works/pi-ai@0.84.2` (the locked devDependency) has no
+ * `system` member on its `Message` union and no `toolsAdded`/`toolsRemoved`, so
+ * the projection below reads those fields structurally via casts and returns
+ * this shape. It is only ever consumed by pi-1.0.0's raw provider — the
+ * legacy 0.84.2 path never produces it.
+ */
+export interface ProjectedSystemMessage {
+  role: "system";
+  content: string;
+  toolsAdded?: Array<{
+    name: string;
+    description?: string;
+    parameters?: unknown;
+  }>;
+  toolsRemoved?: Array<{ name: string }>;
+  timestamp?: number;
+}
+
+/**
+ * Mirror pi 1.0.0's `_installAgentForcedPromptProjection` on the summary
+ * request.
+ *
+ * On 1.0.0 a `before_agent_start` that returns `systemPrompt` (this extension's
+ * anchor mandate) makes the host rewrite every live request into a single
+ * leading system head carrying the forced text and the current tool
+ * declarations. The summary path bypasses that projection (it rebuilds from
+ * the persisted sections), so without this mirror the head diverges at byte 0
+ * and the whole prompt cache misses. `index.ts` calls this only when it has
+ * proven the host projects (`ctx.getSystemPrompt() !== agent.state.systemPrompt`).
+ *
+ * Semantics copied from pi-ai's `getCurrentTools` replay: walk the system
+ * messages in order, deleting names in `toolsRemoved` and setting names in
+ * `toolsAdded` (Map insertion order). When the replay yields no tools — budget
+ * truncation dropped every system entry, or the surviving entry carries no
+ * declarations — fall back to `toolsFallback` (the request's live
+ * `context.tools`). The head timestamp is the first system-message timestamp,
+ * else `Date.now()`; non-system messages keep their order and identity.
+ */
+export function projectForcedPromptHead(
+  messages: WireMessage[],
+  systemPrompt: string,
+  toolsFallback: AgentTool[],
+): Array<WireMessage | ProjectedSystemMessage> {
+  type ProjectedTool = NonNullable<
+    ProjectedSystemMessage["toolsAdded"]
+  >[number];
+  const tools = new Map<string, ProjectedTool>();
+  let timestamp: number | undefined;
+  for (const message of messages) {
+    const view = message as {
+      role?: string;
+      toolsAdded?: ProjectedTool[];
+      toolsRemoved?: Array<{ name: string }>;
+      timestamp?: number;
+    };
+    if (view.role !== "system") continue;
+    if (timestamp === undefined && typeof view.timestamp === "number") {
+      timestamp = view.timestamp;
+    }
+    for (const tool of view.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of view.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+  const replayed = [...tools.values()];
+  const toolsForHead: ProjectedTool[] =
+    replayed.length > 0 ? replayed : toolsFallback;
+  const head: ProjectedSystemMessage = {
+    role: "system",
+    content: systemPrompt,
+    ...(toolsForHead.length > 0 ? { toolsAdded: toolsForHead } : {}),
+    timestamp: timestamp ?? Date.now(),
+  };
+  const nonSystem: WireMessage[] = [];
+  for (const message of messages) {
+    if ((message as { role?: string }).role !== "system") {
+      nonSystem.push(message);
+    }
+  }
+  return [head, ...nonSystem];
+}
+
+// ---------------------------------------------------------------------------
 // Cache retention
 // ---------------------------------------------------------------------------
 
@@ -705,6 +791,20 @@ export interface CacheRequest {
    * when the host exposes it.
    */
   thinkingBudgets?: unknown;
+  /**
+   * Mirror pi 1.0.0's forced-prompt head projection on the summary request.
+   *
+   * pi 1.0.0's `_installAgentForcedPromptProjection` rewrites every live
+   * request's system messages into one `before_agent_start`-forced head; the
+   * summary path bypasses that projection, so it must send the same head or
+   * the whole prefix misses. `index.ts` sets this only when the captured
+   * `agent.state.systemPrompt` is non-empty and differs from
+   * `ctx.getSystemPrompt()` (on 0.84.2 they are identical by construction, so
+   * this stays `undefined`/`false` and the legacy structured request is sent
+   * byte-identically). `context.systemPrompt`/`context.tools` remain the
+   * projection inputs and the 0.84.2 wire input either way.
+   */
+  projectHead?: boolean;
 }
 
 /**
@@ -716,6 +816,12 @@ export interface CacheRequest {
  * `request === null` → delegate the caller's context and options untouched:
  * today's cold standalone request. This is the fallback for every "live input
  * unavailable" case.
+ *
+ * `request.projectHead === true` → replace `context.messages` with pi 1.0.0's
+ * forced-prompt head projection (`projectForcedPromptHead`), keeping
+ * `context.systemPrompt`/`context.tools` as the projection inputs. Any other
+ * value keeps today's request byte-identically (`request.context` is delegated
+ * by reference), which is the 0.84.2 path.
  *
  * The `maxTokens` strip: upstream's summary caller caps output
  * (`maxTokens: 2048` in 0.84.2), but live turns let pi-ai fill
@@ -760,7 +866,17 @@ export function createCachePreservingStreamFn(args: {
         ? { thinkingBudgets: request.thinkingBudgets }
         : {}),
     } as NonNullable<Parameters<StreamFn>[2]>;
-    const context = request.context as Parameters<StreamFn>[1];
+    const context =
+      request.projectHead === true
+        ? ({
+            ...request.context,
+            messages: projectForcedPromptHead(
+              request.context.messages,
+              request.context.systemPrompt,
+              request.context.tools,
+            ),
+          } as Parameters<StreamFn>[1])
+        : (request.context as Parameters<StreamFn>[1]);
     return realStreamFn(model, context, next);
   };
   return { streamFn, used };

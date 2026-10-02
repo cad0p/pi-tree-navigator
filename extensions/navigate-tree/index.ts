@@ -1422,6 +1422,7 @@ Operations (set \`action\`):
           // Public accessor first (0.81+), reflected field as backstop. Both
           // are read here AND in refreshAgentMessages; the reflection probe
           // covers the plain-field shape.
+          const reflected = internals.agent?.state?.systemPrompt;
           let systemPrompt: string | undefined;
           if (typeof ctx.getSystemPrompt === "function") {
             try {
@@ -1431,7 +1432,6 @@ Operations (set \`action\`):
             }
           }
           if (typeof systemPrompt !== "string" || systemPrompt.length === 0) {
-            const reflected = internals.agent?.state?.systemPrompt;
             systemPrompt =
               typeof reflected === "string" ? reflected : undefined;
           }
@@ -1473,12 +1473,25 @@ Operations (set \`action\`):
                   typeof pi.getThinkingLevel === "function"
                     ? pi.getThinkingLevel()
                     : undefined;
+                // pi 1.0.0 projects a `before_agent_start` forced prompt as a
+                // single head on every live request (`ctx.getSystemPrompt()`
+                // returns the forced text while the persisted
+                // `agent.state.systemPrompt` stays the structured prompt).
+                // Mirror that head or the summary diverges at byte 0 and the
+                // whole prompt cache misses. 0.84.2 keeps the two identical by
+                // construction; a missing/empty reflected prompt is
+                // conservative (legacy path).
+                const projectHead =
+                  typeof reflected === "string" &&
+                  reflected.length > 0 &&
+                  systemPrompt !== reflected;
                 summaryCacheRequest = {
                   context: {
                     systemPrompt,
                     messages: built.messages,
                     tools: liveTools as AgentTool[],
                   },
+                  projectHead,
                   // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
                   // over `process.env`, mirroring pi-ai's
                   // `getProviderEnvValue`: the live turns resolve retention

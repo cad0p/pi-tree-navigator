@@ -31,6 +31,8 @@ import {
   detectBranchSummaryCacheMiss,
   formatBranchSummaryCacheMissNotice,
   measureSummaryCache,
+  type ProjectedSystemMessage,
+  projectForcedPromptHead,
   resolveSummaryCacheRetention,
   stripBoundaryOrphanToolResults,
   type WireMessage,
@@ -954,6 +956,195 @@ describe("detectBranchSummaryCacheMiss + formatBranchSummaryCacheMissNotice", ()
 });
 
 // =============================================================================
+// projectForcedPromptHead (pi 1.0.0 forced-prompt projection)
+// =============================================================================
+
+/**
+ * v1-shaped system message. `@earendil-works/pi-ai@0.84.2`'s `Message` union
+ * has no `system` member, so these are cast through `unknown` exactly the way
+ * the helper reads them structurally.
+ */
+function v1System(args: {
+  content?: string;
+  toolsAdded?: Array<{
+    name: string;
+    description?: string;
+    parameters?: unknown;
+  }>;
+  toolsRemoved?: Array<{ name: string }>;
+  sections?: Record<string, string>;
+  timestamp?: number;
+}): WireMessage {
+  return {
+    role: "system",
+    content: args.content ?? "",
+    ...(args.toolsAdded ? { toolsAdded: args.toolsAdded } : {}),
+    ...(args.toolsRemoved ? { toolsRemoved: args.toolsRemoved } : {}),
+    ...(args.sections ? { sections: args.sections } : {}),
+    ...(args.timestamp !== undefined ? { timestamp: args.timestamp } : {}),
+  } as unknown as WireMessage;
+}
+
+function v1User(text: string, timestamp: number): WireMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text }],
+    timestamp,
+  } as WireMessage;
+}
+
+function v1Assistant(text: string, timestamp: number): WireMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    timestamp,
+  } as unknown as WireMessage;
+}
+
+function projectedHead(
+  messages: WireMessage[],
+  systemPrompt = "FORCED",
+  toolsFallback: CacheRequest["context"]["tools"] = [],
+): ProjectedSystemMessage {
+  return projectForcedPromptHead(
+    messages,
+    systemPrompt,
+    toolsFallback,
+  )[0] as ProjectedSystemMessage;
+}
+
+const REPLAY_A = { name: "a", description: "A", parameters: {} };
+const REPLAY_B = { name: "b", description: "B", parameters: {} };
+const REPLAY_C = { name: "c", description: "C", parameters: {} };
+
+describe("projectForcedPromptHead", () => {
+  it("builds one forced head and preserves non-system messages in order", () => {
+    const user = v1User("hi", 222);
+    const assistant = v1Assistant("yo", 333);
+    const messages = [
+      v1System({ toolsAdded: [REPLAY_A], timestamp: 111 }),
+      user,
+      assistant,
+    ];
+    const projected = projectForcedPromptHead(messages, "FORCED PROMPT", []);
+    assert.equal(projected.length, 3);
+    assert.deepEqual(projected[0], {
+      role: "system",
+      content: "FORCED PROMPT",
+      toolsAdded: [REPLAY_A],
+      timestamp: 111,
+    });
+    // Non-system messages keep identity and order.
+    assert.equal(projected[1], user);
+    assert.equal(projected[2], assistant);
+  });
+
+  it("replays toolsRemoved/toolsAdded with Map semantics (removal deletes, set keeps position)", () => {
+    const messages = [
+      v1System({ toolsAdded: [REPLAY_A, REPLAY_B, REPLAY_C], timestamp: 1 }),
+      v1System({ toolsRemoved: [{ name: "b" }], timestamp: 2 }),
+      v1User("between", 3),
+      v1System({
+        toolsAdded: [{ name: "d", description: "D", parameters: {} }],
+        timestamp: 4,
+      }),
+      // Redefinition of an existing name updates in place (does not reorder),
+      // mirroring pi-ai's `getCurrentTools` Map replay.
+      v1System({
+        toolsAdded: [{ name: "c", description: "C2", parameters: {} }],
+        timestamp: 5,
+      }),
+    ];
+    const head = projectedHead(messages);
+    assert.deepEqual(head.toolsAdded, [
+      REPLAY_A,
+      { name: "c", description: "C2", parameters: {} },
+      { name: "d", description: "D", parameters: {} },
+    ]);
+  });
+
+  it("deletes a name removed before it is re-added in the same replay", () => {
+    const messages = [
+      v1System({ toolsAdded: [REPLAY_A], timestamp: 1 }),
+      v1System({ toolsRemoved: [{ name: "a" }], timestamp: 2 }),
+      v1System({ toolsAdded: [REPLAY_B], timestamp: 3 }),
+    ];
+    const head = projectedHead(messages);
+    assert.deepEqual(head.toolsAdded, [REPLAY_B]);
+  });
+
+  it("uses the first system timestamp, ignoring non-system timestamps", () => {
+    const head = projectedHead([
+      v1System({ timestamp: undefined }),
+      v1User("hi", 5),
+      v1System({ toolsAdded: [REPLAY_A], timestamp: 99 }),
+      v1System({ timestamp: 200 }),
+    ]);
+    assert.equal(head.timestamp, 99);
+  });
+
+  it("falls back to Date.now() when no system message carries a timestamp", () => {
+    const before = Date.now();
+    const head = projectedHead([v1User("hi", 5)]);
+    assert.ok(
+      typeof head.timestamp === "number" && head.timestamp >= before,
+      "falls back to Date.now() for the head timestamp",
+    );
+  });
+
+  it("falls back to the live tool array when the replay yields no tools", () => {
+    const fallback = [
+      { name: "read", description: "r", parameters: {} },
+    ] as CacheRequest["context"]["tools"];
+    // A surviving delta-less system entry (content only) replays zero tools.
+    const head = projectedHead(
+      [v1System({ content: "base", timestamp: 1 }), v1User("hi", 2)],
+      "FORCED",
+      fallback,
+    );
+    assert.deepEqual(head.toolsAdded, fallback);
+  });
+
+  it("omits toolsAdded entirely when the replay and fallback are both empty", () => {
+    const head = projectedHead([v1System({ timestamp: 1 })]);
+    assert.ok(!("toolsAdded" in head));
+  });
+
+  it("mirrors the host head shape for a realistic v1 transcript (sections dropped, tools replayed)", () => {
+    // Host-shaped pin: the initial system message carries the prompt + tools,
+    // a later delta patches sections and removes a tool. pi 1.0.0's
+    // `_installAgentForcedPromptProjection` would emit one head with the
+    // forced text, the replayed current tools, and the first timestamp.
+    const messages = [
+      v1System({
+        content: "BASE PROMPT",
+        toolsAdded: [REPLAY_A, REPLAY_B],
+        timestamp: 0,
+      }),
+      v1User("real work", 10),
+      v1Assistant("done", 11),
+      v1System({
+        content: "",
+        sections: { tools: "changed" },
+        toolsRemoved: [{ name: "b" }],
+        timestamp: 4_242,
+      }),
+    ];
+    const projected = projectForcedPromptHead(messages, "FORCED MANDATE", []);
+    assert.deepEqual(projected[0], {
+      role: "system",
+      content: "FORCED MANDATE",
+      toolsAdded: [REPLAY_A],
+      timestamp: 0,
+    });
+    // The head never carries `sections` (the host forced head drops them),
+    // and every structured system delta collapses into it.
+    assert.ok(!("sections" in (projected[0] as object)));
+    assert.deepEqual(projected.slice(1), [messages[1], messages[2]]);
+  });
+});
+
+// =============================================================================
 // createCachePreservingStreamFn
 // =============================================================================
 
@@ -1063,6 +1254,54 @@ describe("createCachePreservingStreamFn", () => {
     assert.equal(wrapped.used.value, false);
     assert.equal(calls[0].context, coldContext);
     assert.equal(calls[0].options, coldOptions);
+  });
+
+  it("keeps the legacy structured request when projectHead is undefined or false (0.84.2 parity)", () => {
+    for (const flag of [undefined, false] as const) {
+      const { calls, realStreamFn } = capturingRealStreamFn();
+      const request = makeCacheRequest();
+      request.projectHead = flag;
+      const wrapped = createCachePreservingStreamFn({ realStreamFn, request });
+      wrapped.streamFn({} as never, {} as never, { maxTokens: 2048 });
+      // Identity: the legacy request object is delegated untouched.
+      assert.equal(calls[0].context.messages, request.context.messages);
+      assert.equal(calls[0].context.systemPrompt, "LIVE SYSTEM PROMPT");
+      assert.equal(calls[0].context.tools, request.context.tools);
+    }
+  });
+
+  it("projects the forced-prompt head when projectHead is true", () => {
+    const { calls, realStreamFn } = capturingRealStreamFn();
+    const request = makeCacheRequest();
+    const replayTool = {
+      name: "replayed",
+      description: "from the transcript",
+      parameters: {},
+    };
+    request.context.messages = [
+      v1System({ toolsAdded: [replayTool], timestamp: 7 }),
+      ...request.context.messages,
+    ];
+    request.projectHead = true;
+    const wrapped = createCachePreservingStreamFn({ realStreamFn, request });
+    wrapped.streamFn({} as never, {} as never, { maxTokens: 2048 });
+    const context = calls[0].context;
+    assert.deepEqual(context.messages[0], {
+      role: "system",
+      content: "LIVE SYSTEM PROMPT",
+      toolsAdded: [replayTool],
+      timestamp: 7,
+    });
+    assert.equal(context.messages.length, request.context.messages.length);
+    assert.ok(
+      context.messages
+        .slice(1)
+        .every((m) => (m as { role?: string }).role !== "system"),
+      "system messages collapse into the head",
+    );
+    // Legacy fields remain: projection inputs + the 0.84.2 wire input.
+    assert.equal(context.systemPrompt, "LIVE SYSTEM PROMPT");
+    assert.equal(context.tools, request.context.tools);
   });
 });
 
