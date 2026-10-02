@@ -31,18 +31,20 @@
  *     the pi process, including sessions that never call
  *     `navigate_tree`.
  *
- * Verified against pi 0.81.0 / 0.83.0 / 0.84.2. In-loop context
+ * Verified against pi 0.81.0 / 0.83.0 / 0.84.2. pi 1.0.0 core
+ * actions (anchor / list / rewind) are live-verified; the
+ * reflection-bootstrap audit on 1.0.0 is still pending #25 (the daily
+ * upstream probe is red for the tracked drift). In-loop context
  * refresh runs through the public `context` extension event (see
  * `buildContextMessages`), not `agent.prepareNextTurn*` reflection.
  */
 
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import {
-  type AgentTool,
-  estimateContextTokens,
-  type StreamFn,
-  type ThinkingLevel,
+import type {
+  AgentTool,
+  StreamFn,
+  ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
   AgentSession,
@@ -74,6 +76,7 @@ import {
   START_ANCHOR_DEFAULT_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
+import { estimateContextTokens } from "./context-tokens.ts";
 import {
   extractTextContent,
   formatContextDelta,
@@ -542,7 +545,7 @@ function findInFlightAssistantToolCalls(
 }
 
 function estimateActiveBranchTokens(sm: SessionManager): number {
-  return estimateContextTokens(sm.buildSessionContext().messages).tokens;
+  return estimateContextTokens(sm.buildSessionContext().messages);
 }
 
 function estimateAtEntry(
@@ -552,7 +555,7 @@ function estimateAtEntry(
 ): number {
   return estimateContextTokens(
     buildSessionContext(entries, entryId, byId).messages,
-  ).tokens;
+  );
 }
 
 /**
@@ -642,8 +645,8 @@ function findLabelHint(
  *
  * `usage` fields are zeroed except `totalTokens`, which is set to the
  * chain size measured BEFORE this synthetic is appended (the post-rewind
- * baseline that pi-agent-core's `estimateContextTokens` reads off the last
- * assistant). `stopReason: "toolUse"` survives Kiro's `normalizeMessages`
+ * baseline that the local `estimateContextTokens` (context-tokens.ts)
+ * reads off the last assistant). `stopReason: "toolUse"` survives Kiro's `normalizeMessages`
  * filter (which strips `error` / `aborted`); without it the synthetic would
  * be filtered out and the tool_result would re-orphan.
  */
@@ -1156,12 +1159,17 @@ Operations (set \`action\`):
             `A label '${p.name}' already exists on the active branch — labels are unique and immutable once written. Use action='list' to review the active labels, then pick a fresh name.`,
           );
         }
-        pi.setLabel(leafId, fullLabel);
+        // Atomic anchor: compute the estimate BEFORE writing the label. A
+        // throw from the estimator must not leave a label on disk —
+        // otherwise the agent sees an error yet a retry with the same
+        // name is rejected as a duplicate. The rewind path keeps its own
+        // (test-pinned) ordering because its salvage contract differs.
         const cw = ctx.model?.contextWindow ?? 0;
         const tokensHere = estimateActiveBranchTokens(sm);
         const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
         const positionLine = `${formatPct1(tokensHere, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}`;
         const hintLine = labelHint ? ` (after: “${labelHint}”)` : "";
+        pi.setLabel(leafId, fullLabel);
         return {
           content: [
             {

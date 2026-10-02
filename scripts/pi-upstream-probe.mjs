@@ -32,12 +32,20 @@
  *   - `AgentSession` + `SessionManager` are still exported from the
  *     package root.
  *
+ * Runtime import surface: the probe also extracts every runtime named
+ * import the extension sources take from the host-aliased packages
+ * (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`,
+ * `@earendil-works/pi-tui`, `typebox`) and asserts each symbol exists on
+ * the package entry actually resolved under `PROBE_NODE_MODULES`. That is
+ * the class of break the repo's pinned dev-deps cannot see (pi 1.0.0
+ * dropped pi-agent-core's `estimateContextTokens` exactly this way).
+ *
  * Exit code: 0 = all good (no upstream break), 1 = something broke.
  */
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const results = [];
@@ -371,6 +379,244 @@ try {
 } catch (e) {
   check("probe crashed", false, String(e.stack || e.message));
 }
+
+// ---------------------------------------------------------------------------
+// 10. Extension runtime import surface.
+//
+// The extension loader aliases `@earendil-works/*` to the host process's
+// own modules, so a runtime named import that upstream removed resolves to
+// `undefined` on the host even though the repo's pinned dev-deps still
+// typecheck green. Extract every runtime named import from the extension
+// sources and assert it exists on the package entry the host would load.
+// ---------------------------------------------------------------------------
+
+const EXTENSION_SOURCE_DIR = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "extensions",
+  "navigate-tree",
+);
+const IMPORT_SURFACE_PACKAGES = [
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-tui",
+  "typebox",
+];
+const IMPORT_STATEMENT_RE = /^[ \t]*import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/gm;
+
+/**
+ * Runtime (value) named imports per package found in one source file.
+ * Type-only specifiers are skipped: `import type { X }` statements are
+ * erased and can never be `undefined` at runtime, and `type X` members are
+ * skipped inside mixed imports.
+ */
+function extractRuntimeImports(source) {
+  const found = new Map();
+  for (const match of source.matchAll(IMPORT_STATEMENT_RE)) {
+    const clause = match[1].trim();
+    const specifier = match[2];
+    if (!IMPORT_SURFACE_PACKAGES.includes(specifier)) continue;
+    // `import type { ... }` and namespace imports carry no named values.
+    if (clause.startsWith("type ") || clause.startsWith("*")) continue;
+    const names = new Set();
+    const brace = clause.indexOf("{");
+    const head = (brace === -1 ? clause : clause.slice(0, brace))
+      .trim()
+      .replace(/,$/, "")
+      .trim();
+    if (head) names.add("default");
+    if (brace !== -1) {
+      const body = clause.slice(brace + 1, clause.lastIndexOf("}"));
+      for (const raw of body.split(",")) {
+        const member = raw.trim();
+        if (!member || member.startsWith("type ")) continue;
+        const imported = member.split(/\s+as\s+/)[0].trim();
+        if (imported) names.add(imported);
+      }
+    }
+    if (names.size === 0) continue;
+    const bucket = found.get(specifier) ?? new Set();
+    for (const name of names) bucket.add(name);
+    found.set(specifier, bucket);
+  }
+  return found;
+}
+
+/**
+ * Strip `//` and block comments while preserving string / template-literal
+ * contents, so a commented-out `import` line is never extracted. The probe
+ * runs with builtins only (no TypeScript parser in the workflow), so this is
+ * a small lexer over the states that matter here.
+ */
+function stripComments(source) {
+  let out = "";
+  let i = 0;
+  let state = "code";
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (state === "code") {
+      if (ch === "/" && next === "/") { state = "line"; i += 2; continue; }
+      if (ch === "/" && next === "*") { state = "block"; i += 2; continue; }
+      if (ch === "'") state = "single";
+      else if (ch === '"') state = "double";
+      else if (ch === "`") state = "template";
+      out += ch; i += 1; continue;
+    }
+    if (state === "line") {
+      if (ch === "\n") { state = "code"; out += ch; }
+      i += 1; continue;
+    }
+    if (state === "block") {
+      if (ch === "*" && next === "/") { state = "code"; i += 2; continue; }
+      i += 1; continue;
+    }
+    // single | double | template: keep content, honor escapes
+    out += ch;
+    if (ch === "\\") { out += next ?? ""; i += 2; continue; }
+    if (
+      (state === "single" && ch === "'") ||
+      (state === "double" && ch === '"') ||
+      (state === "template" && ch === "`")
+    ) {
+      state = "code";
+    }
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Lenient, independent scan used only as a coverage guard for
+ * `extractRuntimeImports`: which surface packages have at least one
+ * non-type import statement in the (comment-stripped) source. If the
+ * extractor returns no names for one of these, the surface check would
+ * otherwise pass vacuously — fail instead. Deliberately a different regex
+ * shape from `IMPORT_STATEMENT_RE` so a drift in either is caught.
+ */
+function runtimeImportedPackages(source) {
+  const found = new Set();
+  for (const match of source.matchAll(/import\s+([^;]*?)\s+from\s+["']([^"']+)["']/g)) {
+    const specifier = match[2];
+    if (!IMPORT_SURFACE_PACKAGES.includes(specifier)) continue;
+    const clause = match[1].trim();
+    if (clause.startsWith("type ") || clause.startsWith("*")) continue;
+    found.add(specifier);
+  }
+  return found;
+}
+
+/**
+ * Resolve a host package's root entry the way the extension loader would:
+ * exports-map aware, and authoritative to PROBE_NODE_MODULES when set.
+ * `require.resolve` handles maps that declare a `require`/`default`
+ * condition (typebox -> build/index.mjs), but the pi packages declare only
+ * `import`/`types` and throw ERR_PACKAGE_PATH_NOT_EXPORTED, so fall back to
+ * the package's own package.json `exports["."]` / `main`. That fallback is
+ * also why the hardcoded `dist/index.js` of `resolveDist` cannot be reused.
+ */
+function resolveHostPackageEntry(pkgName) {
+  const bases = process.env.PROBE_NODE_MODULES
+    ? [process.env.PROBE_NODE_MODULES]
+    : [path.join(process.cwd(), "node_modules"), path.resolve(process.cwd(), "../node_modules")];
+  const pkgDirs = [];
+  for (const base of bases) {
+    pkgDirs.push(path.join(base, ...pkgName.split("/")));
+    // npm can hoist a transitive host package under a direct dependency
+    // (pi-tui lands in pi-coding-agent/node_modules in the probe install).
+    pkgDirs.push(
+      path.join(
+        base,
+        "@earendil-works",
+        "pi-coding-agent",
+        "node_modules",
+        ...pkgName.split("/"),
+      ),
+    );
+  }
+  for (const pkgDir of pkgDirs) {
+    try {
+      const fromPkgDir = createRequire(path.join(pkgDir, "resolve.cjs"));
+      return fromPkgDir.resolve(pkgName);
+    } catch {}
+    const pkgJsonPath = path.join(pkgDir, "package.json");
+    if (!existsSync(pkgJsonPath)) continue;
+    let pkg;
+    try {
+      pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+    } catch {
+      continue;
+    }
+    const rootExport =
+      typeof pkg.exports === "string" ? pkg.exports : pkg.exports?.["."];
+    let entry;
+    if (typeof rootExport === "string") entry = rootExport;
+    else if (rootExport && typeof rootExport === "object") {
+      entry = rootExport.import ?? rootExport.default ?? rootExport.require ?? rootExport.node;
+    }
+    if (!entry && typeof pkg.main === "string") entry = pkg.main;
+    if (!entry) continue;
+    return path.join(pkgDir, entry);
+  }
+  return null;
+}
+
+let importSurface;
+try {
+  const files = readdirSync(EXTENSION_SOURCE_DIR)
+    .filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"))
+    .sort();
+  const used = new Map();
+  const expectedRuntime = new Set();
+  for (const file of files) {
+    const source = stripComments(readFileSync(path.join(EXTENSION_SOURCE_DIR, file), "utf8"));
+    for (const pkgName of runtimeImportedPackages(source)) expectedRuntime.add(pkgName);
+    for (const [specifier, names] of extractRuntimeImports(source)) {
+      const bucket = used.get(specifier) ?? new Set();
+      for (const name of names) bucket.add(name);
+      used.set(specifier, bucket);
+    }
+  }
+  const missing = [];
+  let verified = 0;
+  for (const pkgName of IMPORT_SURFACE_PACKAGES) {
+    if (expectedRuntime.has(pkgName) && !used.get(pkgName)?.size) {
+      missing.push(
+        `${pkgName} (runtime import(s) present in source but none extracted — extraction may have drifted)`,
+      );
+    }
+  }
+  for (const pkgName of IMPORT_SURFACE_PACKAGES) {
+    const names = used.get(pkgName);
+    if (!names || names.size === 0) continue;
+    const entry = resolveHostPackageEntry(pkgName);
+    if (!entry) {
+      missing.push(`${pkgName} (entry not found under the probe node_modules)`);
+      continue;
+    }
+    const namespace = await import(pathToFileURL(entry).href);
+    for (const name of [...names].sort()) {
+      if (name in namespace) verified++;
+      else missing.push(`${pkgName} -> ${name}`);
+    }
+  }
+  importSurface = {
+    ok: missing.length === 0,
+    detail: missing.length
+      ? `missing on host: ${missing.join(", ")}`
+      : `${verified} runtime named import(s) across ${files.length} source file(s) verified`,
+  };
+} catch (e) {
+  importSurface = {
+    ok: false,
+    detail: `threw: ${e instanceof Error ? e.message : String(e)}`,
+  };
+}
+check(
+  "extension runtime named imports exist on host packages",
+  importSurface.ok,
+  importSurface.detail,
+);
 
 console.log(`\n${failures.length} of ${results.length} checks failed`);
 if (failures.length > 0) {
