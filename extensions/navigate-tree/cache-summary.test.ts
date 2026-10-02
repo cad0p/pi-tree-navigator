@@ -1073,6 +1073,24 @@ describe("projectForcedPromptHead", () => {
     assert.deepEqual(head.toolsAdded, [REPLAY_B]);
   });
 
+  it("applies toolsRemoved before toolsAdded within one system message (host order)", () => {
+    const messages = [
+      v1System({ toolsAdded: [REPLAY_A], timestamp: 1 }),
+      // One delta removes and re-adds the same name. The host's per-message
+      // replay order is remove-then-add (pi-ai `getCurrentTools`), so the new
+      // definition must survive; a swapped order would delete it.
+      v1System({
+        toolsRemoved: [{ name: "a" }],
+        toolsAdded: [{ name: "a", description: "A2", parameters: {} }],
+        timestamp: 2,
+      }),
+    ];
+    const head = projectedHead(messages);
+    assert.deepEqual(head.toolsAdded, [
+      { name: "a", description: "A2", parameters: {} },
+    ]);
+  });
+
   it("uses the first system timestamp, ignoring non-system timestamps", () => {
     const head = projectedHead([
       v1System({ timestamp: undefined }),
