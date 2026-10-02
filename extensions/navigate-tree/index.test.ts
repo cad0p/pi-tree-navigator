@@ -176,6 +176,15 @@ interface FakeCtx {
   setContextUsage(usage: ContextUsage | undefined): void;
 }
 
+/**
+ * The single system-prompt value both fixtures expose by default. The cache
+ * path only takes the forced-head projection when `ctx.getSystemPrompt()`
+ * differs from `agent.state.systemPrompt`; keeping them equal here holds the
+ * legacy rewind tests on the legacy (no-projection) path. Tests that pin the
+ * pi-1.0.0 projection override one side explicitly.
+ */
+const LIVE_SYSTEM_PROMPT = "LIVE SYSTEM PROMPT";
+
 function makeCtx(
   sm: SessionManager,
   opts: {
@@ -202,7 +211,7 @@ function makeCtx(
   return {
     sessionManager: sm,
     model,
-    getSystemPrompt: () => "LIVE SYSTEM PROMPT",
+    getSystemPrompt: () => LIVE_SYSTEM_PROMPT,
     hasUI: opts.hasUI ?? true,
     cwd: opts.cwd ?? "/tmp",
     isProjectTrusted: () => opts.projectTrusted ?? false,
@@ -366,7 +375,7 @@ function makeFakeSession(sm: SessionManager): FakeAgentSession {
     sessionManager: sm,
     settingsManager: { getShowCacheMissNotices: () => false },
     agent: {
-      state: { systemPrompt: "S", messages: [], tools: [] },
+      state: { systemPrompt: LIVE_SYSTEM_PROMPT, messages: [], tools: [] },
       prepareNextTurn: undefined,
       prepareNextTurnWithContext: undefined,
     },
@@ -4958,6 +4967,113 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       /Additional focus: Preserve the latest/,
     );
     assert.doesNotMatch(trailer.content[0].text, /\{first\}/);
+  });
+
+  it("projects a forced-prompt head when the reflected prompt differs (pi 1.0.0)", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    appendInFlightAssistant(sm, "tc-rewind");
+
+    const fake = makeFakeSession(sm);
+    const liveTools = [{ name: "read", description: "r", parameters: {} }];
+    fake.agent.state.tools = liveTools;
+    // The forced prompt (ctx.getSystemPrompt) differs from the persisted
+    // structured prompt: the host projects a forced head on every live
+    // request, so the summary must mirror it.
+    fake.agent.state.systemPrompt = "STRUCTURED SYSTEM PROMPT";
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const provider = capturingProvider();
+    installProvider(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+
+    assert.equal(provider.calls.length, 1);
+    const call = provider.calls[0];
+    const head = call.context.messages[0] as {
+      role: string;
+      content: string;
+      toolsAdded: unknown;
+      timestamp: number;
+    };
+    assert.equal(head.role, "system");
+    assert.equal(head.content, LIVE_SYSTEM_PROMPT);
+    assert.deepEqual(head.toolsAdded, liveTools);
+    assert.equal(typeof head.timestamp, "number");
+    // The persisted structured deltas collapse into the head.
+    assert.ok(call.context.messages.slice(1).every((m) => m.role !== "system"));
+    // The legacy wire fields stay present for the projection inputs.
+    assert.equal(call.context.systemPrompt, LIVE_SYSTEM_PROMPT);
+    assert.equal(call.context.tools, liveTools);
+  });
+
+  it("stays on the legacy path when the reflected prompt is missing or empty", async () => {
+    for (const reflected of [undefined, ""] as const) {
+      const { spy, captured } = capturingSummarize();
+      const { sm, pi, tool, ctx } = setup({ summarize: spy });
+      const t1 = appendTurn(sm, "u1", "a1", 6_000);
+      pi.pi.setLabel(t1.assistantId, "anchor:start");
+      appendTurn(sm, "u2", "a2", 12_000);
+      appendInFlightAssistant(sm, "tc-rewind");
+
+      const fake = makeFakeSession(sm);
+      fake.agent.state.systemPrompt = reflected as never;
+      __testHooks.captureSession(fake as unknown as AgentSession);
+
+      const provider = capturingProvider();
+      installProvider(ctx, provider.streamSimple);
+
+      const result = await tool.execute(
+        "tc-rewind",
+        {
+          action: "rewind",
+          rewindTo: "start",
+          newLabel: "end",
+          summaryFocus: "Preserve user instructions and continue.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(result.isError, undefined);
+      await (
+        captured.streamFn as (
+          m: unknown,
+          c: unknown,
+          o: unknown,
+        ) => Promise<unknown>
+      )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+
+      const call = provider.calls[0];
+      assert.equal(
+        call.context.messages[0].role !== "system",
+        true,
+        "legacy request keeps the structured messages (no projected head)",
+      );
+      assert.equal(call.context.systemPrompt, LIVE_SYSTEM_PROMPT);
+    }
   });
 
   it("falls back with reflection-missing when no owning session can be found", async () => {
