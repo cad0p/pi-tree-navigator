@@ -19,7 +19,8 @@
  *      accessor pair must exist and be readable.
  *   4. `session.agent.state.systemPrompt` (#33) — fallback source for the
  *      live system prompt when the public `ctx.getSystemPrompt()` is
- *      unavailable; a plain field on the mutable state object.
+ *      unavailable; a readable string on the mutable state object (plain
+ *      field on 0.84.2, getter over messages on 1.x).
  *   5. `session.agent.thinkingBudgets` (#33) — plain field on the Agent;
  *      forwarded on the cache path when present.
  *   6. `SessionManager.prototype.getSessionId` (#33) — the summary joins
