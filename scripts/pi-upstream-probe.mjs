@@ -133,7 +133,9 @@ try {
   // The extension calls it with NO args and expects { messages } back
   // (index.ts: refreshAgentMessages). A signature change (required param)
   // or a return-shape change would pass the existence check above but
-  // throw/break at runtime — so call it for real.
+  // throw/break at runtime — so call it for real. The stub carries the
+  // 0.87+/1.x `buildSessionProjection` dependency (the 1.x implementation
+  // delegates to it; 0.84.2 ignores it).
   let bscResult = null;
   let bscThrew = null;
   try {
@@ -141,6 +143,12 @@ try {
       getEntries: () => [],
       leafId: null,
       byId: new Map(),
+      buildSessionProjection: () => ({
+        entries: [],
+        messages: [],
+        thinkingLevel: "off",
+        model: null,
+      }),
     });
   } catch (e) {
     bscThrew = e instanceof Error ? e.message : String(e);
@@ -185,8 +193,8 @@ try {
   // --- 5. Agent.state.tools + systemPrompt (cache-preserving request, #33) ---
   // The summary request mirrors the live tool array and system prompt; both
   // are read off the mutable agent state object created by
-  // createMutableAgentState. Verify the accessor pair for tools and the plain
-  // systemPrompt field, and that the state is not #-private.
+  // createMutableAgentState. Verify the accessor pair for tools and the
+  // systemPrompt runtime shape, and that the state is not #-private.
   check(
     "state.tools accessor pair (source: get/set tools)",
     /get\s+tools\s*\(/.test(agentSrc) && /set\s+tools\s*\(/.test(agentSrc),
@@ -194,12 +202,41 @@ try {
       ? "tools accessor pair found"
       : "tools accessor pair MISSING",
   );
+  // state.systemPrompt is a plain data field on 0.84.2 and a getter
+  // (`getCurrentSystemPrompt(messages)`) on 1.x — assert the runtime shape (a
+  // seeded string round-trips) instead of the 0.84.2 source pattern.
+  let systemPromptShape = { ok: false, detail: "not run" };
+  try {
+    const probeAgent = new Agent({
+      streamFn: () => ({
+        async *[Symbol.asyncIterator]() {},
+        async result() {
+          throw new Error("probe");
+        },
+      }),
+      initialState: {
+        systemPrompt: "probe-seed",
+        model: { id: "probe", provider: "probe", api: "anthropic" },
+        thinkingLevel: "off",
+        messages: [],
+        tools: [],
+      },
+    });
+    const sp = probeAgent.state.systemPrompt;
+    systemPromptShape = {
+      ok: typeof sp === "string" && sp === "probe-seed",
+      detail: `typeof=${typeof sp} value=${JSON.stringify(sp)}`,
+    };
+  } catch (e) {
+    systemPromptShape = {
+      ok: false,
+      detail: `threw: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
   check(
-    "state.systemPrompt plain field",
-    /systemPrompt:\s*initialState\?\.systemPrompt/.test(agentSrc),
-    /systemPrompt:\s*initialState\?\.systemPrompt/.test(agentSrc)
-      ? "plain systemPrompt field found"
-      : "systemPrompt field MISSING",
+    "state.systemPrompt readable string (seed round-trip)",
+    systemPromptShape.ok,
+    systemPromptShape.detail,
   );
 
   // --- 6. Agent.thinkingBudgets (plain field, #33) ---
@@ -362,8 +399,12 @@ try {
     batchOrdering.ok,
     batchOrdering.detail,
   );
+  // 1.x widened the role list (`"system" ||` first) and assigns the returned
+  // entry id, so anchor on the message_end block + the appendMessage call
+  // instead of the exact 0.84.2 role-line shape (the call sits ~620–720
+  // chars into the block on both versions).
   const sessionPersistsOnMessageEnd =
-    /if \(event\.type === "message_end"\)[\s\S]{0,400}?else if \(event\.message\.role === "user" \|\|[\s\S]{0,300}?this\.sessionManager\.appendMessage\(event\.message\)/.test(
+    /if \(event\.type === "message_end"\)[\s\S]{0,1000}?this\.sessionManager\.appendMessage\(event\.message\)/.test(
       sessionSrc,
     );
   const sessionSubscribes = /this\.agent\.subscribe\(this\._handleAgentEvent\)/.test(
