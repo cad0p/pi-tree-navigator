@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - *(guidance)* Rewind to the oldest appropriate anchor (closes #51)
 - *(hint)* Keep the tool-active gate per-session (closes #58)
 - *(compat)* Pi 1.0.0 — replace the removed estimateContextTokens import, make anchor atomic (closes #61)
+- *(cache)* Mirror the forced-prompt head in rewind summaries — pi 1.0.0 cache miss (closes #65)
 
 ### 📚 Documentation
 
