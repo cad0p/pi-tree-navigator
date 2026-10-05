@@ -1744,7 +1744,7 @@ Operations (set \`action\`):
             type: "text",
             text:
               `[rewind to '${p.rewindTo}' · collapsed as '${p.newLabel}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
-              `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user. Other branch_summary messages, if present, record earlier collapsed segments.` +
+              `A branch_summary recording the work just collapsed has been appended to your context. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch's work. Other branch_summary messages, if present, record earlier collapsed segments.` +
               (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
           },
         ],
