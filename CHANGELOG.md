@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - *(compat)* Pi 1.0.0 — replace the removed estimateContextTokens import, make anchor atomic (closes #61)
 - *(cache)* Mirror the forced-prompt head in rewind summaries — pi 1.0.0 cache miss (closes #65)
 - *(probe)* Un-stale the three pi 1.x checks — stub, systemPrompt getter, message_end shape (closes #25)
+- *(rewind)* Resume the latest branch's work in the rewind nudge (closes #71)
 
 ### 📚 Documentation
 
