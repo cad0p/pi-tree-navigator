@@ -1846,6 +1846,9 @@ describe("dispatch: rewind happy path", () => {
     assert.match(result.content[0].text, /### In Progress/);
     assert.match(result.content[0].text, /### Blocked/);
     assert.match(result.content[0].text, /are pending/);
+    // Post-rewind continuation nudge (2026-10-05): the model must resume the
+    // collapsed branch's work, not re-answer retained earlier requests.
+    assert.match(result.content[0].text, /continuing the latest branch's work/);
     assert.match(result.content[0].text, /## Next Steps/);
   });
 
