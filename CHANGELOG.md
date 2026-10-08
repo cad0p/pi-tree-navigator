@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 - *(probe)* Un-stale the three pi 1.x checks — stub, systemPrompt getter, message_end shape (closes #25)
 - *(rewind)* Resume the latest branch's work in the rewind nudge (closes #71)
 - *(rewind)* Name the newest branch_summary as current (closes #73)
+- *(rewind)* Do not re-answer retained user messages (closes #76)
 
 ### 📚 Documentation
 
