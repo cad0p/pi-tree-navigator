@@ -145,8 +145,9 @@ agent: navigate_tree(action="rewind", rewindTo="impl-start", newLabel="impl-end"
                      summaryFocus="record only the public API of the parser
                                    and the open issue with edge case X")
   → [rewind to 'impl-start' · collapsed as 'impl-end'] · context 30.4% → 4.1% of 1.0M
-  → A branch_summary recording the work just collapsed has been appended
-    to your context. Items under '### Done' are complete. ...
+  → A branch_summary of the collapsed work has been appended to your context.
+    It is the newest branch_summary, the current state. User messages retained
+    above predate this rewind — do not re-answer them. ...
 
 agent: ...continues with the freed context, the next API call is back at ~4%...
 ```

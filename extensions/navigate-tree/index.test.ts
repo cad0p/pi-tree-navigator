@@ -1846,12 +1846,12 @@ describe("dispatch: rewind happy path", () => {
     assert.match(result.content[0].text, /### In Progress/);
     assert.match(result.content[0].text, /### Blocked/);
     assert.match(result.content[0].text, /are pending/);
-    // Post-rewind continuation nudge (2026-10-05): the model must resume the
-    // collapsed branch, treat earlier summaries as history, and not re-answer
-    // retained user messages that predate the rewind.
+    // Post-rewind continuation nudge (2026-10-05, extended 2026-10-08): the
+    // model must resume the collapsed branch, treat earlier summaries as
+    // history, and not re-answer retained user messages from before the rewind.
     assert.match(
       result.content[0].text,
-      /It is the newest branch_summary and the current state of the work/,
+      /It is the newest branch_summary, the current state/,
     );
     assert.match(
       result.content[0].text,
@@ -1861,6 +1861,7 @@ describe("dispatch: rewind happy path", () => {
       result.content[0].text,
       /User messages retained above predate this rewind/,
     );
+    assert.match(result.content[0].text, /do not re-answer them/);
     assert.match(result.content[0].text, /## Next Steps/);
   });
 
