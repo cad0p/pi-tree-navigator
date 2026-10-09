@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* Resume the latest branch's work in the rewind nudge (closes #71)
 - *(rewind)* Name the newest branch_summary as current (closes #73)
 - *(rewind)* Do not re-answer retained user messages (closes #76)
+- *(rewind)* Capture the final transformed live request for summaries (closes #75)
 
 ### 📚 Documentation
 
