@@ -361,6 +361,15 @@ interface FakeAgentSession {
     thinkingBudgets?: unknown;
     prepareNextTurn?: unknown;
     prepareNextTurnWithContext?: unknown;
+    /**
+     * Public pi-agent-core field the #75 capture wraps. The real host chain
+     * installs the forced-prompt / hidden-declaration projections BEFORE this
+     * extension's wrapper; tests model that by pre-installing a transform.
+     */
+    transformContext?: (
+      messages: unknown[],
+      signal?: AbortSignal,
+    ) => Promise<unknown[]> | unknown[];
   };
   /**
    * Plain field on `AgentSession`; the extension reads
@@ -451,6 +460,60 @@ describe("context event handler", () => {
     appendTurn(sm, "u2", "a2", 200);
     const projected = __testHooks.buildContextMessages(sm);
     assert.deepEqual(projected, sm.buildSessionContext().messages);
+  });
+
+  it("buildContextMessages applies context_edit omissions (projection beats raw entries)", () => {
+    const { sm } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    appendTurn(sm, "u2", "a2", 200);
+    // pi's overflow recovery and the fallback provider omit failed attempts
+    // with a null-replacement context_edit. The wire projection must drop
+    // the message; the raw buildContextEntries walk would reintroduce it.
+    sm.appendContextEdit(t1.assistantId, null);
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.ok(
+      !projected.some((message) => JSON.stringify(message).includes("a1")),
+      "the omitted assistant must not be reintroduced",
+    );
+    assert.ok(
+      sm.buildContextEntries().some((entry) => entry.id === t1.assistantId),
+      "the raw entry walk still contains the omitted entry",
+    );
+    assert.equal(projected.length, sm.buildSessionContext().messages.length);
+  });
+
+  it("captures the FINAL transformed request (post host projections), not the context-handler input", async () => {
+    const { sm } = setup();
+    appendTurn(sm, "u1", "a1", 100);
+    const fake = makeFakeSession(sm);
+    // Host projection layer: replace every system message with a forced head
+    // — exactly what `_installAgentForcedPromptProjection` does, and exactly
+    // what the deleted `context_with_system` capture missed because that
+    // event fires BEFORE this layer.
+    fake.agent.transformContext = async (messages) => [
+      {
+        role: "system",
+        content: `${LIVE_SYSTEM_PROMPT}\nFORCED`,
+        timestamp: 7,
+      },
+      ...messages.filter(
+        (message) => (message as { role?: string }).role !== "system",
+      ),
+    ];
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    const visible = __testHooks
+      .buildContextMessages(sm)
+      .filter((message) => message.role !== "system");
+    const final = await fake.agent.transformContext(visible);
+    const stored = __testHooks.liveCaptures.get(sm.getSessionId());
+    assert.ok(stored, "the transformContext wrapper must store a capture");
+    assert.equal(JSON.stringify(stored.messages), JSON.stringify(final));
+    assert.equal(
+      (stored.messages[0] as { content: string }).content,
+      `${LIVE_SYSTEM_PROMPT}\nFORCED`,
+      "the capture must hold the post-projection head, not the pre-transform list",
+    );
+    assert.equal((stored.messages[0] as { timestamp: number }).timestamp, 7);
   });
 
   it("handler returns messages = tree projection on every call (no leaf-gating)", () => {
@@ -2856,7 +2919,7 @@ describe("dispatch: rewind happy path", () => {
     setupRewindable(sm, pi, { capture: true });
     // The live path needs a capture from the request that produced the
     // in-flight assistant; the fixture's last turn stands in for it.
-    captureLive(sm, pi);
+    await captureLive(sm, pi);
     appendInFlightAssistant(sm, "tc-rewind");
 
     const provider = capturingProvider();
@@ -4783,37 +4846,50 @@ function appendInFlightAssistant(sm: SessionManager, id: string): string {
 }
 
 /**
- * Feed a synthetic live request through the registered
- * `context_with_system` handler: the same `[head, ...projected messages]`
- * array pi hands every capture. Call it while the session leaf is the
- * in-flight assistant's parent (i.e. before appending that assistant), so
- * the capture passes the rewind call site's freshness check.
+ * Feed a synthetic live request through the REAL capture wrapper (#75):
+ * build a fake session whose `agent.transformContext` stands in for the host
+ * chain (context handlers → forced-prompt / hidden-declaration projections),
+ * install the wrapper via `captureSession`, then call the wrapped transform
+ * with the pre-transform visible messages. Returns the FINAL transformed
+ * list — the exact array the summary payload replays. Call it while the
+ * session leaf is the in-flight assistant's parent (i.e. before appending
+ * that assistant), so the capture passes the rewind call site's freshness
+ * check.
+ *
+ * `inject` models another extension (or host rewrite) changing the visible
+ * list after our `context` handler; the `capture-diverged` guard must refuse
+ * the replay when that happens.
  */
-function captureLive(
+async function captureLive(
   sm: SessionManager,
-  pi: FakePi,
+  _pi: FakePi,
   headTools: Array<{
     name: string;
     description?: string;
     parameters?: unknown;
   }> = [],
-): unknown[] {
-  const handler = pi.onCalls.get("context_with_system")?.[0];
-  assert.ok(handler, "factory must register a context_with_system handler");
-  const messages = [
-    {
-      role: "system",
-      content: LIVE_SYSTEM_PROMPT,
-      ...(headTools.length > 0 ? { toolsAdded: headTools } : {}),
-      timestamp: 1,
-    },
-    ...__testHooks.buildContextMessages(sm),
-  ];
-  handler(
-    { type: "context_with_system", messages } as never,
-    { sessionManager: sm } as never,
-  );
-  return messages;
+  inject?: (messages: unknown[]) => unknown[],
+): Promise<unknown[]> {
+  const fake = makeFakeSession(sm);
+  fake.agent.transformContext = async (messages) => {
+    const visible = inject ? inject(messages) : messages;
+    return [
+      {
+        role: "system",
+        content: LIVE_SYSTEM_PROMPT,
+        ...(headTools.length > 0 ? { toolsAdded: headTools } : {}),
+        timestamp: 1,
+      },
+      ...visible.filter(
+        (message) => (message as { role?: string }).role !== "system",
+      ),
+    ];
+  };
+  __testHooks.captureSession(fake as unknown as AgentSession);
+  const visible = __testHooks
+    .buildContextMessages(sm)
+    .filter((message) => message.role !== "system");
+  return fake.agent.transformContext(visible);
 }
 
 /**
@@ -4917,7 +4993,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       { name: "grep", description: "g", parameters: {} },
       { name: "read", description: "r", parameters: {} },
     ];
-    const capture = captureLive(sm, pi, headTools);
+    const capture = await captureLive(sm, pi, headTools);
     const inFlightId = appendInFlightAssistant(sm, "tc-rewind");
     assert.equal(sm.getLeafId(), inFlightId);
 
@@ -5061,7 +5137,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     // Capture at the current leaf, then append another turn before the
     // in-flight assistant: the capture no longer matches the in-flight
     // assistant's parent (resume/fork/reload shape).
-    captureLive(sm, pi);
+    await captureLive(sm, pi);
     appendTurn(sm, "u5", "a5", 30_000);
     appendInFlightAssistant(sm, "tc-rewind");
     installLiveStream(ctx, capturingProvider().streamSimple);
@@ -5085,6 +5161,117 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
         .fallbackReason,
       "stale-capture",
     );
+  });
+
+  it("numbers {first} from the context-edited projection, not the raw entry walk", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    // A failed attempt BEFORE the anchor, omitted by pi / the fallback
+    // provider via a null-replacement context_edit. The raw entry walk
+    // counts it as background and would report `{first}=4`; the projection
+    // the model sees drops it, so the branch start stays message 3.
+    const failedId = sm.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-completions",
+      provider: "opencode-go",
+      model: "deepseek-v4.1-flash",
+      stopReason: "error",
+      timestamp: Date.now(),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+    sm.appendContextEdit(failedId, null);
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    const provider = capturingProvider();
+    installLiveStream(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve the latest instruction and what remains.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (result.details.summaryCache as { mode: string }).mode,
+      "live-prefix",
+    );
+
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { messages: [] }, { maxTokens: 2048 });
+    const messages = provider.calls[0].context.messages as Array<{
+      role: string;
+      content: Array<{ text?: string }>;
+    }>;
+    const trailer = messages[messages.length - 1];
+    assert.match(
+      trailer.content[0].text ?? "",
+      /Summarize only messages 3 onwards/,
+      "an omitted background message must not inflate the branch start",
+    );
+  });
+
+  it("falls back with capture-diverged when the transformed list differs from the projection", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi);
+    // Another extension or host rewrite splices a message into the
+    // transformed list: the capture no longer matches the projection at the
+    // capture leaf, so `{first}` cannot be trusted and the replay must not
+    // run.
+    await captureLive(sm, pi, [], (messages) => [
+      ...messages,
+      {
+        role: "user",
+        content: [{ type: "text", text: "injected by another handler" }],
+        timestamp: Date.now(),
+      },
+    ]);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "capture-diverged");
   });
 
   it("kill switch PI_NAVIGATE_TREE_SUMMARY_CACHE=0 bypasses the cache path", async () => {
@@ -5208,7 +5395,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     if (!fake) throw new Error("capture: true must return fake");
     fake.settingsManager = { getShowCacheMissNotices: () => true };
     appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    captureLive(sm, pi);
+    await captureLive(sm, pi);
     appendInFlightAssistant(sm, "tc-rewind");
     installLiveStream(ctx, capturingProvider().streamSimple);
 
@@ -5309,7 +5496,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     appendTurn(sm, "u4", "a4", 24_000);
     appendTurn(sm, "u5", "a5", 30_000);
 
-    captureLive(sm, pi);
+    await captureLive(sm, pi);
     appendInFlightAssistant(sm, "tc-rewind");
     installLiveStream(ctx, capturingProvider().streamSimple);
 
@@ -5346,7 +5533,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     appendTurn(sm, "u3", "a3", 18_000);
     appendTurn(sm, "u4", "a4", 24_000);
 
-    captureLive(sm, pi);
+    await captureLive(sm, pi);
     appendInFlightAssistant(sm, "tc-rewind");
     installLiveStream(ctx, capturingProvider().streamSimple);
 
@@ -5388,7 +5575,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       `a2 ${"y".repeat(40_000)}`,
       30_000,
     );
-    captureLive(sm, pi);
+    await captureLive(sm, pi);
     appendInFlightAssistant(sm, "tc-rewind");
     installLiveStream(ctx, capturingProvider().streamSimple);
 

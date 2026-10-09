@@ -36,8 +36,9 @@
  * seams). In-loop context refresh runs through the public `context`
  * extension event (see `buildContextMessages`), not
  * `agent.prepareNextTurn*` reflection; the cache-preserving summary
- * path (#75) observes live requests via the public
- * `context_with_system` event and replays them through the public
+ * path (#75) captures the FINAL live request by wrapping the public
+ * `agent.transformContext` field (after the host's forced-prompt and
+ * hidden-declaration projections) and replays it through the public
  * `modelRegistry.streamSimple`.
  */
 
@@ -51,6 +52,7 @@ import type {
 import {
   AgentSession,
   buildSessionContext,
+  buildSessionProjection,
   CONFIG_DIR_NAME,
   collectEntriesForBranchSummary,
   convertToLlm,
@@ -188,6 +190,12 @@ const LIST_PCT_COL_WIDTH = 5;
 const LIST_LABEL_COL_WIDTH = 28;
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
+/**
+ * Stashed host transformContext (#75), so a `/reload` re-wraps the host's own
+ * transform instead of chaining another observer layer.
+ */
+const ORIG_TRANSFORM_KEY = Symbol.for("navigate-tree.orig-transform-context");
+
 // Two warnings: list-site (read-only path; warns about the next turn's
 // context view) and rewind-site (wrote to disk; leads with that). Both
 // suggest /reload first, then restart pi, in that order.
@@ -240,10 +248,80 @@ function asInternals(session: AgentSession): PiInternals {
 const sessionInstances: WeakRef<AgentSession>[] = [];
 let seenSessions = new WeakSet<AgentSession>();
 
+/**
+ * Most recent FINAL live request captured per session (#75): the exact
+ * `[head, ...messages]` array the agent loop hands to the provider, i.e. the
+ * output of the host's composed `transformContext` (runner `context` /
+ * `context_with_system` handlers, then the forced-prompt and
+ * hidden-declaration projections). Stored post-transform on purpose: the
+ * public `context_with_system` event fires BEFORE those host projections, so
+ * capturing there misses the forced head (live evidence: pi 1.1.0
+ * `AgentSession._installAgentForcedPromptProjection` wraps
+ * `agent.transformContext` outside `runner.emitContext`).
+ */
+interface LiveCapture {
+  messages: AgentMessage[];
+  leafId: string | null;
+}
+const liveCaptures = new Map<string, LiveCapture>();
+
+/**
+ * Install the observation-only live-request capture on a session's Agent by
+ * wrapping `agent.transformContext` (a public Agent field) once per session.
+ * The wrapper delegates to the host's own transform, stores the result, and
+ * returns it unchanged — it can never alter the live request. Replace, never
+ * stack: the original is stashed under `ORIG_TRANSFORM_KEY`.
+ */
+function installLiveCaptureWrapper(session: AgentSession): void {
+  try {
+    const agent = asInternals(session).agent as
+      | (Record<PropertyKey, unknown> & {
+          transformContext?: (
+            messages: AgentMessage[],
+            signal?: AbortSignal,
+          ) => Promise<AgentMessage[]> | AgentMessage[];
+        })
+      | undefined;
+    if (!agent) return;
+    if (!agent[ORIG_TRANSFORM_KEY]) {
+      agent[ORIG_TRANSFORM_KEY] = agent.transformContext;
+    }
+    const orig = agent[ORIG_TRANSFORM_KEY] as
+      | ((
+          messages: AgentMessage[],
+          signal?: AbortSignal,
+        ) => Promise<AgentMessage[]> | AgentMessage[])
+      | undefined;
+    agent.transformContext = async (messages, signal) => {
+      const transformed = orig ? await orig(messages, signal) : messages;
+      try {
+        const sessionId = session.sessionManager.getSessionId();
+        // Refresh insertion order so the cap evicts the stalest session.
+        liveCaptures.delete(sessionId);
+        liveCaptures.set(sessionId, {
+          messages: transformed.slice(),
+          leafId: session.sessionManager.getLeafId(),
+        });
+        if (liveCaptures.size > MAX_SESSION_REFS) {
+          const oldest = liveCaptures.keys().next().value;
+          if (oldest !== undefined) liveCaptures.delete(oldest);
+        }
+      } catch {
+        // Observation-only: a throwing sessionManager must never break the
+        // live request. A missing capture just takes the cold fallback.
+      }
+      return transformed;
+    };
+  } catch {
+    // Older/reshaped host: no wrapper ⇒ no capture ⇒ cold fallback.
+  }
+}
+
 function captureSession(session: AgentSession): void {
   if (seenSessions.has(session)) return;
   seenSessions.add(session);
   sessionInstances.push(new WeakRef(session));
+  installLiveCaptureWrapper(session);
   // Reap dead WeakRefs occasionally so the array doesn't grow unbounded
   // across /new and /resume cycles.
   if (sessionInstances.length > MAX_SESSION_REFS) {
@@ -401,6 +479,15 @@ function withSessionHeaders(
  * snapshot. The loop's own `currentContext.messages` is never mutated — the
  * handler only replaces the clone that `convertToLlm` consumes.
  *
+ * Prefers the canonical `buildSessionProjection().messages` (>= 0.87.0): that
+ * is exactly what pi itself treats as the model context, applying
+ * `context_edit` omissions/replacements written by pi's own overflow recovery
+ * and by extensions such as the fallback provider. Returning the raw
+ * `buildContextEntries()` view would reintroduce edited-away messages into the
+ * request (and desync the summary payload's `{first}` numbering from what the
+ * model actually sees). The entry walk remains only as a defensive fallback
+ * for structural test doubles.
+ *
  * We always replace (no leaf-gating): every `appendMessage` advances the
  * session leaf, so a "leaf changed since last turn" heuristic would fire on
  * essentially every call anyway — and always-replace is byte-for-byte the
@@ -409,11 +496,20 @@ function withSessionHeaders(
  * The parameter is typed structurally because `ReadonlySessionManager` is
  * NOT re-exported from the package barrel (only `SessionManager` and
  * `sessionEntryToContextMessages` are public); `ctx.sessionManager` at the
- * event site is `ReadonlySessionManager`, which has `buildContextEntries()`.
+ * event site is `ReadonlySessionManager`.
  */
 export function buildContextMessages(sm: {
   buildContextEntries(): SessionEntry[];
+  buildSessionProjection?(): { messages: AgentMessage[] };
 }): ReturnType<typeof sessionEntryToContextMessages> {
+  try {
+    if (typeof sm.buildSessionProjection === "function") {
+      return sm.buildSessionProjection().messages;
+    }
+  } catch {
+    // Fall through to the raw entry projection — pi rewrites the context
+    // handlers' output at the wire boundary anyway.
+  }
   return sm
     .buildContextEntries()
     .flatMap((entry) => sessionEntryToContextMessages(entry));
@@ -427,20 +523,25 @@ export function buildContextMessages(sm: {
  *
  * System messages are excluded because the instruction numbering explicitly
  * excludes the system prompt (and any tool-delta system messages replayed
- * into the head). Walks the live projection (not the raw branch) so a
- * compaction cut before `target` — represented by a single summary entry —
- * is counted the way the captured payload actually presents it.
+ * into the head). Quantity is taken from the PROJECted entries
+ * (`buildSessionProjection()`), so a compaction cut before `target` is
+ * counted the way the captured payload presents it AND messages omitted by
+ * `context_edit` (pi's overflow recovery, the fallback provider's
+ * failed-attempt edits) no longer inflate `{first}` past what the model sees.
  */
 function countBackgroundMessages(
-  contextEntries: SessionEntry[],
+  projectedEntries: Array<{
+    sourceEntry: { id: string };
+    messages: AgentMessage[];
+  }>,
   target: string,
 ): number {
   let count = 0;
-  for (const entry of contextEntries) {
-    for (const message of convertToLlm(sessionEntryToContextMessages(entry))) {
+  for (const entry of projectedEntries) {
+    for (const message of convertToLlm(entry.messages)) {
       if (message.role !== "system") count++;
     }
-    if (entry.id === target) break;
+    if (entry.sourceEntry.id === target) break;
   }
   return count;
 }
@@ -747,18 +848,6 @@ function toolError(
   };
 }
 
-/**
- * Most recent live request captured for one session through the public
- * `context_with_system` event (#75): the exact `[head, ...messages]` array
- * the provider was about to receive. `leafId` is the session leaf at capture
- * time — the in-flight assistant's parent — and is the freshness key the
- * rewind call site checks before replaying the capture.
- */
-interface LiveCapture {
-  messages: AgentMessage[];
-  leafId: string | null;
-}
-
 export default function (
   pi: ExtensionAPI,
   opts?: { summarize?: typeof generateBranchSummary },
@@ -777,13 +866,6 @@ export default function (
   let toolActive = true;
   let rewindHintAtPercent: number | null = null;
   let hintTracker = new RewindHintTracker();
-
-  // Live-request capture (#75): per-session, observation-only. Every
-  // `context_with_system` event replaces its session's entry; the map is
-  // capped at MAX_SESSION_REFS (the same fanout bound as the captured
-  // AgentSession refs) so a long-lived process with many subagent sessions
-  // cannot pin unbounded live-message arrays.
-  const liveCaptures = new Map<string, LiveCapture>();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
   // and NEVER cleared in-process: once a session has settled (write or
@@ -919,33 +1001,6 @@ export default function (
   pi.on("context", (_event, ctx) => ({
     messages: buildContextMessages(ctx.sessionManager),
   }));
-
-  // Observation-only capture of the final live request (#75): runs after the
-  // `context` handlers above and Pi's system-message restore, so
-  // `event.messages` is the exact `[head, ...messages]` array the provider
-  // will receive — tool declarations included. Storing it is what lets
-  // `rewind` replay the live request's own message list instead of
-  // re-deriving it (the divergence that made summary requests miss the
-  // prompt cache). Returning nothing leaves the live request untouched.
-  pi.on("context_with_system", (event, ctx) => {
-    try {
-      const sessionId = ctx.sessionManager.getSessionId();
-      // Refresh insertion order so the cap evicts the stalest session.
-      liveCaptures.delete(sessionId);
-      liveCaptures.set(sessionId, {
-        messages: event.messages.slice(),
-        leafId: ctx.sessionManager.getLeafId(),
-      });
-      if (liveCaptures.size > MAX_SESSION_REFS) {
-        const oldest = liveCaptures.keys().next().value;
-        if (oldest !== undefined) liveCaptures.delete(oldest);
-      }
-    } catch {
-      // Observation-only: a throwing sessionManager must never break the
-      // live request. A missing capture just takes the cold fallback.
-    }
-    return undefined;
-  });
 
   // Anchor mandate (#31): a before_agent_start append lands at the END of
   // the system prompt — stronger than the mid-prompt Guidelines block, and
@@ -1518,51 +1573,73 @@ Operations (set \`action\`):
             // captured system message carries the live prompt AND the live
             // tool declarations, so the provider replays the exact live
             // order — no mirroring, no `context.tools` re-derivation.
-            const first = countBackgroundMessages(contextEntries, target) + 1;
-            const payload = [
-              ...convertToLlm(capture.messages),
-              buildSummaryInstructionMessage(first, p.summaryFocus),
-            ];
-            // No truncation: cutting the live prefix breaks parity by
-            // definition. When the replay plus the instruction cannot fit
-            // the window, hand the rewind to upstream's cold path (which
-            // truncates at the evidence budget).
-            const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
-            const payloadTokens = payload.reduce(
-              (sum, message) => sum + estimateTokens(message as AgentMessage),
-              0,
+            //
+            // `{first}` must number the branch start the way the model
+            // sees the payload, so count the PROJECTED (context-edit-aware)
+            // entries at the capture leaf. The guard below refuses the
+            // replay when the capture and that projection disagree in
+            // length: the transformed live list was changed by another
+            // extension or a host rewrite, and a guessed `{first}` could
+            // scope the summary wrong.
+            const captureProjection = buildSessionProjection(
+              allEntries,
+              capture.leafId,
+              byId,
             );
-            if (payloadTokens > tokenBudget) {
-              summaryCacheFallbackReason = "overflow";
+            const nonSystem = (messages: AgentMessage[]): number =>
+              convertToLlm(messages).filter((m) => m.role !== "system").length;
+            const captureVisible = nonSystem(capture.messages);
+            const projectedVisible = nonSystem(captureProjection.messages);
+            if (captureVisible !== projectedVisible) {
+              summaryCacheFallbackReason = "capture-diverged";
             } else {
-              // Public since 0.81.0; `ctx.thinkingLevel` only exists >=
-              // 0.84.2, so never read it directly. "off" is omitted,
-              // mirroring the live loop's request shape.
-              const reasoning =
-                typeof pi.getThinkingLevel === "function"
-                  ? pi.getThinkingLevel()
+              const first =
+                countBackgroundMessages(captureProjection.entries, target) + 1;
+              const payload = [
+                ...convertToLlm(capture.messages),
+                buildSummaryInstructionMessage(first, p.summaryFocus),
+              ];
+              // No truncation: cutting the live prefix breaks parity by
+              // definition. When the replay plus the instruction cannot fit
+              // the window, hand the rewind to upstream's cold path (which
+              // truncates at the evidence budget).
+              const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
+              const payloadTokens = payload.reduce(
+                (sum, message) => sum + estimateTokens(message as AgentMessage),
+                0,
+              );
+              if (payloadTokens > tokenBudget) {
+                summaryCacheFallbackReason = "overflow";
+              } else {
+                // Public since 0.81.0; `ctx.thinkingLevel` only exists >=
+                // 0.84.2, so never read it directly. "off" is omitted,
+                // mirroring the live loop's request shape.
+                const reasoning =
+                  typeof pi.getThinkingLevel === "function"
+                    ? pi.getThinkingLevel()
+                    : undefined;
+                // `thinkingBudgets` is a plain field on pi-agent-core's Agent;
+                // forwarded on the capture path exactly like the live loop.
+                const owning = findOwningSession(sm);
+                const thinkingBudgets = owning
+                  ? asInternals(owning).agent?.thinkingBudgets
                   : undefined;
-              // `thinkingBudgets` is a plain field on pi-agent-core's Agent;
-              // forwarded on the capture path exactly like the live loop.
-              const owning = findOwningSession(sm);
-              const thinkingBudgets = owning
-                ? asInternals(owning).agent?.thinkingBudgets
-                : undefined;
-              summaryCacheRequest = {
-                messages: payload,
-                // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
-                // over `process.env`, mirroring pi-ai's
-                // `getProviderEnvValue`: the live turns resolve retention
-                // from the provider env, so a provider-scoped "long" with
-                // a process-level "short" would make live=long /
-                // summary=short and silently miss.
-                cacheRetention: resolveSummaryCacheRetention(auth.env),
-                ...(sessionId ? { sessionId } : {}),
-                ...(typeof reasoning === "string" && reasoning !== "off"
-                  ? { reasoning: reasoning as ThinkingLevel }
-                  : {}),
-                ...(thinkingBudgets ? { thinkingBudgets } : {}),
-              };
+                summaryCacheRequest = {
+                  messages: payload,
+                  // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
+                  // over `process.env`, mirroring pi-ai's
+                  // `getProviderEnvValue`: the live turns resolve retention
+                  // from the provider env, so a provider-scoped "long" with
+                  // a process-level "short" would make live=long /
+                  // summary=short and silently miss.
+                  cacheRetention: resolveSummaryCacheRetention(auth.env),
+                  ...(sessionId ? { sessionId } : {}),
+                  ...(typeof reasoning === "string" && reasoning !== "off"
+                    ? { reasoning: reasoning as ThinkingLevel }
+                    : {}),
+                  ...(thinkingBudgets ? { thinkingBudgets } : {}),
+                };
+              }
             }
           }
         }
@@ -1904,12 +1981,14 @@ export const __testHooks = {
       delete proto[ORIG_PROMPT_KEY];
     }
     sessionInstances.length = 0;
+    liveCaptures.clear();
     // WeakSet has no .clear(); rebind to a fresh instance so a test that
     // re-captures the SAME session identity post-reset isn't deduped by
     // stale state from the previous test's capture.
     seenSessions = new WeakSet();
   },
   /** Module-internal helpers exposed for hermetic unit tests. */
+  liveCaptures,
   buildSyntheticAssistant,
   findLabelHint,
   findLabeledEntry,

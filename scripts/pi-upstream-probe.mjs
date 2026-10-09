@@ -21,9 +21,11 @@
  *   5. `ModelRegistry.prototype.streamSimple` (#75, floor 0.87.0) — the
  *      summarization transport is `modelRegistry.streamSimple`; its absence
  *      forces upstream's cold dispatch.
- *   6. `context_with_system` event support (#75) — the live-request capture
- *      seam; checked against the runner source (there is no runtime symbol
- *      for an event name) plus the event-type declaration.
+ *   6. `Agent.transformContext` plain writable field (#75) — the live-request
+ *      capture seam; the extension wraps it once per session (observation
+ *      only) so the capture sees the FINAL list after pi's forced-prompt /
+ *      hidden-declaration projections. Checked against the constructor
+ *      assignment in the installed pi-agent-core dist.
  *
  * #75 deleted the #33 `state.tools` / `state.systemPrompt` reflection reads
  * (the capture replays the live message list instead of mirroring fields),
@@ -228,33 +230,29 @@ try {
     typeof ModelRegistry?.prototype?.streamSimple,
   );
 
-  // --- 7c. context_with_system event support (#75) ---
-  // The live-request capture registers `pi.on("context_with_system", ...)`.
-  // Event names have no runtime symbol, so check the runner's emit site and
-  // the event-type declaration in the installed dist. If pi drops/renames
-  // the event, the capture silently never fires and every rewind goes cold —
-  // exactly the failure this probe must surface.
-  const extensionsDir = path.join(path.dirname(codingAgentDist), "core/extensions");
-  let contextWithSystemSupport = { ok: false, detail: "not run" };
-  try {
-    const runnerSrc = readFileSync(path.join(extensionsDir, "runner.js"), "utf8");
-    const typesSrc = readFileSync(path.join(extensionsDir, "types.d.ts"), "utf8");
-    const emitsEvent = runnerSrc.includes('"context_with_system"');
-    const declaresEvent = typesSrc.includes('type: "context_with_system"');
-    contextWithSystemSupport = {
-      ok: emitsEvent && declaresEvent,
-      detail: `runner emit: ${emitsEvent ? "found" : "MISSING"}, type declaration: ${declaresEvent ? "found" : "MISSING"}`,
-    };
-  } catch (e) {
-    contextWithSystemSupport = {
-      ok: false,
-      detail: `threw: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
+  // --- 7c. Agent.transformContext capture seam (#75) ---
+  // The live-request capture wraps `agent.transformContext` once per
+  // session. It must be a plain writable instance field: a `#`-private field
+  // or a getter-only prototype accessor would make the wrapper assignment a
+  // silent no-op / throw, every capture would be missing, and every rewind
+  // would fall back with `no-capture`.
+  const transformAssign =
+    /this\.transformContext\s*=\s*runtimeOptions\.transformContext/.test(
+      agentSrc,
+    );
+  const transformDesc = Object.getOwnPropertyDescriptor(
+    Agent?.prototype ?? {},
+    "transformContext",
+  );
   check(
-    "context_with_system event supported (#75)",
-    contextWithSystemSupport.ok,
-    contextWithSystemSupport.detail,
+    "Agent.transformContext plain writable field (#75 capture seam)",
+    transformAssign &&
+      !(transformDesc?.get && transformDesc?.set === undefined),
+    transformAssign
+      ? transformDesc?.get
+        ? `prototype accessor present (get=${!!transformDesc.get}, set=${!!transformDesc.set})`
+        : "plain this.transformContext = runtimeOptions.transformContext"
+      : "constructor assignment MISSING",
   );
 
   // --- 8. SettingsManager.getShowCacheMissNotices (TUI cache-notice gate) ---

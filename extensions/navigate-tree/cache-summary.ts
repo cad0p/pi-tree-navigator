@@ -16,9 +16,9 @@
  *
  * ## How
  *
- * This extension observes every live request through pi's public
- * `context_with_system` event and stores the exact `[head, ...messages]`
- * array the provider is about to see, keyed by session. At rewind time
+ * This extension observes the FINAL live request of every turn by wrapping
+ * the public `agent.transformContext` field (once per session) and stores
+ * its exact `[head, ...messages]` output keyed by session. At rewind time
  * `index.ts` converts that capture with the same public `convertToLlm` the
  * live loop uses, appends the summary instruction, and hands the result to
  * `createCachePreservingStreamFn`. The wrapper passes it to
@@ -482,9 +482,9 @@ export function measureSummaryCache(
 // ---------------------------------------------------------------------------
 /**
  * The captured live request, replayed for the summarization call.
- * `index.ts` assembles this from the `context_with_system` capture (already
- * converted to wire messages) plus the trailing instruction, and passes it
- * to `createCachePreservingStreamFn`.
+ * `index.ts` assembles this from the `agent.transformContext` capture
+ * (already converted to wire messages) plus the trailing instruction, and
+ * passes it to `createCachePreservingStreamFn`.
  */
 export interface CacheRequest {
   /**
