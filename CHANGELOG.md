@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(rewind)* Rename params labelStart/labelEnd to rewindTo/newLabel (closes #43)
+- *(rewind)* Context-pressure rewind hint (config-gated, default off) (closes #44) (closes #42)
+- *(anchor)* Automatic low-floor anchor:start (closes #55)
+
+### 🐛 Bug Fixes
+
+- *(hint)* Guard the rewind-hint fallback + hoist LABEL_PREFIX + TUI-proof docs rule (closes #48)
+- *(guidance)* Rewind to the oldest appropriate anchor (closes #51)
+- *(hint)* Keep the tool-active gate per-session (closes #58)
+- *(compat)* Pi 1.0.0 — replace the removed estimateContextTokens import, make anchor atomic (closes #61)
+- *(cache)* Mirror the forced-prompt head in rewind summaries — pi 1.0.0 cache miss (closes #65)
+- *(probe)* Un-stale the three pi 1.x checks — stub, systemPrompt getter, message_end shape (closes #25)
+- *(rewind)* Resume the latest branch's work in the rewind nudge (closes #71)
+- *(rewind)* Name the newest branch_summary as current (closes #73)
+- *(rewind)* Do not re-answer retained user messages (closes #76)
+- *(rewind)* Capture the final transformed live request for summaries (closes #75)
+
+### 📚 Documentation
+
+- AGENTS.md — pinned base text (drop Goldmine variant) (closes #53) ([#54](https://github.com/cad0p/pi-tree-navigator/pull/54))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Drop macos-latest from the PR test matrix (closes #57)
+
+
 ## [0.2.0] - 2026-09-15
 
 <!-- USER-EDITABLE SECTION START -->
