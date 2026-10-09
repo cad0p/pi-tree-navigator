@@ -16,41 +16,39 @@
  *
  * ## How
  *
- * `index.ts` already injects a `streamFn` into `generateBranchSummary`
- * (for custom-provider routing). That seam receives the fully built
- * `(model, context, options)` triple *after* upstream applied its cold
- * choices — including `completeSummarization`'s forced
- * `cacheRetention: "none"` + fresh `sessionId` — and before the wire
- * call. `createCachePreservingStreamFn` replaces that triple with the
- * live request shape: the session's own system prompt, tool array, and
- * session id, the conversation as structured `Message`s (so the bytes
- * prefix-match the live turns), and the same cache/reasoning params live
- * turns send.
+ * This extension observes every live request through pi's public
+ * `context_with_system` event and stores the exact `[head, ...messages]`
+ * array the provider is about to see, keyed by session. At rewind time
+ * `index.ts` converts that capture with the same public `convertToLlm` the
+ * live loop uses, appends the summary instruction, and hands the result to
+ * `createCachePreservingStreamFn`. The wrapper passes it to
+ * `modelRegistry.streamSimple` unchanged, so the summary request's messages
+ * (and the tool declarations replayed from its leading system message) are
+ * byte-identical to the live request by construction — no field mirroring.
+ * The wrapper only strips upstream's `maxTokens` cap and sets the live
+ * cache/reasoning options.
  *
  * ## Residual risks (see README "Limitations")
  *
- *  - Every param this module does not mirror is a silent cache miss:
- *    the summary still runs, just cold (and a cold *structured* request
- *    can bill more than branch-only evidence). The extension measures the
- *    summary response with pi's own miss detector and, when it clears the
- *    display floor, records the notice string in `details.summaryCache`
- *    (gated by `showCacheMissNotices`); `index.ts`'s `renderResult` renders
- *    it as a TUI transcript line. Neither surface reaches the model.
- *  - The request depends on plain (non-`#`-private) pi internals for
- *    `systemPrompt` / `tools`; `index.ts` falls back to the cold request
- *    when any live input is unavailable.
+ *  - Providers that key on request attributes outside the message
+ *    transcript (headers, retry/timeout defaults, `onPayload` /
+ *    `transformHeaders` hooks) still see this extension-built request, not
+ *    the SDK-built one. `index.ts` keeps the session-routing headers the
+ *    providers require (`withSessionHeaders`).
+ *  - When the capture is unavailable, stale, or unsafe, `index.ts` hands
+ *    the rewind to upstream `generateBranchSummary` unchanged: a correct
+ *    summary on one cold bill, recorded in `details.summaryCache` as a
+ *    fallback reason. The extension also measures the served response with
+ *    pi's own miss detector and, when it clears the display floor, records
+ *    the notice string in `details.summaryCache` (gated by
+ *    `showCacheMissNotices`); `index.ts`'s `renderResult` renders it as a
+ *    TUI transcript line. Neither surface reaches the model.
  */
 
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type {
-  AgentTool,
-  StreamFn,
-  ThinkingLevel,
-} from "@earendil-works/pi-agent-core";
-import {
   convertToLlm,
-  estimateTokens,
-  type SessionEntry,
-  sessionEntryToContextMessages,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
@@ -139,209 +137,22 @@ export function buildSummaryInstruction(focus: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Payload construction
+// Instruction message
 // ---------------------------------------------------------------------------
 
 /**
- * Drop `toolResult` messages whose matching assistant `toolCall` is not in
- * the payload (a branch cut between a call and its result; compaction
- * boundaries can also split them). Providers reject result blocks that
- * reference calls outside the request, so the structured summary request
- * must strip them. Port of the fork's `stripBoundaryOrphanToolResults`:
- * preserves order, never mutates, and preserves element identity (callers
- * use identity to count how many stripped messages preceded the branch).
- */
-export function stripBoundaryOrphanToolResults(
-  messages: WireMessage[],
-): WireMessage[] {
-  const callIds = new Set<string>();
-  for (const message of messages) {
-    if (message.role !== "assistant") continue;
-    for (const block of message.content) {
-      if (block.type === "toolCall") callIds.add(block.id);
-    }
-  }
-  return messages.filter((message) => {
-    if (message.role !== "toolResult") return true;
-    return callIds.has(message.toolCallId);
-  });
-}
-
-/**
- * Newest index of an assistant entry whose content carries a `toolCall` with
- * `inFlightToolCallId`, or -1 when none exists. Searches from the end because
- * sequential execution can leave sibling `toolResult` entries after the
- * assistant that owns the in-flight call.
- */
-function findInFlightAssistantIndex(
-  entries: SessionEntry[],
-  inFlightToolCallId: string,
-): number {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (
-      entry.type === "message" &&
-      entry.message.role === "assistant" &&
-      Array.isArray(entry.message.content) &&
-      entry.message.content.some(
-        (block) => block.type === "toolCall" && block.id === inFlightToolCallId,
-      )
-    ) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-export interface BuildLiveSummaryArgs {
-  /**
-   * The live projection of the active branch (`sessionManager
-   * .buildContextEntries()`), i.e. the exact entries the live turns send.
-   * Using the projection (rather than reconstructing prefix+branch) is what
-   * makes the resulting payload byte-identical to the previous live
-   * request's message list.
-   */
-  contextEntries: SessionEntry[];
-  /**
-   * Ids of the entries being collapsed (`collectEntriesForBranchSummary`).
-   * Messages from other entries are pre-branch background: sent for cache
-   * prefix matching only, excluded from the summary via the `{first}` scope
-   * sentence.
-   */
-  branchEntryIds: Set<string>;
-  /**
-   * Id of the tool call whose assistant message triggered this rewind. That
-   * assistant entry was never part of any cached live prefix (it is the
-   * response being streamed), and an unpaired `tool_use` immediately
-   * followed by a user message is rejected by Anthropic. The newest retained
-   * assistant entry carrying a `toolCall` with this id is removed by index —
-   * NOT merely from the tail: `navigate_tree` runs `executionMode:
-   * "sequential"`, so pi-agent-core appends each sibling `toolResult` before
-   * the next call executes and a sibling result can follow this assistant.
-   * Dropping the assistant makes the retained history byte-identical to the
-   * previous live request.
-   */
-  inFlightToolCallId: string;
-  /** Context window minus the response reserve (upstream default 16384). */
-  tokenBudget: number;
-  /** `summaryFocus` from the tool call. */
-  focus: string;
-}
-
-export interface LiveSummaryMessages {
-  /** Structured history (stripped) + the trailing instruction message. */
-  messages: WireMessage[];
-  /**
-   * 1-based number of the first branch message in `messages` (numbering
-   * excludes the system prompt; the instruction itself is not evidence).
-   * Substituted into `{first}`.
-   */
-  first: number;
-  /**
-   * False when no retained entry belongs to the collapsed branch: a
-   * labels-only segment, the newest message alone exceeding the budget, or
-   * the branch start being dropped by compaction. `first` is then 1 — every
-   * retained message is background and gets summarized. The index.ts call
-   * site now treats `false` as a real fallback (reason
-   * `"branch-start-not-retained"`), so a live-prefix request always carries
-   * `true`; the flag is kept in `details.summaryCache` for diagnostics. A
-   * retained survivor by definition implies a hit, so there is no clamp
-   * step.
-   */
-  branchStartRetained: boolean;
-}
-
-/**
- * Build the cache-preserving summary payload.
+ * Build the trailing instruction wire message for a captured payload.
  *
- * Walk the live projection newest→oldest, dropping oldest entries first when
- * over budget (a truncated request no longer prefix-matches live turns; the
- * system prompt + tools still do). Summary entries (`compaction` /
- * `branch_summary`) get upstream's 0.9-slack retry so they survive
- * truncation when they are the thing that must not be lost. Then strip
- * boundary-orphan tool results and adjust `{first}` by however many stripped
- * messages preceded the branch start, so the instruction's numbering always
- * matches the payload actually sent.
+ * `first` is the 1-based number of the first branch message in the payload
+ * (non-system messages only — the captured leading system message carries the
+ * prompt and tool declarations and is not part of the conversation
+ * numbering). Everything before it is background for prefix matching only.
  */
-export function buildLiveSummaryMessages(
-  args: BuildLiveSummaryArgs,
-): LiveSummaryMessages {
-  const {
-    contextEntries,
-    branchEntryIds,
-    inFlightToolCallId,
-    tokenBudget,
-    focus,
-  } = args;
-
-  // --- in-flight assistant exclusion (must happen before anything else) ---
-  // Search the WHOLE retained array, not just the tail. `navigate_tree`
-  // declares `executionMode: "sequential"`, so pi-agent-core runs the batch
-  // through `executeToolCallsSequential`: calls execute in order and each
-  // `toolResult` is appended before the next call executes. When a sibling
-  // tool call precedes the rewind call in the same assistant turn, the last
-  // session entry is that sibling's `toolResult` — not the assistant — so a
-  // tail-only check would leave the assistant (and its unpaired `tool_use`)
-  // in the payload and Anthropic would reject the summary request. Remove the
-  // assistant at its index; the sibling `toolResult`s that follow then have
-  // no matching call and are dropped by `stripBoundaryOrphanToolResults`
-  // below (single removal path — do not add a second one here).
-  const retained = contextEntries.slice();
-  const excludedAt = findInFlightAssistantIndex(retained, inFlightToolCallId);
-  if (excludedAt >= 0) retained.splice(excludedAt, 1);
-
-  // --- newest→oldest walk with the upstream token budget ---
-  const evidence: WireMessage[] = [];
-  const inBranch: boolean[] = [];
-  let totalTokens = 0;
-  for (let i = retained.length - 1; i >= 0; i--) {
-    const entry = retained[i];
-    const entryMessages = sessionEntryToContextMessages(entry);
-    let overBudget = false;
-    for (let j = entryMessages.length - 1; j >= 0; j--) {
-      const agentMessage = entryMessages[j];
-      // convertToLlm is a pure per-message map+filter (verified against
-      // 0.84.2 `messages.js`), so converting one message at a time keeps
-      // the branch/background flag exact without diverging from what the
-      // live loop produces for the same AgentMessage.
-      const wire = convertToLlm([agentMessage]);
-      if (wire.length === 0) continue;
-      const tokens = estimateTokens(agentMessage);
-      const fits = tokenBudget <= 0 || totalTokens + tokens <= tokenBudget;
-      if (!fits) {
-        // Summary entries are load-bearing context: upstream retries them
-        // when under 90% of budget. Mirror that before giving up.
-        if (
-          (entry.type === "compaction" || entry.type === "branch_summary") &&
-          totalTokens < tokenBudget * 0.9
-        ) {
-          evidence.unshift(...wire);
-          inBranch.unshift(...wire.map(() => branchEntryIds.has(entry.id)));
-          totalTokens += tokens;
-        }
-        overBudget = true;
-        break;
-      }
-      evidence.unshift(...wire);
-      inBranch.unshift(...wire.map(() => branchEntryIds.has(entry.id)));
-      totalTokens += tokens;
-    }
-    if (overBudget) break;
-  }
-
-  const firstBranchIdx = inBranch.indexOf(true);
-  const branchStartRetained = firstBranchIdx >= 0;
-  // Pre-truncation counting would misnumber; count only retained messages
-  // before the branch start.
-  const firstRaw = branchStartRetained ? 1 + firstBranchIdx : 1;
-
-  const stripped = stripBoundaryOrphanToolResults(evidence);
-  const removedBeforeFirst = evidence
-    .slice(0, firstRaw - 1)
-    .filter((message) => !stripped.includes(message)).length;
-  const first = Math.max(1, firstRaw - removedBeforeFirst);
-
-  const instruction: WireMessage = {
+export function buildSummaryInstructionMessage(
+  first: number,
+  focus: string,
+): WireMessage {
+  return {
     role: "user",
     content: [
       {
@@ -354,94 +165,6 @@ export function buildLiveSummaryMessages(
     ],
     timestamp: Date.now(),
   };
-
-  return { messages: [...stripped, instruction], first, branchStartRetained };
-}
-
-// ---------------------------------------------------------------------------
-// Forced-prompt head projection (pi 1.0.0)
-// ---------------------------------------------------------------------------
-
-/**
- * Structural view of the pi-1.0.0 leading system message carried in the wire
- * transcript. `@earendil-works/pi-ai@0.84.2` (the locked devDependency) has no
- * `system` member on its `Message` union and no `toolsAdded`/`toolsRemoved`, so
- * the projection below reads those fields structurally via casts and returns
- * this shape. It is only ever consumed by pi-1.0.0's raw provider — the
- * legacy 0.84.2 path never produces it.
- */
-export interface ProjectedSystemMessage {
-  role: "system";
-  content: string;
-  toolsAdded?: Array<{
-    name: string;
-    description?: string;
-    parameters?: unknown;
-  }>;
-  toolsRemoved?: Array<{ name: string }>;
-  timestamp?: number;
-}
-
-/**
- * Mirror pi 1.0.0's `_installAgentForcedPromptProjection` on the summary
- * request.
- *
- * On 1.0.0 a `before_agent_start` that returns `systemPrompt` (this extension's
- * anchor mandate) makes the host rewrite every live request into a single
- * leading system head carrying the forced text and the current tool
- * declarations. The summary path bypasses that projection (it rebuilds from
- * the persisted sections), so without this mirror the head diverges at byte 0
- * and the whole prompt cache misses. `index.ts` calls this only when it has
- * proven the host projects (`ctx.getSystemPrompt() !== agent.state.systemPrompt`).
- *
- * Semantics copied from pi-ai's `getCurrentTools` replay: walk the system
- * messages in order, deleting names in `toolsRemoved` and setting names in
- * `toolsAdded` (Map insertion order). When the replay yields no tools — budget
- * truncation dropped every system entry, or the surviving entry carries no
- * declarations — fall back to `toolsFallback` (the request's live
- * `context.tools`). The head timestamp is the first system-message timestamp,
- * else `Date.now()`; non-system messages keep their order and identity.
- */
-export function projectForcedPromptHead(
-  messages: WireMessage[],
-  systemPrompt: string,
-  toolsFallback: AgentTool[],
-): Array<WireMessage | ProjectedSystemMessage> {
-  type ProjectedTool = NonNullable<
-    ProjectedSystemMessage["toolsAdded"]
-  >[number];
-  const tools = new Map<string, ProjectedTool>();
-  let timestamp: number | undefined;
-  for (const message of messages) {
-    const view = message as {
-      role?: string;
-      toolsAdded?: ProjectedTool[];
-      toolsRemoved?: Array<{ name: string }>;
-      timestamp?: number;
-    };
-    if (view.role !== "system") continue;
-    if (timestamp === undefined && typeof view.timestamp === "number") {
-      timestamp = view.timestamp;
-    }
-    for (const tool of view.toolsRemoved ?? []) tools.delete(tool.name);
-    for (const tool of view.toolsAdded ?? []) tools.set(tool.name, tool);
-  }
-  const replayed = [...tools.values()];
-  const toolsForHead: ProjectedTool[] =
-    replayed.length > 0 ? replayed : toolsFallback;
-  const head: ProjectedSystemMessage = {
-    role: "system",
-    content: systemPrompt,
-    ...(toolsForHead.length > 0 ? { toolsAdded: toolsForHead } : {}),
-    timestamp: timestamp ?? Date.now(),
-  };
-  const nonSystem: WireMessage[] = [];
-  for (const message of messages) {
-    if ((message as { role?: string }).role !== "system") {
-      nonSystem.push(message);
-    }
-  }
-  return [head, ...nonSystem];
 }
 
 // ---------------------------------------------------------------------------
@@ -757,19 +480,21 @@ export function measureSummaryCache(
 // ---------------------------------------------------------------------------
 // StreamFn wrapper
 // ---------------------------------------------------------------------------
-
 /**
- * The exact request live turns send, rebuilt for the summarization call.
- * `index.ts` assembles this from public pi APIs + two plain reflected fields
- * and passes it to `createCachePreservingStreamFn`.
+ * The captured live request, replayed for the summarization call.
+ * `index.ts` assembles this from the `context_with_system` capture (already
+ * converted to wire messages) plus the trailing instruction, and passes it
+ * to `createCachePreservingStreamFn`.
  */
 export interface CacheRequest {
-  /** Live system prompt + live tool array + structured history + trailer. */
-  context: {
-    systemPrompt: string;
-    messages: WireMessage[];
-    tools: AgentTool[];
-  };
+  /**
+   * The captured live request's wire messages (`[head, ...messages]`) plus
+   * the trailing summary instruction. The leading system message carries the
+   * live prompt and tool declarations, so the provider replays both verbatim
+   * — no separate `systemPrompt`/`tools` fields (passing those would make
+   * pi-ai's `normalizeContext` prepend a declaration live never sends).
+   */
+  messages: WireMessage[];
   /**
    * Resolved (never hardcoded) cache retention. Explicit `"short"` matters:
    * reads key on sessionId + prefix bytes, so `"none"` (upstream's forced
@@ -791,49 +516,33 @@ export interface CacheRequest {
    * when the host exposes it.
    */
   thinkingBudgets?: unknown;
-  /**
-   * Mirror pi 1.0.0's forced-prompt head projection on the summary request.
-   *
-   * pi 1.0.0's `_installAgentForcedPromptProjection` rewrites every live
-   * request's system messages into one `before_agent_start`-forced head; the
-   * summary path bypasses that projection, so it must send the same head or
-   * the whole prefix misses. `index.ts` sets this only when the captured
-   * `agent.state.systemPrompt` is non-empty and differs from
-   * `ctx.getSystemPrompt()` (on 0.84.2 they are identical by construction, so
-   * this stays `undefined`/`false` and the legacy structured request is sent
-   * byte-identically). `context.systemPrompt`/`context.tools` remain the
-   * projection inputs and the 0.84.2 wire input either way.
-   */
-  projectHead?: boolean;
 }
 
 /**
  * Wrap the `streamFn` handed to `generateBranchSummary` so the request is
- * rewritten to the live shape at the last possible moment (after upstream's
- * `completeSummarization` forced `cacheRetention: "none"` + a fresh
- * `sessionId`).
+ * rewritten to the captured live shape at the last possible moment (after
+ * upstream's `completeSummarization` forced `cacheRetention: "none"` + a
+ * fresh `sessionId`).
  *
  * `request === null` → delegate the caller's context and options untouched:
- * today's cold standalone request. This is the fallback for every "live input
- * unavailable" case.
+ * today's cold standalone request. This is the fallback for every
+ * "capture unavailable/unsafe" case.
  *
- * `request.projectHead === true` → replace `context.messages` with pi 1.0.0's
- * forced-prompt head projection (`projectForcedPromptHead`), keeping
- * `context.systemPrompt`/`context.tools` as the projection inputs. Any other
- * value keeps today's request byte-identically (`request.context` is delegated
- * by reference), which is the 0.84.2 path.
+ * With a request, the wrapper swaps the context for
+ * `{ messages: request.messages }` only. Omitting `systemPrompt`/`tools`
+ * means pi-ai's `normalizeContext` prepends nothing, and the provider
+ * replays the captured leading system message — which carries the live
+ * prompt and tool declarations in the live order — verbatim.
  *
  * The `maxTokens` strip: upstream's summary caller caps output
- * (`maxTokens: 2048` in 0.84.2), but live turns let pi-ai fill
+ * (`maxTokens: min(4096, model.maxTokens)`), but live turns let pi-ai fill
  * `clampMaxTokensToContext(model, liveContext, options?.maxTokens ??
  * model.maxTokens)`. A caller cap therefore diverges from the live
  * `max_output_tokens` and can break a gateway that keys on it. Stripping the
  * cap lets the provider compute the same value live gets. Residual: when the
  * context window is near-full the clamp differs by the trailer size (~1k);
  * r5d bounds output length in prose instead, and a miss is flagged by the
- * notice. (The recorded value differs across 0.80.2 = 2048 / 0.84.2 = 2048 /
- * fork = 4096, which is exactly why we strip whatever is there rather than
- * assume a constant.)
+ * notice.
  *
  * Returned `used.value` flips true iff the live request was actually
  * delegated, so `index.ts` can report whether the wrapper engaged (it stays
@@ -866,18 +575,11 @@ export function createCachePreservingStreamFn(args: {
         ? { thinkingBudgets: request.thinkingBudgets }
         : {}),
     } as NonNullable<Parameters<StreamFn>[2]>;
-    const context =
-      request.projectHead === true
-        ? ({
-            ...request.context,
-            messages: projectForcedPromptHead(
-              request.context.messages,
-              request.context.systemPrompt,
-              request.context.tools,
-            ),
-          } as Parameters<StreamFn>[1])
-        : (request.context as Parameters<StreamFn>[1]);
-    return realStreamFn(model, context, next);
+    return realStreamFn(
+      model,
+      { messages: request.messages } as Parameters<StreamFn>[1],
+      next,
+    );
   };
   return { streamFn, used };
 }

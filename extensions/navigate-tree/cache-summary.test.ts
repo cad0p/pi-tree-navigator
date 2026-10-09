@@ -12,17 +12,14 @@
 import * as assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import {
-  convertToLlm,
-  estimateTokens,
   generateBranchSummary,
   type SessionEntry,
   type SessionMessageEntry,
-  sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import {
   BRANCH_SUMMARY_CACHE_PROMPT,
-  buildLiveSummaryMessages,
   buildSummaryInstruction,
+  buildSummaryInstructionMessage,
   CACHE_MISS_DISPLAY_COST,
   CACHE_MISS_DISPLAY_TOKENS,
   CACHE_TTL_MS,
@@ -31,10 +28,7 @@ import {
   detectBranchSummaryCacheMiss,
   formatBranchSummaryCacheMissNotice,
   measureSummaryCache,
-  type ProjectedSystemMessage,
-  projectForcedPromptHead,
   resolveSummaryCacheRetention,
-  stripBoundaryOrphanToolResults,
   type WireMessage,
 } from "./cache-summary.ts";
 
@@ -97,46 +91,6 @@ function assistantTextEntry(text: string, parentId: string | null = null) {
   );
 }
 
-function assistantToolCallEntry(
-  id: string,
-  parentId: string | null = null,
-  name = "navigate_tree",
-) {
-  return messageEntry(
-    {
-      role: "assistant",
-      content: [
-        { type: "toolCall", id, name, arguments: { action: "rewind" } },
-      ],
-      api: "openai-responses",
-      provider: "opencode-go",
-      model: "muse-spark",
-      stopReason: "toolUse",
-      timestamp: 1_700_000_000_000,
-      usage: ZERO_USAGE,
-    },
-    parentId,
-  );
-}
-
-function toolResultEntry(
-  toolCallId: string,
-  text = "ok",
-  parentId: string | null = null,
-) {
-  return messageEntry(
-    {
-      role: "toolResult",
-      toolCallId,
-      toolName: "navigate_tree",
-      content: [{ type: "text", text }],
-      isError: false,
-      timestamp: 1_700_000_000_000,
-    },
-    parentId,
-  );
-}
-
 function compactionEntry(summary: string, tokensBefore = 0) {
   return {
     type: "compaction",
@@ -147,42 +101,6 @@ function compactionEntry(summary: string, tokensBefore = 0) {
     firstKeptEntryId: "kept",
     tokensBefore,
   } satisfies SessionEntry;
-}
-
-function labelEntry(label: string, targetId = "target") {
-  return {
-    type: "label",
-    id: nextId(),
-    parentId: null,
-    timestamp: new Date(1_700_000_000_000).toISOString(),
-    targetId,
-    label,
-  } satisfies SessionEntry;
-}
-
-/** Wire payload the live loop would have produced for a set of entries. */
-function wireOf(entries: SessionEntry[]): WireMessage[] {
-  return convertToLlm(
-    entries.flatMap((entry) => sessionEntryToContextMessages(entry)),
-  );
-}
-
-function tokensOf(entry: SessionEntry): number {
-  return sessionEntryToContextMessages(entry).reduce(
-    (sum, message) => sum + estimateTokens(message),
-    0,
-  );
-}
-
-/** Extract the `{first}` the instruction trailer resolved to. */
-function trailerFirst(payload: WireMessage[]): number {
-  const trailer = payload[payload.length - 1];
-  assert.equal(trailer.role, "user");
-  const text = (trailer.content as Array<{ type: string; text: string }>)[0]
-    .text;
-  const match = /messages (\d+) onwards/.exec(text);
-  assert.ok(match, "instruction must carry a {first} scope number");
-  return Number(match?.[1]);
 }
 
 // =============================================================================
@@ -253,389 +171,6 @@ describe("buildSummaryInstruction", () => {
 });
 
 // =============================================================================
-// stripBoundaryOrphanToolResults
-// =============================================================================
-
-describe("stripBoundaryOrphanToolResults", () => {
-  it("drops unpaired toolResults and preserves order + element identity", () => {
-    const call = assistantToolCallEntry("call-1");
-    const ok = toolResultEntry("call-1", "paired");
-    const orphan = toolResultEntry("call-missing", "orphan");
-    const wire = wireOf([call, ok, orphan]);
-    const stripped = stripBoundaryOrphanToolResults(wire);
-    assert.deepEqual(
-      stripped.map((m) => m.role),
-      ["assistant", "toolResult"],
-    );
-    assert.equal(
-      stripped[0],
-      wire[0],
-      "must not clone messages (identity is used by the caller)",
-    );
-    assert.equal(stripped[1], wire[1]);
-    assert.ok(!stripped.includes(wire[2]));
-  });
-});
-
-// =============================================================================
-// buildLiveSummaryMessages
-// =============================================================================
-
-describe("buildLiveSummaryMessages", () => {
-  it("payload prefix is byte-identical to the live turn's converted messages", () => {
-    // The whole feature hinges on this: the structured history sent to the
-    // summarizer must be the same bytes the live loop sent, minus the
-    // in-flight assistant (which was never part of any cached prefix).
-    const bgUser = userEntry("background");
-    const bgAssistant = assistantTextEntry("ack");
-    const branchUser = userEntry("do the work");
-    const inFlight = assistantToolCallEntry("tc-rewind");
-    const contextEntries: SessionEntry[] = [
-      bgUser,
-      bgAssistant,
-      branchUser,
-      inFlight,
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set(contextEntries.map((e) => e.id)),
-      inFlightToolCallId: "tc-rewind",
-      tokenBudget: 0,
-      focus: "preserve the instruction",
-    });
-    // Live request for the same branch-before-this-turn:
-    const live = wireOf([bgUser, bgAssistant, branchUser]);
-    assert.deepEqual(built.messages.slice(0, -1), live);
-    // Trailer is the instruction, with {first} substituted and focus appended.
-    const trailer = built.messages[built.messages.length - 1];
-    assert.equal(trailer.role, "user");
-    assert.match(
-      (trailer.content as Array<{ text: string }>)[0].text,
-      /Additional focus: preserve the instruction$/,
-    );
-    assert.doesNotMatch(
-      (trailer.content as Array<{ text: string }>)[0].text,
-      /\{first\}/,
-    );
-  });
-
-  it("includes pre-branch background for prefix matching and numbers {first} at the branch start", () => {
-    const bgUser = userEntry("background");
-    const bgAssistant = assistantTextEntry("ack");
-    const branchUser = userEntry("branch work");
-    const branchAssistant = assistantTextEntry("done");
-    const contextEntries: SessionEntry[] = [
-      bgUser,
-      bgAssistant,
-      branchUser,
-      branchAssistant,
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([branchUser.id, branchAssistant.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    assert.equal(built.branchStartRetained, true);
-    assert.equal(built.first, 3);
-    assert.equal(trailerFirst(built.messages), 3);
-    // Background is present (prefix matching), not only the branch.
-    assert.equal(built.messages.length, 5);
-  });
-
-  it("excludes the in-flight assistant, leaving no unpaired tool_use", () => {
-    const branchUser = userEntry("start");
-    const priorAssistant = assistantTextEntry("prior");
-    const inFlight = assistantToolCallEntry("tc-rewind");
-    const contextEntries: SessionEntry[] = [
-      branchUser,
-      priorAssistant,
-      inFlight,
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set(contextEntries.map((e) => e.id)),
-      inFlightToolCallId: "tc-rewind",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    const body = built.messages.slice(0, -1);
-    assert.deepEqual(
-      body.map((m) => m.role),
-      ["user", "assistant"],
-      "history must end at the message before the in-flight assistant",
-    );
-    const toolCalls = body.flatMap((m) =>
-      m.role === "assistant"
-        ? m.content.filter((block) => block.type === "toolCall")
-        : [],
-    );
-    assert.equal(toolCalls.length, 0, "no unpaired tool_use may survive");
-  });
-
-  it("searches the whole array: a sibling toolResult after the assistant does not hide the in-flight call", () => {
-    // Sequential execution: pi-agent-core appends each sibling `toolResult`
-    // before the next call runs, so a sibling result from the same assistant
-    // batch can be the LAST entry. The assistant carries both the sibling and
-    // the in-flight rewind tool call.
-    const branchUser = userEntry("start");
-    const priorAssistant = assistantTextEntry("prior");
-    const siblingAndRewind = messageEntry({
-      role: "assistant",
-      content: [
-        { type: "toolCall", id: "tc-sibling", name: "read", arguments: {} },
-        {
-          type: "toolCall",
-          id: "tc-rewind",
-          name: "navigate_tree",
-          arguments: { action: "rewind" },
-        },
-      ],
-      api: "openai-responses",
-      provider: "opencode-go",
-      model: "muse-spark",
-      stopReason: "toolUse",
-      timestamp: 1_700_000_000_000,
-      usage: ZERO_USAGE,
-    });
-    const siblingResult = toolResultEntry("tc-sibling", "sibling done");
-    const contextEntries: SessionEntry[] = [
-      branchUser,
-      priorAssistant,
-      siblingAndRewind,
-      siblingResult,
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set(contextEntries.map((e) => e.id)),
-      inFlightToolCallId: "tc-rewind",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    const body = built.messages.slice(0, -1);
-    // Both the assistant entry and its sibling result are gone, so the
-    // payload is exactly the history before that assistant.
-    assert.deepEqual(body, wireOf([branchUser, priorAssistant]));
-    const toolCalls = body.flatMap((m) =>
-      m.role === "assistant"
-        ? m.content.filter((block) => block.type === "toolCall")
-        : [],
-    );
-    assert.equal(
-      toolCalls.length,
-      0,
-      "neither the sibling nor the rewind tool_use may survive",
-    );
-    assert.ok(
-      !body.some((m) => m.role === "toolResult"),
-      "the sibling toolResult is a boundary orphan and must be stripped",
-    );
-  });
-
-  it("numbers {first} after stripping boundary-orphan toolResults", () => {
-    // A pre-branch toolResult whose call is not in the payload (budget drop /
-    // compaction) is stripped; the scope number must count the payload that
-    // is actually sent, not the pre-strip array.
-    const bgUser = userEntry("background");
-    const orphan = toolResultEntry("call-missing", "orphan");
-    const branchUser = userEntry("branch work");
-    const branchAssistant = assistantTextEntry("done");
-    const contextEntries: SessionEntry[] = [
-      bgUser,
-      orphan,
-      branchUser,
-      branchAssistant,
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([branchUser.id, branchAssistant.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    const body = built.messages.slice(0, -1);
-    assert.equal(body.length, 3, "orphan stripped from the payload");
-    assert.equal(
-      built.first,
-      2,
-      "branch start shifts down by one stripped message",
-    );
-    assert.equal(trailerFirst(built.messages), 2);
-  });
-
-  it("drops oldest background first on budget truncation and shrinks {first}", () => {
-    const bgUser = userEntry(`BIGBACKGROUND${"x".repeat(4000)}`);
-    const bgAssistant = assistantTextEntry("bg ack");
-    const branchUser = userEntry("branch work");
-    const branchAssistant = assistantTextEntry("branch done");
-    const contextEntries: SessionEntry[] = [
-      bgUser,
-      bgAssistant,
-      branchUser,
-      branchAssistant,
-    ];
-    const branchTokens = tokensOf(branchUser) + tokensOf(branchAssistant);
-    const bgAssistantTokens = tokensOf(bgAssistant);
-    // Exactly enough for the branch + the newest background message; the
-    // oldest background entry must be the casualty.
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([branchUser.id, branchAssistant.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: branchTokens + bgAssistantTokens,
-      focus: "x",
-    });
-    const body = built.messages.slice(0, -1);
-    assert.equal(body.length, 3);
-    assert.ok(
-      !JSON.stringify(body).includes("BIGBACKGROUND"),
-      "oldest background entry must be dropped first",
-    );
-    assert.ok(JSON.stringify(body).includes("bg ack"));
-    assert.equal(built.first, 2);
-    assert.equal(trailerFirst(built.messages), 2);
-  });
-
-  it("drops all background when nothing fits and numbers {first} at 1", () => {
-    const bgUser = userEntry(`BIGBACKGROUND${"x".repeat(4000)}`);
-    const branchUser = userEntry("branch work");
-    const branchAssistant = assistantTextEntry("branch done");
-    const contextEntries: SessionEntry[] = [
-      bgUser,
-      branchUser,
-      branchAssistant,
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([branchUser.id, branchAssistant.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: tokensOf(branchUser) + tokensOf(branchAssistant),
-      focus: "x",
-    });
-    assert.equal(built.messages.length, 3);
-    assert.equal(built.first, 1);
-    assert.equal(trailerFirst(built.messages), 1);
-  });
-
-  it("retains a summary entry over budget when under the 0.9 slack", () => {
-    const summary = compactionEntry(`SUMMARY${"s".repeat(20_000)}`, 5000);
-    const branchUser = userEntry("branch work");
-    const branchAssistant = assistantTextEntry("branch done");
-    const contextEntries: SessionEntry[] = [
-      summary,
-      branchUser,
-      branchAssistant,
-    ];
-    const branchTokens = tokensOf(branchUser) + tokensOf(branchAssistant);
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([branchUser.id, branchAssistant.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: branchTokens * 2,
-      focus: "x",
-    });
-    assert.ok(
-      JSON.stringify(built.messages).includes("SUMMARY"),
-      "compaction summary must survive truncation under the slack",
-    );
-    assert.equal(built.first, 2, "the compaction summary is background");
-  });
-
-  it("drops a summary entry over budget once the 0.9 slack is exhausted", () => {
-    const summary = compactionEntry(`SUMMARY${"s".repeat(20_000)}`, 5000);
-    // Long enough that the branch alone exceeds 0.9 × budget once the budget
-    // is branchTokens + 1 (slack only rescues when total < 0.9 × budget).
-    const branchUser = userEntry(`branch work ${"u".repeat(200)}`);
-    const branchAssistant = assistantTextEntry(
-      `branch done ${"a".repeat(200)}`,
-    );
-    const contextEntries: SessionEntry[] = [
-      summary,
-      branchUser,
-      branchAssistant,
-    ];
-    const branchTokens = tokensOf(branchUser) + tokensOf(branchAssistant);
-    // budget = branchTokens + 1 ⇒ 0.9*budget is below branchTokens once the
-    // branch exceeds ~9 tokens, so the slack retry must be refused.
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([branchUser.id, branchAssistant.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: branchTokens + 1,
-      focus: "x",
-    });
-    assert.ok(!JSON.stringify(built.messages).includes("SUMMARY"));
-    assert.equal(built.first, 1);
-  });
-
-  it("falls back to {first}=1 and flags the miss when no branch entry survived", () => {
-    const bgUser = userEntry("background");
-    const contextEntries: SessionEntry[] = [bgUser];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set(["not-in-payload"]),
-      inFlightToolCallId: "none",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    assert.equal(built.branchStartRetained, false);
-    assert.equal(built.first, 1);
-  });
-
-  it("flags a labels-only segment (no message-producing entries) as not retained", () => {
-    // A segment made only of label entries (and/or model/thinking changes)
-    // maps to zero wire messages, so no branch message survives into the
-    // payload. The call site turns this into a real fallback
-    // ("branch-start-not-retained") instead of shipping a background-only
-    // request with {first}=1.
-    const bgUser = userEntry("background");
-    const labelA = labelEntry("anchor:start", bgUser.id);
-    const labelB = labelEntry("anchor:other", bgUser.id);
-    const contextEntries: SessionEntry[] = [bgUser, labelA, labelB];
-    const built = buildLiveSummaryMessages({
-      contextEntries,
-      branchEntryIds: new Set([labelA.id, labelB.id]),
-      inFlightToolCallId: "none",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    assert.equal(built.branchStartRetained, false);
-    assert.equal(built.first, 1);
-    assert.equal(trailerFirst(built.messages), 1);
-  });
-
-  it("pins the raw converted role sequence (trailer may follow a toolResult)", () => {
-    // Live pi can emit a user-role trailer immediately after a toolResult
-    // message. Anthropic merges consecutive user turns; Kiro/Bedrock adapters
-    // are untested on this exact shape and are residual-risk surfaces that
-    // the opencode-go live gate does not cover.
-    const entries: SessionEntry[] = [
-      userEntry("bg"),
-      assistantTextEntry("bg ack"),
-      userEntry("branch"),
-      assistantToolCallEntry("tc-1"),
-      toolResultEntry("tc-1", "result"),
-      assistantToolCallEntry("tc-rewind"),
-    ];
-    const built = buildLiveSummaryMessages({
-      contextEntries: entries,
-      branchEntryIds: new Set(entries.slice(2).map((e) => e.id)),
-      inFlightToolCallId: "tc-rewind",
-      tokenBudget: 0,
-      focus: "x",
-    });
-    assert.deepEqual(
-      built.messages.map((m) => m.role),
-      ["user", "assistant", "user", "assistant", "toolResult", "user"],
-    );
-  });
-});
-
-// =============================================================================
-// resolveSummaryCacheRetention
-// =============================================================================
-
 describe("resolveSummaryCacheRetention", () => {
   const original = process.env.PI_CACHE_RETENTION;
   afterEach(() => {
@@ -956,213 +491,6 @@ describe("detectBranchSummaryCacheMiss + formatBranchSummaryCacheMissNotice", ()
 });
 
 // =============================================================================
-// projectForcedPromptHead (pi 1.0.0 forced-prompt projection)
-// =============================================================================
-
-/**
- * v1-shaped system message. `@earendil-works/pi-ai@0.84.2`'s `Message` union
- * has no `system` member, so these are cast through `unknown` exactly the way
- * the helper reads them structurally.
- */
-function v1System(args: {
-  content?: string;
-  toolsAdded?: Array<{
-    name: string;
-    description?: string;
-    parameters?: unknown;
-  }>;
-  toolsRemoved?: Array<{ name: string }>;
-  sections?: Record<string, string>;
-  timestamp?: number;
-}): WireMessage {
-  return {
-    role: "system",
-    content: args.content ?? "",
-    ...(args.toolsAdded ? { toolsAdded: args.toolsAdded } : {}),
-    ...(args.toolsRemoved ? { toolsRemoved: args.toolsRemoved } : {}),
-    ...(args.sections ? { sections: args.sections } : {}),
-    ...(args.timestamp !== undefined ? { timestamp: args.timestamp } : {}),
-  } as unknown as WireMessage;
-}
-
-function v1User(text: string, timestamp: number): WireMessage {
-  return {
-    role: "user",
-    content: [{ type: "text", text }],
-    timestamp,
-  } as WireMessage;
-}
-
-function v1Assistant(text: string, timestamp: number): WireMessage {
-  return {
-    role: "assistant",
-    content: [{ type: "text", text }],
-    timestamp,
-  } as unknown as WireMessage;
-}
-
-function projectedHead(
-  messages: WireMessage[],
-  systemPrompt = "FORCED",
-  toolsFallback: CacheRequest["context"]["tools"] = [],
-): ProjectedSystemMessage {
-  return projectForcedPromptHead(
-    messages,
-    systemPrompt,
-    toolsFallback,
-  )[0] as ProjectedSystemMessage;
-}
-
-const REPLAY_A = { name: "a", description: "A", parameters: {} };
-const REPLAY_B = { name: "b", description: "B", parameters: {} };
-const REPLAY_C = { name: "c", description: "C", parameters: {} };
-
-describe("projectForcedPromptHead", () => {
-  it("builds one forced head and preserves non-system messages in order", () => {
-    const user = v1User("hi", 222);
-    const assistant = v1Assistant("yo", 333);
-    const messages = [
-      v1System({ toolsAdded: [REPLAY_A], timestamp: 111 }),
-      user,
-      assistant,
-    ];
-    const projected = projectForcedPromptHead(messages, "FORCED PROMPT", []);
-    assert.equal(projected.length, 3);
-    assert.deepEqual(projected[0], {
-      role: "system",
-      content: "FORCED PROMPT",
-      toolsAdded: [REPLAY_A],
-      timestamp: 111,
-    });
-    // Non-system messages keep identity and order.
-    assert.equal(projected[1], user);
-    assert.equal(projected[2], assistant);
-  });
-
-  it("replays toolsRemoved/toolsAdded with Map semantics (removal deletes, set keeps position)", () => {
-    const messages = [
-      v1System({ toolsAdded: [REPLAY_A, REPLAY_B, REPLAY_C], timestamp: 1 }),
-      v1System({ toolsRemoved: [{ name: "b" }], timestamp: 2 }),
-      v1User("between", 3),
-      v1System({
-        toolsAdded: [{ name: "d", description: "D", parameters: {} }],
-        timestamp: 4,
-      }),
-      // Redefinition of an existing name updates in place (does not reorder),
-      // mirroring pi-ai's `getCurrentTools` Map replay.
-      v1System({
-        toolsAdded: [{ name: "c", description: "C2", parameters: {} }],
-        timestamp: 5,
-      }),
-    ];
-    const head = projectedHead(messages);
-    assert.deepEqual(head.toolsAdded, [
-      REPLAY_A,
-      { name: "c", description: "C2", parameters: {} },
-      { name: "d", description: "D", parameters: {} },
-    ]);
-  });
-
-  it("deletes a name removed before it is re-added in the same replay", () => {
-    const messages = [
-      v1System({ toolsAdded: [REPLAY_A], timestamp: 1 }),
-      v1System({ toolsRemoved: [{ name: "a" }], timestamp: 2 }),
-      v1System({ toolsAdded: [REPLAY_B], timestamp: 3 }),
-    ];
-    const head = projectedHead(messages);
-    assert.deepEqual(head.toolsAdded, [REPLAY_B]);
-  });
-
-  it("applies toolsRemoved before toolsAdded within one system message (host order)", () => {
-    const messages = [
-      v1System({ toolsAdded: [REPLAY_A], timestamp: 1 }),
-      // One delta removes and re-adds the same name. The host's per-message
-      // replay order is remove-then-add (pi-ai `getCurrentTools`), so the new
-      // definition must survive; a swapped order would delete it.
-      v1System({
-        toolsRemoved: [{ name: "a" }],
-        toolsAdded: [{ name: "a", description: "A2", parameters: {} }],
-        timestamp: 2,
-      }),
-    ];
-    const head = projectedHead(messages);
-    assert.deepEqual(head.toolsAdded, [
-      { name: "a", description: "A2", parameters: {} },
-    ]);
-  });
-
-  it("uses the first system timestamp, ignoring non-system timestamps", () => {
-    const head = projectedHead([
-      v1System({ timestamp: undefined }),
-      v1User("hi", 5),
-      v1System({ toolsAdded: [REPLAY_A], timestamp: 99 }),
-      v1System({ timestamp: 200 }),
-    ]);
-    assert.equal(head.timestamp, 99);
-  });
-
-  it("falls back to Date.now() when no system message carries a timestamp", () => {
-    const before = Date.now();
-    const head = projectedHead([v1User("hi", 5)]);
-    assert.ok(
-      typeof head.timestamp === "number" && head.timestamp >= before,
-      "falls back to Date.now() for the head timestamp",
-    );
-  });
-
-  it("falls back to the live tool array when the replay yields no tools", () => {
-    const fallback = [
-      { name: "read", description: "r", parameters: {} },
-    ] as CacheRequest["context"]["tools"];
-    // A surviving delta-less system entry (content only) replays zero tools.
-    const head = projectedHead(
-      [v1System({ content: "base", timestamp: 1 }), v1User("hi", 2)],
-      "FORCED",
-      fallback,
-    );
-    assert.deepEqual(head.toolsAdded, fallback);
-  });
-
-  it("omits toolsAdded entirely when the replay and fallback are both empty", () => {
-    const head = projectedHead([v1System({ timestamp: 1 })]);
-    assert.ok(!("toolsAdded" in head));
-  });
-
-  it("mirrors the host head shape for a realistic v1 transcript (sections dropped, tools replayed)", () => {
-    // Host-shaped pin: the initial system message carries the prompt + tools,
-    // a later delta patches sections and removes a tool. pi 1.0.0's
-    // `_installAgentForcedPromptProjection` would emit one head with the
-    // forced text, the replayed current tools, and the first timestamp.
-    const messages = [
-      v1System({
-        content: "BASE PROMPT",
-        toolsAdded: [REPLAY_A, REPLAY_B],
-        timestamp: 0,
-      }),
-      v1User("real work", 10),
-      v1Assistant("done", 11),
-      v1System({
-        content: "",
-        sections: { tools: "changed" },
-        toolsRemoved: [{ name: "b" }],
-        timestamp: 4_242,
-      }),
-    ];
-    const projected = projectForcedPromptHead(messages, "FORCED MANDATE", []);
-    assert.deepEqual(projected[0], {
-      role: "system",
-      content: "FORCED MANDATE",
-      toolsAdded: [REPLAY_A],
-      timestamp: 0,
-    });
-    // The head never carries `sections` (the host forced head drops them),
-    // and every structured system delta collapses into it.
-    assert.ok(!("sections" in (projected[0] as object)));
-    assert.deepEqual(projected.slice(1), [messages[1], messages[2]]);
-  });
-});
-
-// =============================================================================
 // createCachePreservingStreamFn
 // =============================================================================
 
@@ -1189,27 +517,31 @@ function capturingRealStreamFn() {
   return { calls, realStreamFn };
 }
 
+/**
+ * A captured live request as `index.ts` builds it: the live head (prompt +
+ * tool declarations in live order), the conversation, and the trailing
+ * instruction. `toolsAdded` deliberately uses an order a session's
+ * `state.tools` array would not have (grep before read) — the wrapper must
+ * replay this array verbatim, never re-derive declarations.
+ */
 function makeCacheRequest(): CacheRequest {
-  const entries: SessionEntry[] = [
-    userEntry("branch work"),
-    assistantTextEntry("done"),
-  ];
-  const built = buildLiveSummaryMessages({
-    contextEntries: entries,
-    branchEntryIds: new Set(entries.map((e) => e.id)),
-    inFlightToolCallId: "tc-rewind",
-    tokenBudget: 0,
-    focus: "preserve the parser API",
-  });
-  const tools = [
-    { name: "read", description: "r", parameters: {} },
-  ] as unknown as CacheRequest["context"]["tools"];
   return {
-    context: {
-      systemPrompt: "LIVE SYSTEM PROMPT",
-      messages: built.messages,
-      tools,
-    },
+    messages: [
+      {
+        role: "system",
+        content: "LIVE SYSTEM PROMPT",
+        toolsAdded: [
+          { name: "grep", description: "g", parameters: {} },
+          { name: "read", description: "r", parameters: {} },
+        ],
+      } as unknown as WireMessage,
+      {
+        role: "user",
+        content: [{ type: "text", text: "branch work" }],
+        timestamp: 1,
+      } as WireMessage,
+      buildSummaryInstructionMessage(2, "preserve the parser API"),
+    ],
     cacheRetention: "short" as const,
     sessionId: "live-session-id",
     reasoning: "high" as const,
@@ -1217,8 +549,24 @@ function makeCacheRequest(): CacheRequest {
   };
 }
 
+describe("buildSummaryInstructionMessage", () => {
+  it("wraps the r5d instruction as a user message with {first} substituted", () => {
+    const message = buildSummaryInstructionMessage(42, "finish the parser");
+    assert.equal(message.role, "user");
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    const text = blocks
+      .filter((block) => block.type === "text")
+      .map((block) => (block.type === "text" ? block.text : ""))
+      .join("");
+    assert.match(text, /Summarize only messages 42 onwards/);
+    assert.match(text, /Additional focus: finish the parser/);
+    assert.doesNotMatch(text, /\{first\}/);
+    assert.equal(typeof message.timestamp, "number");
+  });
+});
+
 describe("createCachePreservingStreamFn", () => {
-  it("rewrites context + options to the live request shape", () => {
+  it("replays the captured messages verbatim and mirrors the live options", () => {
     const { calls, realStreamFn } = capturingRealStreamFn();
     const request = makeCacheRequest();
     const wrapped = createCachePreservingStreamFn({ realStreamFn, request });
@@ -1232,9 +580,13 @@ describe("createCachePreservingStreamFn", () => {
     assert.equal(wrapped.used.value, true);
     assert.equal(calls.length, 1);
     const captured = calls[0];
-    assert.equal(captured.context.systemPrompt, "LIVE SYSTEM PROMPT");
-    assert.equal(captured.context.messages, request.context.messages);
-    assert.equal(captured.context.tools, request.context.tools);
+    // Identity: the captured array is delegated untouched. No
+    // `systemPrompt`/`tools` fields — the captured leading system message is
+    // the only prompt/tool source, so pi-ai's `normalizeContext` prepends
+    // nothing.
+    assert.equal(captured.context.messages, request.messages);
+    assert.equal(captured.context.systemPrompt, undefined);
+    assert.equal(captured.context.tools, undefined);
     assert.equal(captured.options?.maxTokens, undefined);
     assert.equal(captured.options?.cacheRetention, "short");
     assert.equal(captured.options?.sessionId, "live-session-id");
@@ -1243,6 +595,35 @@ describe("createCachePreservingStreamFn", () => {
     // Non-cache options survive.
     assert.equal(captured.options?.apiKey, "k");
     assert.deepEqual(captured.options?.headers, { h: "1" });
+  });
+
+  it("keeps the captured head's tool order and message prefix (cache-parity regression)", () => {
+    const request = makeCacheRequest();
+    const headTools = (
+      request.messages[0] as { toolsAdded?: Array<{ name: string }> }
+    ).toolsAdded;
+    assert.deepEqual(
+      headTools?.map((tool) => tool.name),
+      ["grep", "read"],
+      "fixture head must declare a tool order a re-derivation would not produce",
+    );
+    const { calls, realStreamFn } = capturingRealStreamFn();
+    const wrapped = createCachePreservingStreamFn({ realStreamFn, request });
+    wrapped.streamFn({} as never, {} as never, {});
+    const wire = calls[0].context.messages;
+    assert.deepEqual(
+      (wire[0] as { toolsAdded?: Array<{ name: string }> }).toolsAdded?.map(
+        (tool) => tool.name,
+      ),
+      ["grep", "read"],
+    );
+    // Byte-identical prefix: everything apart from the trailing instruction
+    // equals the capture (JSON is the serialization a serialized-prefix
+    // provider cache keys on for same-value message arrays).
+    assert.equal(
+      JSON.stringify(wire.slice(0, -1)),
+      JSON.stringify(request.messages.slice(0, -1)),
+    );
   });
 
   it("omits reasoning when off/undefined, sessionId when absent, budgets when unset", () => {
@@ -1266,60 +647,12 @@ describe("createCachePreservingStreamFn", () => {
       realStreamFn,
       request: null,
     });
-    const coldContext = { systemPrompt: "COLD", messages: [] };
+    const coldContext = { messages: [] };
     const coldOptions = { maxTokens: 2048, cacheRetention: "none" };
     wrapped.streamFn({} as never, coldContext as never, coldOptions as never);
     assert.equal(wrapped.used.value, false);
     assert.equal(calls[0].context, coldContext);
     assert.equal(calls[0].options, coldOptions);
-  });
-
-  it("keeps the legacy structured request when projectHead is undefined or false (0.84.2 parity)", () => {
-    for (const flag of [undefined, false] as const) {
-      const { calls, realStreamFn } = capturingRealStreamFn();
-      const request = makeCacheRequest();
-      request.projectHead = flag;
-      const wrapped = createCachePreservingStreamFn({ realStreamFn, request });
-      wrapped.streamFn({} as never, {} as never, { maxTokens: 2048 });
-      // Identity: the legacy request object is delegated untouched.
-      assert.equal(calls[0].context.messages, request.context.messages);
-      assert.equal(calls[0].context.systemPrompt, "LIVE SYSTEM PROMPT");
-      assert.equal(calls[0].context.tools, request.context.tools);
-    }
-  });
-
-  it("projects the forced-prompt head when projectHead is true", () => {
-    const { calls, realStreamFn } = capturingRealStreamFn();
-    const request = makeCacheRequest();
-    const replayTool = {
-      name: "replayed",
-      description: "from the transcript",
-      parameters: {},
-    };
-    request.context.messages = [
-      v1System({ toolsAdded: [replayTool], timestamp: 7 }),
-      ...request.context.messages,
-    ];
-    request.projectHead = true;
-    const wrapped = createCachePreservingStreamFn({ realStreamFn, request });
-    wrapped.streamFn({} as never, {} as never, { maxTokens: 2048 });
-    const context = calls[0].context;
-    assert.deepEqual(context.messages[0], {
-      role: "system",
-      content: "LIVE SYSTEM PROMPT",
-      toolsAdded: [replayTool],
-      timestamp: 7,
-    });
-    assert.equal(context.messages.length, request.context.messages.length);
-    assert.ok(
-      context.messages
-        .slice(1)
-        .every((m) => (m as { role?: string }).role !== "system"),
-      "system messages collapse into the head",
-    );
-    // Legacy fields remain: projection inputs + the 0.84.2 wire input.
-    assert.equal(context.systemPrompt, "LIVE SYSTEM PROMPT");
-    assert.equal(context.tools, request.context.tools);
   });
 });
 
@@ -1327,9 +660,7 @@ describe("createCachePreservingStreamFn", () => {
 // Wrapper contract through the REAL upstream generateBranchSummary
 // =============================================================================
 
-const FAKE_SUMMARY_TEXT = "## Goal\nShip #33.\n## Progress\n### Done\nTests.";
-const SUMMARIZATION_SYSTEM_PROMPT =
-  "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const FAKE_SUMMARY_TEXT = "## Goal\nShip #75.\n## Progress\n### Done\nTests.";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -1369,7 +700,7 @@ function fakeModel() {
 }
 
 describe("createCachePreservingStreamFn through real generateBranchSummary", () => {
-  it("forwards the live context + mirrored options into the provider stream", async () => {
+  it("forwards the captured messages + mirrored options into the provider stream", async () => {
     const entries: SessionEntry[] = [
       userEntry("branch work"),
       assistantTextEntry("done"),
@@ -1389,13 +720,13 @@ describe("createCachePreservingStreamFn through real generateBranchSummary", () 
     } as never);
 
     // The real upstream path built a cold context and passed it through the
-    // wrapper, which swapped in the live request.
+    // wrapper, which swapped in the captured request.
     assert.equal(wrapped.used.value, true);
     assert.equal(calls.length, 1);
     const captured = calls[0];
-    assert.equal(captured.context.systemPrompt, request.context.systemPrompt);
-    assert.equal(captured.context.messages, request.context.messages);
-    assert.equal(captured.context.tools, request.context.tools);
+    assert.equal(captured.context.messages, request.messages);
+    assert.equal(captured.context.systemPrompt, undefined);
+    assert.equal(captured.context.tools, undefined);
     assert.equal(captured.options?.cacheRetention, "short");
     assert.equal(captured.options?.sessionId, "live-session-id");
     assert.equal(captured.options?.reasoning, "high");
@@ -1409,11 +740,11 @@ describe("createCachePreservingStreamFn through real generateBranchSummary", () 
 
     // `.result()` contract: upstream unwraps the fake stream and returns the
     // canned summary + usage to the caller.
-    assert.match(result.summary ?? "", /Ship #33/);
+    assert.match(result.summary ?? "", /Ship #75/);
     assert.equal(result.usage?.cacheRead, 20_000);
   });
 
-  it("delegates today's cold request when request is null (0.84.2 shape)", async () => {
+  it("delegates today's cold request when request is null (upstream shape)", async () => {
     const entries: SessionEntry[] = [
       userEntry("branch work"),
       assistantTextEntry("done"),
@@ -1434,13 +765,18 @@ describe("createCachePreservingStreamFn through real generateBranchSummary", () 
 
     assert.equal(wrapped.used.value, false);
     const captured = calls[0];
-    // Cold path: upstream's generic summarization prompt + serialized blob.
-    assert.equal(captured.context.systemPrompt, SUMMARIZATION_SYSTEM_PROMPT);
-    assert.equal(captured.context.messages.length, 1);
-    assert.equal(captured.context.tools, undefined);
-    // Upstream's output cap is version-dependent (0.84.2 = 2048, 0.85.1 =
-    // 4096); assert only presence/type — a version-specific literal would
-    // red on a pi bump (whereas the cache path asserts the cap is absent).
+    // Cold path: upstream's own normalized context (leading generic
+    // summarization system message + serialized conversation blob), no live
+    // fields.
+    assert.equal(captured.context.systemPrompt, undefined);
+    assert.equal(captured.context.messages.length, 2);
+    assert.equal(captured.context.messages[0].role, "system");
+    assert.match(
+      String(captured.context.messages[0].content),
+      /summarization assistant/,
+    );
+    // Upstream's output cap is version-dependent; assert only presence/type
+    // (the capture path asserts the cap is absent).
     assert.equal(typeof captured.options?.maxTokens, "number");
     assert.equal(captured.options?.cacheRetention, "none");
     assert.match(String(captured.options?.sessionId), UUID_RE);

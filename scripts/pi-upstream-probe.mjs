@@ -6,7 +6,7 @@
  * dependencies) still exist with the required shape in the installed
  * @earendil-works/pi-coding-agent / @earendil-works/pi-agent-core.
  *
- * Reflection points (after #14, extended by #33):
+ * Reflection points (after #14, #33, #75):
  *   1. `AgentSession.prototype.prompt` — must be a writable plain data
  *      property (not `#`-private, not a getter-only accessor). The
  *      extension stashes the original and replaces it with a wrapper.
@@ -14,17 +14,20 @@
  *      (exposed as a plain field on AgentSession), `agent.state` must be
  *      readable and `agent.state.messages` writable (plain fields, not
  *      `#`-private). The extension assigns `agent.state.messages = ...`.
- *   3. `session.agent.state.tools` (#33) — the cache-preserving summary
- *      request passes the live tool array to the summarizer, so the
- *      accessor pair must exist and be readable.
- *   4. `session.agent.state.systemPrompt` (#33) — fallback source for the
- *      live system prompt when the public `ctx.getSystemPrompt()` is
- *      unavailable; a readable string on the mutable state object (plain
- *      field on 0.84.2, getter over messages on 1.x).
- *   5. `session.agent.thinkingBudgets` (#33) — plain field on the Agent;
- *      forwarded on the cache path when present.
- *   6. `SessionManager.prototype.getSessionId` (#33) — the summary joins
- *      the live session's cache namespace and reuses its routing id.
+ *   3. `session.agent.thinkingBudgets` (#33) — plain field on the Agent;
+ *      forwarded on the capture path when present.
+ *   4. `SessionManager.prototype.getSessionId` (#33/#75) — the capture map
+ *      is keyed by it and the summary reuses it for routing + cache.
+ *   5. `ModelRegistry.prototype.streamSimple` (#75, floor 0.87.0) — the
+ *      summarization transport is `modelRegistry.streamSimple`; its absence
+ *      forces upstream's cold dispatch.
+ *   6. `context_with_system` event support (#75) — the live-request capture
+ *      seam; checked against the runner source (there is no runtime symbol
+ *      for an event name) plus the event-type declaration.
+ *
+ * #75 deleted the #33 `state.tools` / `state.systemPrompt` reflection reads
+ * (the capture replays the live message list instead of mirroring fields),
+ * so those checks are gone.
  *
  * Transitive dependencies:
  *   - `AgentSession` constructor assigns `this.sessionManager` (plain
@@ -191,56 +194,7 @@ try {
         : "set messages accessor MISSING",
   );
 
-  // --- 5. Agent.state.tools + systemPrompt (cache-preserving request, #33) ---
-  // The summary request mirrors the live tool array and system prompt; both
-  // are read off the mutable agent state object created by
-  // createMutableAgentState. Verify the accessor pair for tools and the
-  // systemPrompt runtime shape, and that the state is not #-private.
-  check(
-    "state.tools accessor pair (source: get/set tools)",
-    /get\s+tools\s*\(/.test(agentSrc) && /set\s+tools\s*\(/.test(agentSrc),
-    /get\s+tools\s*\(/.test(agentSrc) && /set\s+tools\s*\(/.test(agentSrc)
-      ? "tools accessor pair found"
-      : "tools accessor pair MISSING",
-  );
-  // state.systemPrompt is a plain data field on 0.84.2 and a getter
-  // (`getCurrentSystemPrompt(messages)`) on 1.x — assert the runtime shape (a
-  // seeded string round-trips) instead of the 0.84.2 source pattern.
-  let systemPromptShape = { ok: false, detail: "not run" };
-  try {
-    const probeAgent = new Agent({
-      streamFn: () => ({
-        async *[Symbol.asyncIterator]() {},
-        async result() {
-          throw new Error("probe");
-        },
-      }),
-      initialState: {
-        systemPrompt: "probe-seed",
-        model: { id: "probe", provider: "probe", api: "anthropic" },
-        thinkingLevel: "off",
-        messages: [],
-        tools: [],
-      },
-    });
-    const sp = probeAgent.state.systemPrompt;
-    systemPromptShape = {
-      ok: typeof sp === "string" && sp === "probe-seed",
-      detail: `typeof=${typeof sp} value=${JSON.stringify(sp)}`,
-    };
-  } catch (e) {
-    systemPromptShape = {
-      ok: false,
-      detail: `threw: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-  check(
-    "state.systemPrompt readable string (seed round-trip)",
-    systemPromptShape.ok,
-    systemPromptShape.detail,
-  );
-
-  // --- 6. Agent.thinkingBudgets (plain field, #33) ---
+  // --- 5. Agent.thinkingBudgets (plain field, #33) ---
   check(
     "agent.thinkingBudgets plain field",
     /this\.thinkingBudgets\s*=\s*runtimeOptions\.thinkingBudgets/.test(
@@ -251,11 +205,56 @@ try {
       : "thinkingBudgets assignment MISSING",
   );
 
-  // --- 7. SessionManager.getSessionId (#33) ---
+  // --- 7. SessionManager.getSessionId (#33/#75) ---
   check(
     "getSessionId is prototype method",
     typeof SessionManager?.prototype?.getSessionId === "function",
     typeof SessionManager?.prototype?.getSessionId,
+  );
+
+  // --- 7b. ModelRegistry.prototype.streamSimple (#75, floor 0.87.0) ---
+  // The summarization transport is `modelRegistry.streamSimple`; without it
+  // the extension deliberately falls back to upstream's cold dispatch. The
+  // path is only correct when the runtime exposes the method.
+  const ModelRegistry = codingAgent.ModelRegistry;
+  check(
+    "ModelRegistry exported",
+    typeof ModelRegistry === "function",
+    typeof ModelRegistry,
+  );
+  check(
+    "ModelRegistry.streamSimple is prototype method (#75)",
+    typeof ModelRegistry?.prototype?.streamSimple === "function",
+    typeof ModelRegistry?.prototype?.streamSimple,
+  );
+
+  // --- 7c. context_with_system event support (#75) ---
+  // The live-request capture registers `pi.on("context_with_system", ...)`.
+  // Event names have no runtime symbol, so check the runner's emit site and
+  // the event-type declaration in the installed dist. If pi drops/renames
+  // the event, the capture silently never fires and every rewind goes cold —
+  // exactly the failure this probe must surface.
+  const extensionsDir = path.join(path.dirname(codingAgentDist), "core/extensions");
+  let contextWithSystemSupport = { ok: false, detail: "not run" };
+  try {
+    const runnerSrc = readFileSync(path.join(extensionsDir, "runner.js"), "utf8");
+    const typesSrc = readFileSync(path.join(extensionsDir, "types.d.ts"), "utf8");
+    const emitsEvent = runnerSrc.includes('"context_with_system"');
+    const declaresEvent = typesSrc.includes('type: "context_with_system"');
+    contextWithSystemSupport = {
+      ok: emitsEvent && declaresEvent,
+      detail: `runner emit: ${emitsEvent ? "found" : "MISSING"}, type declaration: ${declaresEvent ? "found" : "MISSING"}`,
+    };
+  } catch (e) {
+    contextWithSystemSupport = {
+      ok: false,
+      detail: `threw: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  check(
+    "context_with_system event supported (#75)",
+    contextWithSystemSupport.ok,
+    contextWithSystemSupport.detail,
   );
 
   // --- 8. SettingsManager.getShowCacheMissNotices (TUI cache-notice gate) ---

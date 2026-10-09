@@ -22,4 +22,4 @@ Plus transitive deps: `AgentSession` constructor must assign `this.sessionManage
 
 ## Risk window
 
-The **shipped extension keeps running** on the last compatible pi (peer floor `>=0.81.0`); npm consumers on the NEW pi version will hit the break. No user action required beyond this issue.
+The **shipped extension keeps running** on the last compatible pi (peer floor `>=0.87.0`); npm consumers on the NEW pi version will hit the break. No user action required beyond this issue.

@@ -31,18 +31,20 @@
  *     the pi process, including sessions that never call
  *     `navigate_tree`.
  *
- * Verified against pi 0.81.0 / 0.83.0 / 0.84.2. pi 1.0.0 core
- * actions (anchor / list / rewind) are live-verified; the
- * reflection-bootstrap audit on 1.0.0 is still pending #25 (the daily
- * upstream probe is red for the tracked drift). In-loop context
- * refresh runs through the public `context` extension event (see
- * `buildContextMessages`), not `agent.prepareNextTurn*` reflection.
+ * Verified against pi 1.1.0 via `scripts/pi-upstream-probe.mjs` (the
+ * two remaining reflection points plus the #75 capture/transport
+ * seams). In-loop context refresh runs through the public `context`
+ * extension event (see `buildContextMessages`), not
+ * `agent.prepareNextTurn*` reflection; the cache-preserving summary
+ * path (#75) observes live requests via the public
+ * `context_with_system` event and replays them through the public
+ * `modelRegistry.streamSimple`.
  */
 
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type {
-  AgentTool,
+  AgentMessage,
   StreamFn,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -51,7 +53,9 @@ import {
   buildSessionContext,
   CONFIG_DIR_NAME,
   collectEntriesForBranchSummary,
+  convertToLlm,
   type ExtensionAPI,
+  estimateTokens,
   generateBranchSummary,
   getAgentDir,
   keyHint,
@@ -63,7 +67,7 @@ import {
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
-  buildLiveSummaryMessages,
+  buildSummaryInstructionMessage,
   type CacheRequest,
   createCachePreservingStreamFn,
   detectBranchSummaryCacheMiss,
@@ -284,25 +288,32 @@ function findOwningSession(sm: SessionManager): AgentSession | null {
 }
 
 /**
- * Resolve the provider's `streamSimple` for summarization routing via the
- * PUBLIC modelRegistry API (no reflection).
+ * Resolve the live-streaming transport for summarization via the PUBLIC
+ * `modelRegistry.streamSimple` API (no reflection).
  *
- * Custom providers registered via `pi.registerProvider(name, { api:
- * <custom-id>, streamSimple })` are composed into the ModelRuntime provider
- * returned by `ctx.modelRegistry.getProvider(...)` — its `streamSimple`
- * dispatches to the extension handler (provider-composer `streamWith`).
- * Without passing it as `streamFn` to `generateBranchSummary`,
- * completeSummarization falls back to the pi-ai compat registry (builtin
- * apis only) and throws "No API provider registered for api: <custom-id>".
+ * `ModelRegistry.streamSimple` runs the same `ModelRuntime` pipeline the
+ * agent loop uses — `normalizeContext` (no prepend: the wrapper passes only
+ * `messages`), `prepareRequest` auth resolution (apiKey / headers /
+ * credential baseUrl / provider env), virtual-model routing, and the
+ * composed provider. The composed provider is what keeps custom providers
+ * registered via `pi.registerProvider(name, { api: <custom-id>,
+ * streamSimple })` routable: `completeSummarization` alone falls back to the
+ * pi-ai compat registry (builtin apis only) and throws "No API provider
+ * registered for api: <custom-id>".
+ *
+ * The `typeof` guard covers mocked/older registries; when `streamSimple` is
+ * absent the caller passes no `streamFn` and upstream's cold request runs
+ * through its own dispatch.
  */
-function resolveProviderStreamFn(
+function resolveLiveStreamFn(
   modelRegistry: ModelRegistry,
-  providerId: string,
 ): { streamFn: StreamFn } | undefined {
   try {
-    const provider = modelRegistry.getProvider(providerId);
-    return provider?.streamSimple
-      ? { streamFn: provider.streamSimple as StreamFn }
+    return typeof modelRegistry.streamSimple === "function"
+      ? {
+          streamFn: (model, context, options) =>
+            modelRegistry.streamSimple(model, context, options),
+        }
       : undefined;
   } catch {
     return undefined;
@@ -406,6 +417,32 @@ export function buildContextMessages(sm: {
   return sm
     .buildContextEntries()
     .flatMap((entry) => sessionEntryToContextMessages(entry));
+}
+
+/**
+ * Count the non-system wire messages contributed by the projection entries
+ * at or before `target` — the background prefix the captured payload carries
+ * ahead of the collapsed segment. Substituted into the summary
+ * instruction's `{first}` placeholder.
+ *
+ * System messages are excluded because the instruction numbering explicitly
+ * excludes the system prompt (and any tool-delta system messages replayed
+ * into the head). Walks the live projection (not the raw branch) so a
+ * compaction cut before `target` — represented by a single summary entry —
+ * is counted the way the captured payload actually presents it.
+ */
+function countBackgroundMessages(
+  contextEntries: SessionEntry[],
+  target: string,
+): number {
+  let count = 0;
+  for (const entry of contextEntries) {
+    for (const message of convertToLlm(sessionEntryToContextMessages(entry))) {
+      if (message.role !== "system") count++;
+    }
+    if (entry.id === target) break;
+  }
+  return count;
 }
 
 function refreshAgentMessages(sm: SessionManager): boolean {
@@ -710,6 +747,18 @@ function toolError(
   };
 }
 
+/**
+ * Most recent live request captured for one session through the public
+ * `context_with_system` event (#75): the exact `[head, ...messages]` array
+ * the provider was about to receive. `leafId` is the session leaf at capture
+ * time — the in-flight assistant's parent — and is the freshness key the
+ * rewind call site checks before replaying the capture.
+ */
+interface LiveCapture {
+  messages: AgentMessage[];
+  leafId: string | null;
+}
+
 export default function (
   pi: ExtensionAPI,
   opts?: { summarize?: typeof generateBranchSummary },
@@ -728,6 +777,13 @@ export default function (
   let toolActive = true;
   let rewindHintAtPercent: number | null = null;
   let hintTracker = new RewindHintTracker();
+
+  // Live-request capture (#75): per-session, observation-only. Every
+  // `context_with_system` event replaces its session's entry; the map is
+  // capped at MAX_SESSION_REFS (the same fanout bound as the captured
+  // AgentSession refs) so a long-lived process with many subagent sessions
+  // cannot pin unbounded live-message arrays.
+  const liveCaptures = new Map<string, LiveCapture>();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
   // and NEVER cleared in-process: once a session has settled (write or
@@ -863,6 +919,33 @@ export default function (
   pi.on("context", (_event, ctx) => ({
     messages: buildContextMessages(ctx.sessionManager),
   }));
+
+  // Observation-only capture of the final live request (#75): runs after the
+  // `context` handlers above and Pi's system-message restore, so
+  // `event.messages` is the exact `[head, ...messages]` array the provider
+  // will receive — tool declarations included. Storing it is what lets
+  // `rewind` replay the live request's own message list instead of
+  // re-deriving it (the divergence that made summary requests miss the
+  // prompt cache). Returning nothing leaves the live request untouched.
+  pi.on("context_with_system", (event, ctx) => {
+    try {
+      const sessionId = ctx.sessionManager.getSessionId();
+      // Refresh insertion order so the cap evicts the stalest session.
+      liveCaptures.delete(sessionId);
+      liveCaptures.set(sessionId, {
+        messages: event.messages.slice(),
+        leafId: ctx.sessionManager.getLeafId(),
+      });
+      if (liveCaptures.size > MAX_SESSION_REFS) {
+        const oldest = liveCaptures.keys().next().value;
+        if (oldest !== undefined) liveCaptures.delete(oldest);
+      }
+    } catch {
+      // Observation-only: a throwing sessionManager must never break the
+      // live request. A missing capture just takes the cold fallback.
+    }
+    return undefined;
+  });
 
   // Anchor mandate (#31): a before_agent_start append lands at the END of
   // the system prompt — stronger than the mid-prompt Guidelines block, and
@@ -1383,163 +1466,132 @@ Operations (set \`action\`):
       //   - "branch-crosses-compaction": `buildContextEntries()` applies the
       //     compaction cut — entries before the latest compaction's
       //     `firstKeptEntryId` are dropped from the live projection. When a
-      //     rewind segment reaches older than that cut, the cache payload
-      //     would summarize the lossy compacted projection while the legacy
-      //     path summarizes the raw segment. The compaction entry itself is
-      //     retained, so `branchStartRetained` cannot catch this; the
-      //     id-difference check below does (every other entry type — labels,
-      //     model changes, thinking-level changes — stays in the projection,
-      //     so only compaction-dropped entries are missing).
-      //   - "branch-start-not-retained": no message from the collapsed
-      //     segment survived into the payload (labels-only segment) or the
-      //     newest message alone exceeded the token budget. The legacy path
-      //     then either summarizes the raw evidence or returns "No content to
-      //     summarize" before any wire call.
+      //     rewind segment reaches older than that cut, the capture would
+      //     summarize the lossy compacted projection while the legacy path
+      //     summarizes the raw segment, so the request falls back. The
+      //     predicate is the id difference between the collapsed entries and
+      //     the live projection — NOT "the segment contains a compaction": a
+      //     segment that contains the compaction entry but whose target sits
+      //     at/after `firstKeptEntryId` loses no evidence and must still take
+      //     the capture path.
       // -----------------------------------------------------------------
-      const providerStream = resolveProviderStreamFn(
-        ctx.modelRegistry,
-        ctx.model.provider,
-      );
+      const liveStream = resolveLiveStreamFn(ctx.modelRegistry);
       let summaryCacheRequest: CacheRequest | null = null;
       let summaryCacheFallbackReason: string | undefined;
-      let branchStartRetained = true;
 
       if (process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE === "0") {
         // Kill switch: an env-var escape hatch to force the pre-#33 cold
         // request without unloading the extension.
         summaryCacheFallbackReason = "disabled";
-      } else if (!providerStream) {
-        summaryCacheFallbackReason = "no-provider-stream";
+      } else if (!liveStream) {
+        summaryCacheFallbackReason = "no-live-stream";
       } else {
-        const owning = findOwningSession(sm);
-        const internals = owning ? asInternals(owning) : undefined;
-        const liveTools = internals?.agent?.state?.tools;
-        if (!internals) {
-          summaryCacheFallbackReason = "reflection-missing";
-        } else if (!Array.isArray(liveTools)) {
-          summaryCacheFallbackReason = "no-live-tools";
+        const contextEntries = sm.buildContextEntries();
+        const contextIds = new Set(contextEntries.map((e) => e.id));
+        // Evidence-loss guard: any segment entry missing from the live
+        // projection means the compaction cut dropped raw evidence, so the
+        // capture (the projection) would summarize a lossy view while the
+        // cold path summarizes the raw segment. Use the id-difference
+        // predicate — NOT a "segment contains a compaction" check: a segment
+        // that contains the compaction entry but whose target sits at/after
+        // `firstKeptEntryId` loses no evidence and must still take the cache
+        // path.
+        if (entries.some((e) => !contextIds.has(e.id))) {
+          summaryCacheFallbackReason = "branch-crosses-compaction";
         } else {
-          // Public accessor first (0.81+), reflected field as backstop. Both
-          // are read here AND in refreshAgentMessages; the reflection probe
-          // covers the plain-field shape.
-          const reflected = internals.agent?.state?.systemPrompt;
-          let systemPrompt: string | undefined;
-          if (typeof ctx.getSystemPrompt === "function") {
-            try {
-              systemPrompt = ctx.getSystemPrompt();
-            } catch {
-              systemPrompt = undefined;
-            }
-          }
-          if (typeof systemPrompt !== "string" || systemPrompt.length === 0) {
-            systemPrompt =
-              typeof reflected === "string" ? reflected : undefined;
-          }
-          if (typeof systemPrompt !== "string" || systemPrompt.length === 0) {
-            summaryCacheFallbackReason = "no-system-prompt";
+          const sessionId = sm.getSessionId();
+          const capture = liveCaptures.get(sessionId);
+          // Freshness: the capture must be the live request that produced
+          // the in-flight assistant. The capture-time leaf is exactly that
+          // assistant's parent, so a mismatch means the tree moved
+          // (resume/fork/reload) between the capture and this rewind. A
+          // batched rewind was refused above, so the leaf here is the
+          // assistant itself; a failed in-flight detection (leaf not an
+          // assistant) forces the cold delegation rather than a wrong
+          // replay.
+          if (!capture) {
+            summaryCacheFallbackReason = "no-capture";
+          } else if (capture.leafId !== oldLeafEntry?.parentId) {
+            summaryCacheFallbackReason = "stale-capture";
           } else {
-            const contextEntries = sm.buildContextEntries();
-            const contextIds = new Set(contextEntries.map((e) => e.id));
-            // Evidence-loss guard: any segment entry missing from the live
-            // projection means the compaction cut dropped raw evidence, so
-            // the cache payload would diverge from the legacy raw segment.
-            // Use the id-difference predicate — NOT a "segment contains a
-            // compaction" check: a segment that contains the compaction
-            // entry but whose target sits at/after `firstKeptEntryId` loses
-            // no evidence and must still take the cache path.
-            if (entries.some((e) => !contextIds.has(e.id))) {
-              summaryCacheFallbackReason = "branch-crosses-compaction";
+            // Replay the captured live request verbatim. The leading
+            // captured system message carries the live prompt AND the live
+            // tool declarations, so the provider replays the exact live
+            // order — no mirroring, no `context.tools` re-derivation.
+            const first = countBackgroundMessages(contextEntries, target) + 1;
+            const payload = [
+              ...convertToLlm(capture.messages),
+              buildSummaryInstructionMessage(first, p.summaryFocus),
+            ];
+            // No truncation: cutting the live prefix breaks parity by
+            // definition. When the replay plus the instruction cannot fit
+            // the window, hand the rewind to upstream's cold path (which
+            // truncates at the evidence budget).
+            const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
+            const payloadTokens = payload.reduce(
+              (sum, message) => sum + estimateTokens(message as AgentMessage),
+              0,
+            );
+            if (payloadTokens > tokenBudget) {
+              summaryCacheFallbackReason = "overflow";
             } else {
-              const branchEntryIds = new Set(entries.map((e) => e.id));
-              // Upstream's default `reserveTokens`; the fallback path will
-              // recompute the same budget inside generateBranchSummary.
-              const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
-              const built = buildLiveSummaryMessages({
-                contextEntries,
-                branchEntryIds,
-                inFlightToolCallId: toolCallId,
-                tokenBudget,
-                focus: p.summaryFocus,
-              });
-              branchStartRetained = built.branchStartRetained;
-              if (!built.branchStartRetained) {
-                summaryCacheFallbackReason = "branch-start-not-retained";
-              } else {
-                const sessionId = sm.getSessionId();
-                // Public since 0.81.0; `ctx.thinkingLevel` only exists >=
-                // 0.84.2, so never read it directly. "off" is omitted,
-                // mirroring the live loop's request shape.
-                const reasoning =
-                  typeof pi.getThinkingLevel === "function"
-                    ? pi.getThinkingLevel()
-                    : undefined;
-                // pi 1.0.0 projects a `before_agent_start` forced prompt as a
-                // single head on every live request (`ctx.getSystemPrompt()`
-                // returns the forced text while the persisted
-                // `agent.state.systemPrompt` stays the structured prompt).
-                // Mirror that head or the summary diverges at byte 0 and the
-                // whole prompt cache misses. 0.84.2 keeps the two identical by
-                // construction; a missing/empty reflected prompt is
-                // conservative (legacy path).
-                const projectHead =
-                  typeof reflected === "string" &&
-                  reflected.length > 0 &&
-                  systemPrompt !== reflected;
-                summaryCacheRequest = {
-                  context: {
-                    systemPrompt,
-                    messages: built.messages,
-                    tools: liveTools as AgentTool[],
-                  },
-                  projectHead,
-                  // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
-                  // over `process.env`, mirroring pi-ai's
-                  // `getProviderEnvValue`: the live turns resolve retention
-                  // from the provider env, so a provider-scoped "long" with
-                  // a process-level "short" would make live=long /
-                  // summary=short and silently miss.
-                  cacheRetention: resolveSummaryCacheRetention(auth.env),
-                  ...(sessionId ? { sessionId } : {}),
-                  ...(typeof reasoning === "string" && reasoning !== "off"
-                    ? { reasoning: reasoning as ThinkingLevel }
-                    : {}),
-                  ...(internals.agent?.thinkingBudgets
-                    ? { thinkingBudgets: internals.agent.thinkingBudgets }
-                    : {}),
-                };
-              }
+              // Public since 0.81.0; `ctx.thinkingLevel` only exists >=
+              // 0.84.2, so never read it directly. "off" is omitted,
+              // mirroring the live loop's request shape.
+              const reasoning =
+                typeof pi.getThinkingLevel === "function"
+                  ? pi.getThinkingLevel()
+                  : undefined;
+              // `thinkingBudgets` is a plain field on pi-agent-core's Agent;
+              // forwarded on the capture path exactly like the live loop.
+              const owning = findOwningSession(sm);
+              const thinkingBudgets = owning
+                ? asInternals(owning).agent?.thinkingBudgets
+                : undefined;
+              summaryCacheRequest = {
+                messages: payload,
+                // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
+                // over `process.env`, mirroring pi-ai's
+                // `getProviderEnvValue`: the live turns resolve retention
+                // from the provider env, so a provider-scoped "long" with
+                // a process-level "short" would make live=long /
+                // summary=short and silently miss.
+                cacheRetention: resolveSummaryCacheRetention(auth.env),
+                ...(sessionId ? { sessionId } : {}),
+                ...(typeof reasoning === "string" && reasoning !== "off"
+                  ? { reasoning: reasoning as ThinkingLevel }
+                  : {}),
+                ...(thinkingBudgets ? { thinkingBudgets } : {}),
+              };
             }
           }
         }
       }
 
-      // Always wrap when a provider stream exists: with a request it rewrites
-      // the live shape, without one it delegates today's cold request
-      // byte-for-byte (the `used` flag records which happened).
-      const cacheWrapped = providerStream
+      // Always wrap when a live stream exists: with a request it replays the
+      // capture, without one it delegates today's cold request byte-for-byte
+      // (the `used` flag records which happened).
+      const cacheWrapped = liveStream
         ? createCachePreservingStreamFn({
-            realStreamFn: providerStream.streamFn,
+            realStreamFn: liveStream.streamFn,
             request: summaryCacheRequest,
           })
         : undefined;
 
-      // `auth.baseUrl` (OAuth/credential-derived endpoint, e.g.
-      // githubCopilotOAuth) must be applied to the model, mirroring pi's
-      // own `_getSummarizationRequestAuth` (`result.auth.baseUrl ?
-      // { ...model, baseUrl: result.auth.baseUrl } : model`). Use this one
-      // resolved model for BOTH the summarization call and the session
-      // headers: the routing header is derived from the endpoint actually
-      // contacted, so reading the un-overridden `ctx.model` there would
-      // diverge.
-      const requestModel = auth.baseUrl
-        ? { ...ctx.model, baseUrl: auth.baseUrl }
-        : ctx.model;
-
+      // The summarization transport is `modelRegistry.streamSimple` (via
+      // the wrapper above), whose `prepareRequest` resolves the
+      // credential-derived baseUrl / apiKey / env exactly like the live
+      // path. So the summarize call passes the plain session model;
+      // overriding `baseUrl` here would be redundant (and would double-apply
+      // on OAuth-derived endpoints). The session-routing headers still come
+      // from `withSessionHeaders`: the registry path does not run the SDK's
+      // `getSessionHeaders`, and alias providers 400 without
+      // `x-opencode-session` (C4:A).
       const result = await summarize(entries, {
-        model: requestModel,
+        model: ctx.model,
         apiKey: auth.apiKey ?? "",
         headers: withSessionHeaders(
-          requestModel,
+          ctx.model,
           stripNullHeaders(auth.headers),
           sm.getSessionId(),
         ),
@@ -1599,8 +1651,8 @@ Operations (set \`action\`):
         ? detectBranchSummaryCacheMiss(
             allEntries,
             result.usage,
-            requestModel.provider,
-            requestModel.id,
+            ctx.model.provider,
+            ctx.model.id,
             Date.now(),
             {
               getModel: (provider, model) =>
@@ -1709,7 +1761,12 @@ Operations (set \`action\`):
           | undefined,
         originalErr ? 0 : tokensAtNewLeaf,
       );
-      const syntheticId = sm.appendMessage(syntheticMsg);
+      // Host type drift (1.x): `appendMessage` wants pi-ai's `JsonObject` for
+      // toolCall arguments while the builder types the synthetic args as
+      // `Record<string, unknown>`; runtime shape is identical.
+      const syntheticId = sm.appendMessage(
+        syntheticMsg as Parameters<SessionManager["appendMessage"]>[0],
+      );
 
       // Refresh agent.state.messages so the next prompt() snapshot reflects
       // the rewound chain. Runs in both paths; `refreshAgentMessages`
@@ -1762,7 +1819,6 @@ Operations (set \`action\`):
           summaryCache: {
             mode: summaryCacheMode,
             fallbackReason: summaryCacheFallbackReason ?? null,
-            branchStartRetained,
             used: cacheWrapped?.used.value ?? false,
             cacheRead: summaryCacheStats.cacheRead,
             input: summaryCacheStats.fresh,

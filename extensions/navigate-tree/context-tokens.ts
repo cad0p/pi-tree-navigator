@@ -18,7 +18,7 @@
  *
  * This module reproduces the removed helper's semantics on top of two
  * `@earendil-works/pi-coding-agent` root exports that are public across the
- * whole peer range (≥0.81.0, the peer floor):
+ * whole peer range (≥0.87.0, the peer floor):
  *   • `calculateContextTokens(usage)` — provider usage → context tokens.
  *   • `estimateTokens(message)` — per-message chars/4 heuristic.
  *
