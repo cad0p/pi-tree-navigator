@@ -167,9 +167,9 @@ describe("estimateContextTokens", () => {
 
     // Host-semantics pin, not a cross-version number: pi 1.0.0's
     // estimateTokens counts a system message's content + sections +
-    // toolsAdded, while 0.84.2 (this repo's devDeps) has no system case and
-    // returns 0. Asserting delegation keeps the unit suite correct on both
-    // hosts and documents the divergence instead of pinning a false parity.
+    // toolsAdded, while pre-1.0 hosts have no system case and return 0.
+    // Asserting delegation keeps the unit suite correct on both hosts and
+    // documents the divergence instead of pinning a false parity.
     const hostSystemTokens = estimateTokens(system);
     assert.equal(estimateContextTokens([system]), hostSystemTokens);
     assert.equal(

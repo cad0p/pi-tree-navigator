@@ -129,7 +129,7 @@ function makeFakePi(sm: SessionManager): FakePi {
     sendMessage(...args: unknown[]) {
       sendMessageCalls.push(args);
     },
-    // Public since pi 0.81.0; the cache request mirrors it as `reasoning`.
+    // Public since pi 0.81.0; the cache request forwards it as `reasoning`.
     getThinkingLevel() {
       return "medium";
     },
@@ -177,11 +177,9 @@ interface FakeCtx {
 }
 
 /**
- * The single system-prompt value both fixtures expose by default. The cache
- * path only takes the forced-head projection when `ctx.getSystemPrompt()`
- * differs from `agent.state.systemPrompt`; keeping them equal here holds the
- * legacy rewind tests on the legacy (no-projection) path. Tests that pin the
- * pi-1.0.0 projection override one side explicitly.
+ * Marker content for the head the fake `transformContext` chain installs.
+ * The cache path captures the FINAL transformed list instead of mirroring
+ * prompt fields, so tests only use this value as the captured head's marker.
  */
 const LIVE_SYSTEM_PROMPT = "LIVE SYSTEM PROMPT";
 
@@ -361,6 +359,15 @@ interface FakeAgentSession {
     thinkingBudgets?: unknown;
     prepareNextTurn?: unknown;
     prepareNextTurnWithContext?: unknown;
+    /**
+     * Public pi-agent-core field the #75 capture wraps. The real host chain
+     * installs the forced-prompt / hidden-declaration projections BEFORE this
+     * extension's wrapper; tests model that by pre-installing a transform.
+     */
+    transformContext?: (
+      messages: unknown[],
+      signal?: AbortSignal,
+    ) => Promise<unknown[]> | unknown[];
   };
   /**
    * Plain field on `AgentSession`; the extension reads
@@ -450,7 +457,86 @@ describe("context event handler", () => {
     appendTurn(sm, "u1", "a1", 100);
     appendTurn(sm, "u2", "a2", 200);
     const projected = __testHooks.buildContextMessages(sm);
-    assert.deepEqual(projected, sm.buildSessionContext().messages);
+    assert.deepEqual(
+      projected,
+      sm
+        .buildSessionContext()
+        .messages.filter((message) => message.role !== "system"),
+    );
+  });
+
+  it("buildContextMessages is conversation-only (Pi re-attaches the head)", () => {
+    // `context` handlers transform conversation messages only; the runner
+    // filters system state out before the handler and re-attaches the current
+    // head afterwards. Returning a projection that still carries the
+    // persisted system entry would duplicate the head whenever
+    // `forceSystemPrompt` is unset.
+    const { sm } = setup();
+    sm.appendMessage({ role: "system", content: "PERSISTED HEAD" } as never);
+    appendTurn(sm, "u1", "a1", 100);
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.ok(
+      projected.every((message) => message.role !== "system"),
+      "the context payload must not carry system messages",
+    );
+    assert.ok(
+      sm.buildSessionContext().messages.some((m) => m.role === "system"),
+      "the raw session context still contains the persisted system entry",
+    );
+  });
+
+  it("buildContextMessages applies context_edit omissions (projection beats raw entries)", () => {
+    const { sm } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 100);
+    appendTurn(sm, "u2", "a2", 200);
+    // pi's overflow recovery and the fallback provider omit failed attempts
+    // with a null-replacement context_edit. The wire projection must drop
+    // the message; the raw buildContextEntries walk would reintroduce it.
+    sm.appendContextEdit(t1.assistantId, null);
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.ok(
+      !projected.some((message) => JSON.stringify(message).includes("a1")),
+      "the omitted assistant must not be reintroduced",
+    );
+    assert.ok(
+      sm.buildContextEntries().some((entry) => entry.id === t1.assistantId),
+      "the raw entry walk still contains the omitted entry",
+    );
+    assert.equal(projected.length, sm.buildSessionContext().messages.length);
+  });
+
+  it("captures the FINAL transformed request (post host projections), not the context-handler input", async () => {
+    const { sm } = setup();
+    appendTurn(sm, "u1", "a1", 100);
+    const fake = makeFakeSession(sm);
+    // Host projection layer: replace every system message with a forced head
+    // — exactly what `_installAgentForcedPromptProjection` does, and exactly
+    // what the deleted `context_with_system` capture missed because that
+    // event fires BEFORE this layer.
+    fake.agent.transformContext = async (messages) => [
+      {
+        role: "system",
+        content: `${LIVE_SYSTEM_PROMPT}\nFORCED`,
+        timestamp: 7,
+      },
+      ...messages.filter(
+        (message) => (message as { role?: string }).role !== "system",
+      ),
+    ];
+    __testHooks.captureSession(fake as unknown as AgentSession);
+    const visible = __testHooks
+      .buildContextMessages(sm)
+      .filter((message) => message.role !== "system");
+    const final = await fake.agent.transformContext(visible);
+    const stored = __testHooks.liveCaptures.get(sm.getSessionId());
+    assert.ok(stored, "the transformContext wrapper must store a capture");
+    assert.equal(JSON.stringify(stored.messages), JSON.stringify(final));
+    assert.equal(
+      (stored.messages[0] as { content: string }).content,
+      `${LIVE_SYSTEM_PROMPT}\nFORCED`,
+      "the capture must hold the post-projection head, not the pre-transform list",
+    );
+    assert.equal((stored.messages[0] as { timestamp: number }).timestamp, 7);
   });
 
   it("handler returns messages = tree projection on every call (no leaf-gating)", () => {
@@ -2364,21 +2450,20 @@ describe("dispatch: rewind happy path", () => {
     });
   });
 
-  it("wraps the provider's streamSimple as streamFn (custom-api provider routing)", async () => {
+  it("passes modelRegistry.streamSimple as streamFn (custom-provider routing)", async () => {
     // Regression: rewind failed with "No API provider registered for api:
     // commandcode-custom" for providers registered via
     // pi.registerProvider(name, { api: <custom-id>, streamSimple }) because
     // generateBranchSummary was called WITHOUT streamFn, making
     // completeSummarization fall back to the pi-ai compat registry (which
-    // only knows builtin apis). The fix forwards the composed provider's
-    // `streamSimple` via the public modelRegistry.getProvider() API — the
-    // same routing pi's own branchWithSummary uses.
+    // only knows builtin apis). The fix routes summarization through the
+    // public `modelRegistry.streamSimple`, whose composed provider
+    // dispatches to the extension handler.
     //
-    // #33 wraps that function (to rewrite the request at the seam), so the
-    // identity changed from "the provider's streamSimple" to "a wrapper that
-    // delegates to it". Pin the delegation, not the identity: a regression
-    // that drops the forwarding still fails here because the delegate is
-    // never called.
+    // #75 wraps that function (to replay the captured live request at the
+    // seam), so the identity is "a wrapper that delegates to the registry
+    // stream". Pin the delegation, not the identity: a regression that drops
+    // the forwarding still fails here because the delegate is never called.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -2393,11 +2478,10 @@ describe("dispatch: rewind happy path", () => {
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
     setupRewindable(sm, pi, {});
 
-    // Simulate a custom-api provider (e.g. commandcode 0.5.x with
-    // api "commandcode-custom"): the composed provider exposes
-    // `streamSimple` via the public modelRegistry.getProvider().
+    // Simulate the composed runtime transport (custom providers included):
+    // the extension must forward `modelRegistry.streamSimple`.
     const delegated: unknown[] = [];
-    const providerStreamSimple = async (
+    const registryStreamSimple = async (
       _m: unknown,
       context: unknown,
       options: unknown,
@@ -2405,8 +2489,7 @@ describe("dispatch: rewind happy path", () => {
       delegated.push({ context, options });
       return { result: async () => ({}) } as never;
     };
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => ({ streamSimple: providerStreamSimple });
+    installLiveStream(ctx, registryStreamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2424,11 +2507,11 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(
       typeof capturedStreamFn,
       "function",
-      "summarize must receive a streamFn that delegates to the provider streamSimple",
+      "summarize must receive a streamFn that delegates to modelRegistry.streamSimple",
     );
-    // No captured session in this fixture ⇒ cold fallback: the wrapper
-    // delegates the caller's context/options verbatim.
-    const coldContext = { systemPrompt: "COLD", messages: [] };
+    // No capture in this fixture ⇒ cold fallback: the wrapper delegates the
+    // caller's context/options verbatim.
+    const coldContext = { messages: [] };
     await (
       capturedStreamFn as (
         m: unknown,
@@ -2444,10 +2527,10 @@ describe("dispatch: rewind happy path", () => {
     );
   });
 
-  it("omits streamFn when the provider has no streamSimple (builtin-compat fallback)", async () => {
-    // A provider whose composed entry lacks `streamSimple` (or a
-    // modelRegistry without getProvider, e.g. pre-0.81 hosts) must fall
-    // back to the previous behavior: no streamFn → pi-ai compat dispatch.
+  it("omits streamFn when the registry has no streamSimple (upstream dispatch fallback)", async () => {
+    // A modelRegistry that predates `streamSimple` (pre-0.86 hosts) must
+    // fall back to the previous behavior: no streamFn → upstream's own
+    // dispatch.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -2461,10 +2544,6 @@ describe("dispatch: rewind happy path", () => {
 
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
     setupRewindable(sm, pi, {});
-
-    // Provider exists but has no streamSimple.
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => ({});
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2482,14 +2561,13 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(
       capturedStreamFn,
       undefined,
-      "summarize must NOT receive streamFn when provider has no streamSimple",
+      "summarize must NOT receive streamFn when the registry has no streamSimple",
     );
   });
 
-  it("omits streamFn when getProvider returns undefined", async () => {
-    // modelRegistry.getProvider(providerId) can return undefined (unknown
-    // provider, or a host where the provider isn't composed yet). Must fall
-    // back to the previous behavior (no streamFn).
+  it("omits streamFn when streamSimple is undefined", async () => {
+    // A registry whose `streamSimple` field is absent/undefined (test mocks,
+    // partial hosts) must fall back to no streamFn.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -2503,9 +2581,8 @@ describe("dispatch: rewind happy path", () => {
 
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
     setupRewindable(sm, pi, {});
-
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => undefined;
+    (ctx.modelRegistry as unknown as { streamSimple?: unknown }).streamSimple =
+      undefined;
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2513,7 +2590,7 @@ describe("dispatch: rewind happy path", () => {
         action: "rewind",
         rewindTo: "start",
         newLabel: "end",
-        summaryFocus: "undefined-provider fallback regression focus",
+        summaryFocus: "undefined-streamSimple fallback regression focus",
       },
       undefined,
       undefined,
@@ -2523,14 +2600,14 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(
       capturedStreamFn,
       undefined,
-      "summarize must NOT receive streamFn when getProvider returns undefined",
+      "summarize must NOT receive streamFn when streamSimple is undefined",
     );
   });
 
-  it("omits streamFn when getProvider throws (defensive catch)", async () => {
-    // A hostile/older modelRegistry may throw from getProvider. The
-    // resolveProviderStreamFn try/catch must degrade to no streamFn rather
-    // than failing the rewind.
+  it("omits streamFn when the streamSimple getter throws (defensive catch)", async () => {
+    // A hostile/older modelRegistry may throw while reading the field. The
+    // resolveLiveStreamFn try/catch must degrade to no streamFn rather than
+    // failing the rewind.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -2544,11 +2621,12 @@ describe("dispatch: rewind happy path", () => {
 
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
     setupRewindable(sm, pi, {});
-
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => {
+    Object.defineProperty(ctx.modelRegistry, "streamSimple", {
+      configurable: true,
+      get() {
         throw new Error("registry exploded");
-      };
+      },
+    });
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2556,7 +2634,7 @@ describe("dispatch: rewind happy path", () => {
         action: "rewind",
         rewindTo: "start",
         newLabel: "end",
-        summaryFocus: "throwing-provider fallback regression focus",
+        summaryFocus: "throwing-registry fallback regression focus",
       },
       undefined,
       undefined,
@@ -2566,15 +2644,14 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(
       capturedStreamFn,
       undefined,
-      "summarize must NOT receive streamFn when getProvider throws",
+      "summarize must NOT receive streamFn when the getter throws",
     );
   });
 
-  it("forwards streamSimple when it is not a function (truthy but invalid)", async () => {
-    // `provider?.streamSimple` truthiness is the only guard; a truthy
-    // non-function would previously be forwarded. Pin the current behavior
-    // (forwarded as-is) so a future hardening (typeof check) is a visible
-    // change, not a silent fix.
+  it("omits streamFn when streamSimple is not a function (typeof guard)", async () => {
+    // The old seam forwarded any truthy `provider.streamSimple`; the v2
+    // resolver requires `typeof === "function"` so a malformed registry
+    // degrades to upstream dispatch instead of a broken wrapper.
     let capturedStreamFn: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
       capturedStreamFn = (opts as { streamFn?: unknown }).streamFn;
@@ -2588,10 +2665,7 @@ describe("dispatch: rewind happy path", () => {
 
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
     setupRewindable(sm, pi, {});
-
-    const notAFunction = "not-a-function";
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => ({ streamSimple: notAFunction });
+    installLiveStream(ctx, "not-a-function");
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2599,30 +2673,17 @@ describe("dispatch: rewind happy path", () => {
         action: "rewind",
         rewindTo: "start",
         newLabel: "end",
-        summaryFocus: "non-function streamSimple pin focus",
+        summaryFocus: "non-function streamSimple guard focus",
       },
       undefined,
       undefined,
       ctx,
     );
     assert.equal(result.isError, undefined);
-    // #33 always wraps a truthy provider streamSimple, so the option is the
-    // wrapper (a function), not the raw truthy value. Calling it surfaces
-    // the delegate's TypeError — pin that instead of the old identity.
     assert.equal(
-      typeof capturedStreamFn,
-      "function",
-      "truthy streamSimple is wrapped (function-shaped option)",
-    );
-    assert.throws(
-      () =>
-        (capturedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(
-          {},
-          {},
-          {},
-        ),
-      TypeError,
-      "invoking the wrapper surfaces the non-function delegate error",
+      capturedStreamFn,
+      undefined,
+      "a truthy non-function streamSimple must not be wrapped",
     );
   });
 
@@ -2654,9 +2715,8 @@ describe("dispatch: rewind happy path", () => {
       apiKey: "test-key",
       headers: { "x-real": "value", "x-deleted": null },
     });
-    // Provider present so the rewind path reaches summarize.
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => ({ streamSimple: async () => ({}) as never });
+    // Live stream present so the rewind path reaches summarize.
+    installLiveStream(ctx, async () => ({}) as never);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2715,9 +2775,6 @@ describe("dispatch: rewind happy path", () => {
       // Pre-set session header must survive (never overridden).
       headers: { "x-real": "value", "x-opencode-session": "keep-me" },
     });
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => ({});
-
     const result = await tool.execute(
       "tc-rewind",
       {
@@ -2781,8 +2838,6 @@ describe("dispatch: rewind happy path", () => {
         apiKey: "test-key",
         headers: {},
       });
-      (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-        () => ({});
       const result = await tool.execute(
         tc,
         {
@@ -2813,11 +2868,13 @@ describe("dispatch: rewind happy path", () => {
     );
   });
 
-  it("forwards auth.baseUrl onto the model and auth.env (OAuth-derived endpoints)", async () => {
-    // pi's own _getSummarizationRequestAuth applies `result.auth.baseUrl`
-    // onto the model (OAuth/credential-derived endpoints, e.g.
-    // githubCopilotOAuth) and forwards `env`. The extension must mirror
-    // that — dropping baseUrl would hit the catalog default endpoint.
+  it("passes the plain session model to summarize; the registry applies auth.baseUrl", async () => {
+    // v2 (#75): the summarization transport is `modelRegistry.streamSimple`,
+    // whose `prepareRequest` applies the credential-derived baseUrl (OAuth
+    // endpoints, e.g. githubCopilotOAuth) exactly like the live path. The
+    // extension must therefore NOT pre-apply `auth.baseUrl` onto the model —
+    // that would be redundant for the registry path (and the summarize call
+    // no longer mirrors pi's `_getSummarizationRequestAuth`).
     let capturedModel: unknown;
     let capturedEnv: unknown = "__not_called__";
     const spySummarize = (async (_entries: unknown, opts: unknown) => {
@@ -2833,7 +2890,12 @@ describe("dispatch: rewind happy path", () => {
 
     const { sm, pi, tool, ctx } = setup({ summarize: spySummarize });
     setupRewindable(sm, pi, {});
-
+    (ctx as unknown as { model: unknown }).model = {
+      api: "anthropic",
+      provider: "claude",
+      id: "claude-sonnet-4-5",
+      baseUrl: "https://catalog-default.example.com",
+    };
     (
       ctx.modelRegistry as unknown as {
         getApiKeyAndHeaders: () => Promise<unknown>;
@@ -2845,8 +2907,7 @@ describe("dispatch: rewind happy path", () => {
       baseUrl: "https://oauth-derived.example.com",
       env: { FOO: "bar" },
     });
-    (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-      () => ({ streamSimple: async () => ({}) as never });
+    installLiveStream(ctx, async () => ({}) as never);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2863,8 +2924,8 @@ describe("dispatch: rewind happy path", () => {
     assert.equal(result.isError, undefined);
     assert.equal(
       (capturedModel as { baseUrl?: string } | undefined)?.baseUrl,
-      "https://oauth-derived.example.com",
-      "auth.baseUrl must be applied onto the summarization model",
+      "https://catalog-default.example.com",
+      "summarize receives the plain session model; ModelRegistry.streamSimple resolves auth.baseUrl in prepareRequest",
     );
     assert.deepEqual(
       capturedEnv,
@@ -2879,14 +2940,14 @@ describe("dispatch: rewind happy path", () => {
     // request long (matching live) even when process.env says otherwise.
     const { spy, captured } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
-    const { fake } = setupRewindable(sm, pi, { capture: true });
-    assert.ok(fake);
-    fake.agent.state.tools = [
-      { name: "read", description: "r", parameters: {} },
-    ];
+    setupRewindable(sm, pi, { capture: true });
+    // The live path needs a capture from the request that produced the
+    // in-flight assistant; the fixture's last turn stands in for it.
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
 
     const provider = capturingProvider();
-    installProvider(ctx, provider.streamSimple);
+    installLiveStream(ctx, provider.streamSimple);
     (
       ctx.modelRegistry as unknown as {
         getApiKeyAndHeaders: () => Promise<unknown>;
@@ -2934,13 +2995,21 @@ describe("dispatch: rewind happy path", () => {
     }
   });
 
-  it("derives session-affinity headers from the auth.baseUrl-overridden model", async () => {
-    // The opencode routing header keys off the model's `baseUrl` host. When
-    // auth supplies the endpoint, `withSessionHeaders` must see the same
-    // overridden model the request is sent to.
+  it("derives session-affinity headers from the session model's baseUrl", async () => {
+    // The opencode routing header keys off the model's `baseUrl` host. In v2
+    // the header check reads `ctx.model` (the summarize call passes it
+    // unchanged; the registry applies credential baseUrl at transport time).
+    // Alias models like `opencode-go-N` carry the opencode.ai host on
+    // ctx.model, so the injection still fires for the fleet's aliases.
     const { spy, captured } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     setupRewindable(sm, pi, {});
+    (ctx as unknown as { model: unknown }).model = {
+      api: "openai-responses",
+      provider: "opencode-go-2",
+      id: "muse-spark-1.3-contributor",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    };
     (
       ctx.modelRegistry as unknown as {
         getApiKeyAndHeaders: () => Promise<unknown>;
@@ -2949,9 +3018,8 @@ describe("dispatch: rewind happy path", () => {
       ok: true,
       apiKey: "test-key",
       headers: {},
-      baseUrl: "https://opencode.ai/zen/v1",
     });
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -2959,7 +3027,7 @@ describe("dispatch: rewind happy path", () => {
         action: "rewind",
         rewindTo: "start",
         newLabel: "end",
-        summaryFocus: "auth baseUrl must drive the session-affinity header",
+        summaryFocus: "session model baseUrl must drive the affinity header",
       },
       undefined,
       undefined,
@@ -2971,7 +3039,7 @@ describe("dispatch: rewind happy path", () => {
         "x-opencode-session"
       ],
       sm.getSessionId(),
-      "the opencode routing header must be derived from the overridden baseUrl host",
+      "the opencode routing header must be derived from the session model's baseUrl host",
     );
   });
 });
@@ -4747,9 +4815,9 @@ function capturingProvider() {
   return { calls, streamSimple };
 }
 
-function installProvider(ctx: FakeCtx, streamSimple: unknown): void {
-  (ctx.modelRegistry as unknown as { getProvider?: unknown }).getProvider =
-    () => ({ streamSimple });
+function installLiveStream(ctx: FakeCtx, streamSimple: unknown): void {
+  (ctx.modelRegistry as unknown as { streamSimple?: unknown }).streamSimple =
+    streamSimple;
 }
 
 const USAGE_COST = {
@@ -4799,6 +4867,53 @@ function appendInFlightAssistant(sm: SessionManager, id: string): string {
       cost: USAGE_COST,
     },
   } as never);
+}
+
+/**
+ * Feed a synthetic live request through the REAL capture wrapper (#75):
+ * build a fake session whose `agent.transformContext` stands in for the host
+ * chain (context handlers → forced-prompt / hidden-declaration projections),
+ * install the wrapper via `captureSession`, then call the wrapped transform
+ * with the pre-transform visible messages. Returns the FINAL transformed
+ * list — the exact array the summary payload replays. Call it while the
+ * session leaf is the in-flight assistant's parent (i.e. before appending
+ * that assistant), so the capture passes the rewind call site's freshness
+ * check.
+ *
+ * `inject` models another extension (or host rewrite) changing the visible
+ * list after our `context` handler; the `capture-diverged` guard must refuse
+ * the replay when that happens.
+ */
+async function captureLive(
+  sm: SessionManager,
+  _pi: FakePi,
+  headTools: Array<{
+    name: string;
+    description?: string;
+    parameters?: unknown;
+  }> = [],
+  inject?: (messages: unknown[]) => unknown[],
+): Promise<unknown[]> {
+  const fake = makeFakeSession(sm);
+  fake.agent.transformContext = async (messages) => {
+    const visible = inject ? inject(messages) : messages;
+    return [
+      {
+        role: "system",
+        content: LIVE_SYSTEM_PROMPT,
+        ...(headTools.length > 0 ? { toolsAdded: headTools } : {}),
+        timestamp: 1,
+      },
+      ...visible.filter(
+        (message) => (message as { role?: string }).role !== "system",
+      ),
+    ];
+  };
+  __testHooks.captureSession(fake as unknown as AgentSession);
+  const visible = __testHooks
+    .buildContextMessages(sm)
+    .filter((message) => message.role !== "system");
+  return fake.agent.transformContext(visible);
 }
 
 /**
@@ -4890,25 +5005,27 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     }
   });
 
-  it("assembles the live request and delegates it through the wrapper", async () => {
+  it("assembles the captured live request and delegates it through the wrapper", async () => {
     const { spy, captured } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     const t1 = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(t1.assistantId, "anchor:start");
     appendTurn(sm, "u2", "a2", 12_000);
+    // The live head declares tools in an order a session `state.tools` list
+    // would not have; the summary must replay this exact order.
+    const headTools = [
+      { name: "grep", description: "g", parameters: {} },
+      { name: "read", description: "r", parameters: {} },
+    ];
+    const capture = await captureLive(sm, pi, headTools);
     const inFlightId = appendInFlightAssistant(sm, "tc-rewind");
     assert.equal(sm.getLeafId(), inFlightId);
 
-    const fake = makeFakeSession(sm);
-    const liveTools = [{ name: "read", description: "r", parameters: {} }];
-    fake.agent.state.tools = liveTools;
-    fake.agent.thinkingBudgets = { high: 4242 };
-    __testHooks.captureSession(fake as unknown as AgentSession);
     (pi.pi as unknown as { getThinkingLevel: () => string }).getThinkingLevel =
       () => "high";
 
     const provider = capturingProvider();
-    installProvider(ctx, provider.streamSimple);
+    installLiveStream(ctx, provider.streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -4943,37 +5060,48 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
         c: unknown,
         o: unknown,
       ) => Promise<unknown>
-    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+    )({}, { messages: [] }, { maxTokens: 2048 });
 
     assert.equal(provider.calls.length, 1);
     const call = provider.calls[0];
-    assert.equal(call.context.systemPrompt, "LIVE SYSTEM PROMPT");
-    assert.equal(
-      call.context.tools,
-      liveTools,
-      "live tool instances must be reused",
+    // v2 (#75): the payload is the capture + the instruction, replayed
+    // verbatim — no `systemPrompt`/`tools` fields (the captured head carries
+    // both), and no re-derivation from `agent.state.tools`.
+    assert.equal(call.context.systemPrompt, undefined);
+    assert.equal(call.context.tools, undefined);
+    const messages = call.context.messages;
+    const head = messages[0] as {
+      role: string;
+      content: string;
+      toolsAdded: Array<{ name: string }>;
+      timestamp: number;
+    };
+    assert.equal(head.role, "system");
+    assert.equal(head.content, LIVE_SYSTEM_PROMPT);
+    assert.equal(head.timestamp, 1);
+    assert.deepEqual(
+      head.toolsAdded.map((tool) => tool.name),
+      ["grep", "read"],
+      "captured head tool order must be replayed, not re-derived",
     );
+    // Byte-identical prefix: the payload minus the trailing instruction is
+    // exactly the captured live request.
     assert.equal(
-      call.options?.maxTokens,
-      undefined,
-      "caller cap must be stripped",
+      JSON.stringify(messages.slice(0, -1)),
+      JSON.stringify(capture),
+      "summary payload prefix must be byte-identical to the live capture",
     );
-    assert.equal(call.options?.cacheRetention, "short");
-    assert.equal(call.options?.sessionId, sm.getSessionId());
-    assert.equal(call.options?.reasoning, "high");
-    assert.deepEqual(call.options?.thinkingBudgets, { high: 4242 });
-
-    // In-flight assistant excluded: the payload ends before the assistant
-    // that carries the triggering toolCall, leaving no unpaired tool_use.
-    const body = call.context.messages.slice(0, -1);
+    // The in-flight assistant's rewind toolCall was never part of the
+    // captured request, so it cannot appear in the payload.
     assert.ok(
-      !body.some(
-        (m) =>
-          m.role === "assistant" && JSON.stringify(m).includes("tc-rewind"),
+      !messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          JSON.stringify(message).includes("tc-rewind"),
       ),
-      "in-flight assistant toolCall must not appear in the summary payload",
+      "the in-flight assistant's rewind toolCall must not appear in the summary payload",
     );
-    const trailer = call.context.messages[call.context.messages.length - 1] as {
+    const trailer = messages[messages.length - 1] as {
       role: string;
       content: Array<{ text: string }>;
     };
@@ -4983,122 +5111,21 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       /Additional focus: Preserve the latest/,
     );
     assert.doesNotMatch(trailer.content[0].text, /\{first\}/);
+    // `{first}` numbers the branch start: the anchor's own turn (u1/a1) is
+    // background, so the collapsed segment starts at message 3.
+    assert.match(trailer.content[0].text, /Summarize only messages 3 onwards/);
+    assert.equal(call.options?.maxTokens, undefined);
+    assert.equal(call.options?.cacheRetention, "short");
+    assert.equal(call.options?.sessionId, sm.getSessionId());
+    assert.equal(call.options?.reasoning, "high");
   });
 
-  it("projects a forced-prompt head when the reflected prompt differs (pi 1.0.0)", async () => {
-    const { spy, captured } = capturingSummarize();
-    const { sm, pi, tool, ctx } = setup({ summarize: spy });
-    const t1 = appendTurn(sm, "u1", "a1", 6_000);
-    pi.pi.setLabel(t1.assistantId, "anchor:start");
-    appendTurn(sm, "u2", "a2", 12_000);
-    appendInFlightAssistant(sm, "tc-rewind");
-
-    const fake = makeFakeSession(sm);
-    const liveTools = [{ name: "read", description: "r", parameters: {} }];
-    fake.agent.state.tools = liveTools;
-    // The forced prompt (ctx.getSystemPrompt) differs from the persisted
-    // structured prompt: the host projects a forced head on every live
-    // request, so the summary must mirror it.
-    fake.agent.state.systemPrompt = "STRUCTURED SYSTEM PROMPT";
-    __testHooks.captureSession(fake as unknown as AgentSession);
-
-    const provider = capturingProvider();
-    installProvider(ctx, provider.streamSimple);
-
-    const result = await tool.execute(
-      "tc-rewind",
-      {
-        action: "rewind",
-        rewindTo: "start",
-        newLabel: "end",
-        summaryFocus: "Preserve user instructions and continue.",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.equal(result.isError, undefined);
-    await (
-      captured.streamFn as (
-        m: unknown,
-        c: unknown,
-        o: unknown,
-      ) => Promise<unknown>
-    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
-
-    assert.equal(provider.calls.length, 1);
-    const call = provider.calls[0];
-    const head = call.context.messages[0] as {
-      role: string;
-      content: string;
-      toolsAdded: unknown;
-      timestamp: number;
-    };
-    assert.equal(head.role, "system");
-    assert.equal(head.content, LIVE_SYSTEM_PROMPT);
-    assert.deepEqual(head.toolsAdded, liveTools);
-    assert.equal(typeof head.timestamp, "number");
-    // The persisted structured deltas collapse into the head.
-    assert.ok(call.context.messages.slice(1).every((m) => m.role !== "system"));
-    // The legacy wire fields stay present for the projection inputs.
-    assert.equal(call.context.systemPrompt, LIVE_SYSTEM_PROMPT);
-    assert.equal(call.context.tools, liveTools);
-  });
-
-  it("stays on the legacy path when the reflected prompt is missing or empty", async () => {
-    for (const reflected of [undefined, ""] as const) {
-      const { spy, captured } = capturingSummarize();
-      const { sm, pi, tool, ctx } = setup({ summarize: spy });
-      const t1 = appendTurn(sm, "u1", "a1", 6_000);
-      pi.pi.setLabel(t1.assistantId, "anchor:start");
-      appendTurn(sm, "u2", "a2", 12_000);
-      appendInFlightAssistant(sm, "tc-rewind");
-
-      const fake = makeFakeSession(sm);
-      fake.agent.state.systemPrompt = reflected as never;
-      __testHooks.captureSession(fake as unknown as AgentSession);
-
-      const provider = capturingProvider();
-      installProvider(ctx, provider.streamSimple);
-
-      const result = await tool.execute(
-        "tc-rewind",
-        {
-          action: "rewind",
-          rewindTo: "start",
-          newLabel: "end",
-          summaryFocus: "Preserve user instructions and continue.",
-        },
-        undefined,
-        undefined,
-        ctx,
-      );
-      assert.equal(result.isError, undefined);
-      await (
-        captured.streamFn as (
-          m: unknown,
-          c: unknown,
-          o: unknown,
-        ) => Promise<unknown>
-      )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
-
-      const call = provider.calls[0];
-      assert.equal(
-        call.context.messages[0].role !== "system",
-        true,
-        "legacy request keeps the structured messages (no projected head)",
-      );
-      assert.equal(call.context.systemPrompt, LIVE_SYSTEM_PROMPT);
-    }
-  });
-
-  it("falls back with reflection-missing when no owning session can be found", async () => {
+  it("falls back with no-capture when no live request was captured", async () => {
     const { spy } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     setupRewindable(sm, pi);
-    // Provider present so the fallback reason is the reflection miss, not
-    // the missing stream.
-    installProvider(ctx, capturingProvider().streamSimple);
+    // Live stream present so the fallback reason is the missing capture.
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5122,21 +5149,22 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
-    assert.equal(cache.fallbackReason, "reflection-missing");
+    assert.equal(cache.fallbackReason, "no-capture");
     assert.equal(cache.hit, false);
     assert.equal(cache.notice, null);
   });
 
-  it("falls back when the reflected session has no live tool array", async () => {
+  it("falls back with stale-capture when the tree moved after the capture", async () => {
     const { spy } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     setupRewindable(sm, pi);
-    // Capture a session whose tools field is not an array. (Must be the only
-    // captured session for this sm so findOwningSession resolves it.)
-    const fake = makeFakeSession(sm);
-    fake.agent.state.tools = undefined as never;
-    __testHooks.captureSession(fake as unknown as AgentSession);
-    installProvider(ctx, capturingProvider().streamSimple);
+    // Capture at the current leaf, then append another turn before the
+    // in-flight assistant: the capture no longer matches the in-flight
+    // assistant's parent (resume/fork/reload shape).
+    await captureLive(sm, pi);
+    appendTurn(sm, "u5", "a5", 30_000);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5152,16 +5180,193 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    // The stub reports no usage, so no miss is measured -> no notice.
-    assert.equal(
-      (result.details.summaryCache as { notice: string | null }).notice,
-      null,
-    );
     assert.equal(
       (result.details.summaryCache as { fallbackReason: string })
         .fallbackReason,
-      "no-live-tools",
+      "stale-capture",
     );
+  });
+
+  it("numbers {first} from the context-edited projection, not the raw entry walk", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    // A failed attempt BEFORE the anchor, omitted by pi / the fallback
+    // provider via a null-replacement context_edit. The raw entry walk
+    // counts it as background and would report `{first}=4`; the projection
+    // the model sees drops it, so the branch start stays message 3.
+    const failedId = sm.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-completions",
+      provider: "opencode-go",
+      model: "deepseek-v4.1-flash",
+      stopReason: "error",
+      timestamp: Date.now(),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+    sm.appendContextEdit(failedId, null);
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    const provider = capturingProvider();
+    installLiveStream(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve the latest instruction and what remains.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (result.details.summaryCache as { mode: string }).mode,
+      "live-prefix",
+    );
+
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { messages: [] }, { maxTokens: 2048 });
+    const messages = provider.calls[0].context.messages as Array<{
+      role: string;
+      content: Array<{ text?: string }>;
+    }>;
+    const trailer = messages[messages.length - 1];
+    assert.match(
+      trailer.content[0].text ?? "",
+      /Summarize only messages 3 onwards/,
+      "an omitted background message must not inflate the branch start",
+    );
+  });
+
+  it("numbers {first} past provider-invisible empty assistants (aborted attempt)", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    // A persisted assistant with no text/thinking/toolCall blocks is dropped
+    // by the provider serializer (openai-completions: "no content and no
+    // tool calls"; anthropic-messages: zero blocks). It survives in both the
+    // capture and the projection (so `capture-diverged` passes) but must not
+    // consume a `{first}` number.
+    sm.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "aborted",
+      timestamp: Date.now(),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    const provider = capturingProvider();
+    installLiveStream(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve the latest instruction and what remains.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (result.details.summaryCache as { mode: string }).mode,
+      "live-prefix",
+    );
+
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { messages: [] }, { maxTokens: 2048 });
+    const messages = provider.calls[0].context.messages as Array<{
+      role: string;
+      content: Array<{ text?: string }>;
+    }>;
+    const trailer = messages[messages.length - 1];
+    assert.match(
+      trailer.content[0].text ?? "",
+      /Summarize only messages 3 onwards/,
+      "a provider-invisible empty assistant must not inflate the branch start",
+    );
+  });
+
+  it("falls back with capture-diverged when the transformed list differs from the projection", async () => {
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    setupRewindable(sm, pi);
+    // Another extension or host rewrite splices a message into the
+    // transformed list: the capture no longer matches the projection at the
+    // capture leaf, so `{first}` cannot be trusted and the replay must not
+    // run.
+    await captureLive(sm, pi, [], (messages) => [
+      ...messages,
+      {
+        role: "user",
+        content: [{ type: "text", text: "injected by another handler" }],
+        timestamp: Date.now(),
+      },
+    ]);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "capture-diverged");
   });
 
   it("kill switch PI_NAVIGATE_TREE_SUMMARY_CACHE=0 bypasses the cache path", async () => {
@@ -5169,7 +5374,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     const { spy } = capturingSummarize(undefined);
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     setupRewindable(sm, pi, { capture: true });
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5195,7 +5400,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(cache.notice, null);
   });
 
-  it("falls back with no-provider-stream when the registry has no streamSimple", async () => {
+  it("falls back with no-live-stream when the registry has no streamSimple", async () => {
     const { spy } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({ summarize: spy });
     setupRewindable(sm, pi, { capture: true });
@@ -5214,10 +5419,14 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     );
     assert.equal(result.isError, undefined);
     assertNoCacheNoticeInContent(result.content[0].text);
-    assert.equal(
-      (result.details.summaryCache as { notice: string | null }).notice,
-      null,
-    );
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string;
+      notice: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "no-live-stream");
+    assert.equal(cache.notice, null);
   });
 
   it("stores the fork's miss notice when the summary misses a 20k baseline", async () => {
@@ -5227,7 +5436,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     if (!fake) throw new Error("capture: true must return fake");
     fake.settingsManager = { getShowCacheMissNotices: () => true };
     appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5281,7 +5490,9 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     if (!fake) throw new Error("capture: true must return fake");
     fake.settingsManager = { getShowCacheMissNotices: () => true };
     appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    installProvider(ctx, capturingProvider().streamSimple);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5301,7 +5512,6 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     const cache = result.details.summaryCache as {
       hit: boolean;
       fallbackReason: string | null;
-      branchStartRetained: boolean;
       cacheRead: number;
       notice: string | null;
     };
@@ -5309,9 +5519,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(cache.cacheRead, 20_000);
     assert.equal(cache.notice, null);
     // Non-crossing regression: no compaction in the segment, so the request
-    // stays live-prefix with no fallback and a retained branch start.
+    // stays live-prefix with no fallback.
     assert.equal(cache.fallbackReason, null);
-    assert.equal(cache.branchStartRetained, true);
   });
 
   it("falls back with branch-crosses-compaction when the segment crosses the compaction cut", async () => {
@@ -5327,10 +5536,8 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     appendTurn(sm, "u3", "a3", 18_000);
     appendTurn(sm, "u4", "a4", 24_000);
 
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
     const provider = capturingProvider();
-    installProvider(ctx, provider.streamSimple);
+    installLiveStream(ctx, provider.streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5365,9 +5572,9 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
         c: unknown,
         o: unknown,
       ) => Promise<unknown>
-    )({}, { systemPrompt: "COLD", messages: [] }, { maxTokens: 2048 });
+    )({}, { messages: ["COLD"] }, { maxTokens: 2048 });
     assert.equal(provider.calls.length, 1);
-    assert.equal(provider.calls[0].context.systemPrompt, "COLD");
+    assert.deepEqual(provider.calls[0].context.messages, ["COLD"]);
   });
 
   it("keeps live-prefix when the segment contains a compaction but the target is after firstKeptEntryId", async () => {
@@ -5384,9 +5591,9 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     appendTurn(sm, "u4", "a4", 24_000);
     appendTurn(sm, "u5", "a5", 30_000);
 
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
-    installProvider(ctx, capturingProvider().streamSimple);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5404,11 +5611,9 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string | null;
-      branchStartRetained: boolean;
     };
     assert.equal(cache.mode, "live-prefix");
     assert.equal(cache.fallbackReason, null);
-    assert.equal(cache.branchStartRetained, true);
   });
 
   it("keeps live-prefix when the target is exactly the compaction entry", async () => {
@@ -5423,9 +5628,9 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     appendTurn(sm, "u3", "a3", 18_000);
     appendTurn(sm, "u4", "a4", 24_000);
 
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
-    installProvider(ctx, capturingProvider().streamSimple);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5448,7 +5653,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     assert.equal(cache.fallbackReason, null);
   });
 
-  it("falls back with branch-start-not-retained when the newest message alone exceeds the budget", async () => {
+  it("falls back with overflow when the capture cannot fit the window", async () => {
     const { spy } = capturingSummarize();
     const { sm, pi, tool, ctx } = setup({
       summarize: spy,
@@ -5456,19 +5661,18 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     });
     const a1 = appendTurn(sm, "u1", "a1", 6_000);
     pi.pi.setLabel(a1.assistantId, "anchor:start");
-    // The newest entry alone (~10k tokens) exceeds the 20_000 - 16384 =
-    // 3616-token budget, so the newest→oldest walk breaks before adding any
-    // branch evidence.
+    // The captured payload alone (~15k estimated tokens) exceeds the
+    // 20_000 - 16384 = 3616-token budget, and no truncation is allowed (it
+    // would break prefix parity), so the rewind hands off to the cold path.
     appendTurn(
       sm,
       `u2 ${"x".repeat(20_000)}`,
       `a2 ${"y".repeat(40_000)}`,
       30_000,
     );
-
-    const fake = makeFakeSession(sm);
-    __testHooks.captureSession(fake as unknown as AgentSession);
-    installProvider(ctx, capturingProvider().streamSimple);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5487,12 +5691,10 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     const cache = result.details.summaryCache as {
       mode: string;
       fallbackReason: string;
-      branchStartRetained: boolean;
       notice: string | null;
     };
     assert.equal(cache.mode, "fallback");
-    assert.equal(cache.fallbackReason, "branch-start-not-retained");
-    assert.equal(cache.branchStartRetained, false);
+    assert.equal(cache.fallbackReason, "overflow");
     assert.equal(cache.notice, null);
   });
 
@@ -5508,7 +5710,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       },
     };
     appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5539,7 +5741,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     if (!fake) throw new Error("capture: true must return fake");
     // Default fake session: getShowCacheMissNotices() === false.
     appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5582,7 +5784,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       cacheWrite: 0,
       cost: { input: 0, cacheRead: 0, cacheWrite: 0 },
     });
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5616,7 +5818,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       provider: "openai",
       model: "gpt-5",
     });
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5654,7 +5856,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     appendUsageTurn(sm, CACHE_BASELINE_USAGE, {
       timestamp: Date.now() - (5 * 60 * 1000 + 60_000),
     });
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
@@ -5689,7 +5891,7 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     if (!fake) throw new Error("capture: true must return fake");
     fake.settingsManager = { getShowCacheMissNotices: () => true };
     appendUsageTurn(sm, CACHE_BASELINE_USAGE);
-    installProvider(ctx, capturingProvider().streamSimple);
+    installLiveStream(ctx, capturingProvider().streamSimple);
 
     const result = await tool.execute(
       "tc-rewind",
