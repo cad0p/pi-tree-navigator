@@ -235,7 +235,8 @@ try {
   // session. It must be a plain writable instance field: a `#`-private field
   // or a getter-only prototype accessor would make the wrapper assignment a
   // silent no-op / throw, every capture would be missing, and every rewind
-  // would fall back with `no-capture`.
+  // would fall back with `no-capture`. Check both the constructor source and
+  // a real instance write (the assignment the extension performs).
   const transformAssign =
     /this\.transformContext\s*=\s*runtimeOptions\.transformContext/.test(
       agentSrc,
@@ -244,15 +245,38 @@ try {
     Agent?.prototype ?? {},
     "transformContext",
   );
+  let transformRuntimeWrite = { ok: false, detail: "not run" };
+  try {
+    const agent = new Agent({
+      initialState: {
+        systemPrompt: "",
+        model: undefined,
+        thinkingLevel: "off",
+        tools: [],
+        messages: [],
+      },
+      streamFn: () => ({}),
+    });
+    agent.transformContext = async (messages) => messages;
+    transformRuntimeWrite = {
+      ok: typeof agent.transformContext === "function",
+      detail:
+        typeof agent.transformContext === "function"
+          ? "instance write accepted"
+          : "instance write did not stick",
+    };
+  } catch (e) {
+    transformRuntimeWrite = {
+      ok: false,
+      detail: `instance write threw: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
   check(
     "Agent.transformContext plain writable field (#75 capture seam)",
     transformAssign &&
+      transformRuntimeWrite.ok &&
       !(transformDesc?.get && transformDesc?.set === undefined),
-    transformAssign
-      ? transformDesc?.get
-        ? `prototype accessor present (get=${!!transformDesc.get}, set=${!!transformDesc.set})`
-        : "plain this.transformContext = runtimeOptions.transformContext"
-      : "constructor assignment MISSING",
+    `${transformAssign ? "source assignment found" : "constructor assignment MISSING"}; ${transformRuntimeWrite.detail}`,
   );
 
   // --- 8. SettingsManager.getShowCacheMissNotices (TUI cache-notice gate) ---

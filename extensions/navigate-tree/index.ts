@@ -270,7 +270,9 @@ const liveCaptures = new Map<string, LiveCapture>();
  * wrapping `agent.transformContext` (a public Agent field) once per session.
  * The wrapper delegates to the host's own transform, stores the result, and
  * returns it unchanged — it can never alter the live request. Replace, never
- * stack: the original is stashed under `ORIG_TRANSFORM_KEY`.
+ * stack: the original is stashed under `ORIG_TRANSFORM_KEY` the first time,
+ * presence-checked with `hasOwnProperty` so an absent host transform (stashed
+ * as `undefined`) is not re-wrapped on `/reload`.
  */
 function installLiveCaptureWrapper(session: AgentSession): void {
   try {
@@ -283,7 +285,7 @@ function installLiveCaptureWrapper(session: AgentSession): void {
         })
       | undefined;
     if (!agent) return;
-    if (!agent[ORIG_TRANSFORM_KEY]) {
+    if (!Object.hasOwn(agent, ORIG_TRANSFORM_KEY)) {
       agent[ORIG_TRANSFORM_KEY] = agent.transformContext;
     }
     const orig = agent[ORIG_TRANSFORM_KEY] as
@@ -488,6 +490,15 @@ function withSessionHeaders(
  * model actually sees). The entry walk remains only as a defensive fallback
  * for structural test doubles.
  *
+ * The result is CONVERSATION-ONLY: the `context` event contract is "transform
+ * conversation messages without prompt and tool system messages; Pi restores
+ * that state afterward" (pi docs, `context` section), and `runner.emitContext`
+ * hands handlers `currentMessages.filter(role !== "system")` and re-attaches
+ * the current head via `restoreSystemMessages`. Returning the projection's
+ * system entries would make that re-attach prepend the head to a list still
+ * carrying the persisted system entry — a duplicated head on runs where
+ * `forceSystemPrompt` is unset.
+ *
  * We always replace (no leaf-gating): every `appendMessage` advances the
  * session leaf, so a "leaf changed since last turn" heuristic would fire on
  * essentially every call anyway — and always-replace is byte-for-byte the
@@ -502,17 +513,56 @@ export function buildContextMessages(sm: {
   buildContextEntries(): SessionEntry[];
   buildSessionProjection?(): { messages: AgentMessage[] };
 }): ReturnType<typeof sessionEntryToContextMessages> {
+  let messages: AgentMessage[] | undefined;
   try {
     if (typeof sm.buildSessionProjection === "function") {
-      return sm.buildSessionProjection().messages;
+      messages = sm.buildSessionProjection().messages;
     }
   } catch {
     // Fall through to the raw entry projection — pi rewrites the context
     // handlers' output at the wire boundary anyway.
   }
-  return sm
+  messages ??= sm
     .buildContextEntries()
     .flatMap((entry) => sessionEntryToContextMessages(entry));
+  return messages.filter((message) => message.role !== "system");
+}
+
+/**
+ * True when the provider's serializer will actually send this message.
+ * pi-ai's adapters skip assistant messages that carry no text, thinking, or
+ * tool-call blocks (openai-completions: "Skip assistant messages that have no
+ * content and no tool calls"; anthropic-messages drops zero-block messages),
+ * so such an entry must not consume a `{first}` number. Non-assistant
+ * messages and unknown block types pass (conservative: never under-count a
+ * message the model might see).
+ */
+function isProviderVisibleMessage(message: AgentMessage): boolean {
+  if (message.role !== "assistant") return true;
+  const content: unknown = message.content;
+  if (typeof content === "string") return content.trim().length > 0;
+  if (!Array.isArray(content)) return true;
+  for (const block of content as unknown[]) {
+    if (typeof block !== "object" || block === null) continue;
+    const record = block as { [key: string]: unknown };
+    const type = record.type;
+    if (type === "text") {
+      const text = record.text;
+      if (typeof text === "string" && text.trim().length > 0) return true;
+    } else if (type === "thinking") {
+      const thinking = record.thinking;
+      const signature = record.thinkingSignature;
+      const hasThinking =
+        typeof thinking === "string" && thinking.trim().length > 0;
+      const hasSignature =
+        typeof signature === "string" && signature.trim().length > 0;
+      if (hasThinking || hasSignature || record.redacted === true) return true;
+    } else if (type !== undefined) {
+      // Includes `toolCall` and any future block type: assume it serializes.
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -523,7 +573,9 @@ export function buildContextMessages(sm: {
  *
  * System messages are excluded because the instruction numbering explicitly
  * excludes the system prompt (and any tool-delta system messages replayed
- * into the head). Quantity is taken from the PROJECted entries
+ * into the head). Provider-invisible empty assistants are excluded too (see
+ * `isProviderVisibleMessage`) so an aborted, non-`context_edit`ed attempt
+ * cannot inflate `{first}`. Quantity is taken from the PROJECted entries
  * (`buildSessionProjection()`), so a compaction cut before `target` is
  * counted the way the captured payload presents it AND messages omitted by
  * `context_edit` (pi's overflow recovery, the fallback provider's
@@ -539,7 +591,9 @@ function countBackgroundMessages(
   let count = 0;
   for (const entry of projectedEntries) {
     for (const message of convertToLlm(entry.messages)) {
-      if (message.role !== "system") count++;
+      if (message.role !== "system" && isProviderVisibleMessage(message)) {
+        count++;
+      }
     }
     if (entry.sourceEntry.id === target) break;
   }
@@ -1581,16 +1635,22 @@ Operations (set \`action\`):
             // length: the transformed live list was changed by another
             // extension or a host rewrite, and a guessed `{first}` could
             // scope the summary wrong.
-            const captureProjection = buildSessionProjection(
-              allEntries,
-              capture.leafId,
-              byId,
-            );
+            const captureProjection = (() => {
+              try {
+                return buildSessionProjection(allEntries, capture.leafId, byId);
+              } catch {
+                // A malformed projection cannot be trusted for `{first}`;
+                // fall back cold rather than numbering the branch wrong.
+                return null;
+              }
+            })();
             const nonSystem = (messages: AgentMessage[]): number =>
               convertToLlm(messages).filter((m) => m.role !== "system").length;
             const captureVisible = nonSystem(capture.messages);
-            const projectedVisible = nonSystem(captureProjection.messages);
-            if (captureVisible !== projectedVisible) {
+            const projectedVisible = captureProjection
+              ? nonSystem(captureProjection.messages)
+              : -1;
+            if (!captureProjection || captureVisible !== projectedVisible) {
               summaryCacheFallbackReason = "capture-diverged";
             } else {
               const first =

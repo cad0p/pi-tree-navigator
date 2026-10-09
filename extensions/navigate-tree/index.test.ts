@@ -177,11 +177,9 @@ interface FakeCtx {
 }
 
 /**
- * The single system-prompt value both fixtures expose by default. The cache
- * path only takes the forced-head projection when `ctx.getSystemPrompt()`
- * differs from `agent.state.systemPrompt`; keeping them equal here holds the
- * legacy rewind tests on the legacy (no-projection) path. Tests that pin the
- * pi-1.0.0 projection override one side explicitly.
+ * Marker content for the head the fake `transformContext` chain installs.
+ * The cache path captures the FINAL transformed list instead of mirroring
+ * prompt fields, so tests only use this value as the captured head's marker.
  */
 const LIVE_SYSTEM_PROMPT = "LIVE SYSTEM PROMPT";
 
@@ -459,7 +457,32 @@ describe("context event handler", () => {
     appendTurn(sm, "u1", "a1", 100);
     appendTurn(sm, "u2", "a2", 200);
     const projected = __testHooks.buildContextMessages(sm);
-    assert.deepEqual(projected, sm.buildSessionContext().messages);
+    assert.deepEqual(
+      projected,
+      sm
+        .buildSessionContext()
+        .messages.filter((message) => message.role !== "system"),
+    );
+  });
+
+  it("buildContextMessages is conversation-only (Pi re-attaches the head)", () => {
+    // `context` handlers transform conversation messages only; the runner
+    // filters system state out before the handler and re-attaches the current
+    // head afterwards. Returning a projection that still carries the
+    // persisted system entry would duplicate the head whenever
+    // `forceSystemPrompt` is unset.
+    const { sm } = setup();
+    sm.appendMessage({ role: "system", content: "PERSISTED HEAD" } as never);
+    appendTurn(sm, "u1", "a1", 100);
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.ok(
+      projected.every((message) => message.role !== "system"),
+      "the context payload must not carry system messages",
+    );
+    assert.ok(
+      sm.buildSessionContext().messages.some((m) => m.role === "system"),
+      "the raw session context still contains the persisted system entry",
+    );
   });
 
   it("buildContextMessages applies context_edit omissions (projection beats raw entries)", () => {
@@ -5231,6 +5254,77 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
       trailer.content[0].text ?? "",
       /Summarize only messages 3 onwards/,
       "an omitted background message must not inflate the branch start",
+    );
+  });
+
+  it("numbers {first} past provider-invisible empty assistants (aborted attempt)", async () => {
+    const { spy, captured } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    // A persisted assistant with no text/thinking/toolCall blocks is dropped
+    // by the provider serializer (openai-completions: "no content and no
+    // tool calls"; anthropic-messages: zero blocks). It survives in both the
+    // capture and the projection (so `capture-diverged` passes) but must not
+    // consume a `{first}` number.
+    sm.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      stopReason: "aborted",
+      timestamp: Date.now(),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    } as never);
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    const provider = capturingProvider();
+    installLiveStream(ctx, provider.streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve the latest instruction and what remains.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      (result.details.summaryCache as { mode: string }).mode,
+      "live-prefix",
+    );
+
+    assert.equal(typeof captured.streamFn, "function");
+    await (
+      captured.streamFn as (
+        m: unknown,
+        c: unknown,
+        o: unknown,
+      ) => Promise<unknown>
+    )({}, { messages: [] }, { maxTokens: 2048 });
+    const messages = provider.calls[0].context.messages as Array<{
+      role: string;
+      content: Array<{ text?: string }>;
+    }>;
+    const trailer = messages[messages.length - 1];
+    assert.match(
+      trailer.content[0].text ?? "",
+      /Summarize only messages 3 onwards/,
+      "a provider-invisible empty assistant must not inflate the branch start",
     );
   });
 
