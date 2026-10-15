@@ -2456,6 +2456,57 @@ describe("rewind phase 2: completion", () => {
     assert.equal(boundary.entries[1].details.status, "done");
   });
 
+  it("drops earlier context_edit / compaction drafts the rewind made stale, keeps the rest", async () => {
+    // pi validates the whole boundary list in a preview and drops ALL of it
+    // when one draft fails; a draft targeting an entry the rewind abandoned
+    // would take the continuation down with it.
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    const anchorId = f.sm
+      .getBranch()
+      .find((e) => f.sm.getLabel(e.id) === "anchor:start")?.id;
+    assert.ok(anchorId);
+    await requestRewind(f);
+    const message = assistantMessage(
+      [{ type: "text", text: SUMMARY_TEXT }],
+      "stop",
+      100,
+    );
+    const summaryTurnId = f.sm.appendMessage(message as never);
+    const staleEdit = {
+      type: "context_edit",
+      targetId: summaryTurnId,
+      replacement: { content: "x" },
+    };
+    const staleCompaction = {
+      type: "compaction",
+      summary: "s",
+      firstKeptEntryId: summaryTurnId,
+    };
+    const liveEdit = {
+      type: "context_edit",
+      targetId: anchorId,
+      replacement: { content: "y" },
+    };
+    const foreign = {
+      type: "custom_message",
+      customType: "other-extension",
+      content: "kept",
+      display: true,
+      details: {},
+    };
+    const boundary = await fireTurnEndAll(f.pi, f.ctx, message, {
+      entries: [staleEdit, staleCompaction, liveEdit, foreign] as never,
+    });
+    assert.equal(boundary.continue, true);
+    assert.deepEqual(
+      boundary.entries.slice(0, -1),
+      [liveEdit, foreign],
+      "stale drafts dropped, valid ones kept in order",
+    );
+    assert.equal(boundary.entries.at(-1)?.customType, REWIND_CUSTOM_TYPE);
+  });
+
   it("returns nothing on turns without a pending rewind", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi);

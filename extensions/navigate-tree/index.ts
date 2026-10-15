@@ -559,6 +559,32 @@ function findLabelHint(
 // Extension
 // =============================================================================
 
+/**
+ * Earlier handlers' boundary drafts that still apply after a rewind moved the
+ * branch. A `context_edit` / `compaction` draft can target an entry the
+ * rewind just abandoned; pi validates the whole list in a preview and drops
+ * ALL of it (ours included) when one draft fails, so such drafts are dropped
+ * here instead. Drafts without an entry target pass through.
+ */
+function keepValidDrafts<T>(sm: SessionManager, drafts: readonly T[]): T[] {
+  let onBranch: Set<string>;
+  try {
+    onBranch = new Set(sm.getBranch().map((e) => e.id));
+  } catch {
+    return [...drafts];
+  }
+  return drafts.filter((draft) => {
+    const d = draft as {
+      type?: string;
+      targetId?: string;
+      firstKeptEntryId?: string;
+    };
+    if (d?.type === "context_edit") return onBranch.has(d.targetId ?? "");
+    if (d?.type === "compaction") return onBranch.has(d.firstKeptEntryId ?? "");
+    return true;
+  });
+}
+
 /** A `navigate-tree-rewind` message, delivered as a `turn_end` boundary entry. */
 interface RewindMessageDraft {
   type: "custom_message";
@@ -965,7 +991,7 @@ export default function (pi: ExtensionAPI) {
     // real turn in the same run, ahead of anything the user typed meanwhile.
     // Other handlers' entries are kept (pi replaces the list per handler).
     const deliver = (draft: RewindMessageDraft) => ({
-      entries: [...(event.entries ?? []), draft],
+      entries: [...keepValidDrafts(sm, event.entries ?? []), draft],
       continue: true,
     });
     const message = event.message as {
