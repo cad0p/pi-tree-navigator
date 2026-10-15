@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [calver-released]
 
 <!-- USER-EDITABLE SECTION START -->
-<!-- Add your curated release notes here. -->
+- **In-band rewind summaries** ([#80](https://github.com/cad0p/pi-tree-navigator/issues/80)): the live model writes the summary as its next turn, so it comes from the prompt cache on every provider, pi-claude-bridge included. This replaces 0.2.0's separate summary request, and the tree moves once the summary turn ends. After a rewind, `session_tree` is emitted so history-mirroring providers rebuild from the rewound chain ([#79](https://github.com/cad0p/pi-tree-navigator/issues/79)).
+- **Rewind hint** ([#44](https://github.com/cad0p/pi-tree-navigator/issues/44), [#84](https://github.com/cad0p/pi-tree-navigator/issues/84)): an opt-in nudge to persist work and rewind once `rewindHintReserveTokens` tokens are left in the window. The reserve is an absolute budget, like pi's `compaction.reserveTokens`, so it means the same on a 100k and a 1M window. The nudge names every active anchor with its context %. It stays off unless configured.
+- **Per-model reserve** ([#86](https://github.com/cad0p/pi-tree-navigator/issues/86)): `modelOverrides["<provider>/<modelId>"].rewindHintReserveTokens`, keyed like pi's `compaction.modelOverrides`. An entry can set `"off"` to disable the hint for that model only.
+- **Automatic `anchor:start`** ([#55](https://github.com/cad0p/pi-tree-navigator/issues/55)): every session leg gets a low-floor fallback rewind target (`anchorStartAfterTurns`, default 2).
+- **Breaking:** the rewind params `labelStart`/`labelEnd` are now `rewindTo`/`newLabel` ([#43](https://github.com/cad0p/pi-tree-navigator/issues/43)). The prerelease-only `rewindHintAtPercent` key from `@next` builds is ignored with a warning; migrate to `rewindHintReserveTokens` (e.g. `"90"` on a 1M window → `100000`).
+- **pi 1.x compatibility** ([#61](https://github.com/cad0p/pi-tree-navigator/issues/61), [#65](https://github.com/cad0p/pi-tree-navigator/issues/65), [#25](https://github.com/cad0p/pi-tree-navigator/issues/25)).
 <!-- USER-EDITABLE SECTION END -->
 
 ### 🚀 Features
