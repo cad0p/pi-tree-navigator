@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* Context-pressure rewind hint (config-gated, default off) (closes #44) (closes #42)
 - *(anchor)* Automatic low-floor anchor:start (closes #55)
 - *(rewind)* In-band summary + session_tree emit (closes #79, closes #80, closes #28)
+- *(hint)* Absolute rewindHintReserveTokens + name the anchors in the hint (closes #84)
 
 ### 🐛 Bug Fixes
 
