@@ -5475,44 +5475,6 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
     }
   });
 
-  it("switching between reserves inside one crossing never fires twice", async () => {
-    const { fixture, pi, ctx } = await overrideSetup({
-      rewindHintReserveTokens: 40_000,
-      modelOverrides: { [SONNET]: { rewindHintReserveTokens: 50_000 } },
-    });
-    const other = { api: "openai", provider: "x", id: "other" };
-    const sonnet = ctx.model;
-    try {
-      // Fires on the 50k entry at 50k left.
-      ctx.setContextUsage(usageAt(95));
-      fireTurnEnd(pi, ctx);
-      assert.equal(pi.sendMessageCalls.length, 1);
-      // 45k left on the 40k-base model: above its reserve, but still inside
-      // the 50k crossing that fired, so no re-arm.
-      ctx.model = other;
-      ctx.setContextUsage(usageAt(95.5));
-      fireTurnEnd(pi, ctx);
-      ctx.model = sonnet;
-      ctx.setContextUsage(usageAt(96));
-      fireTurnEnd(pi, ctx);
-      assert.equal(pi.sendMessageCalls.length, 1);
-      // A crossing spent under 40k does not re-fire when the 50k entry
-      // becomes active with 45k left.
-      ctx.setContextUsage(usageAt(10));
-      fireTurnEnd(pi, ctx);
-      ctx.model = other;
-      ctx.setContextUsage(usageAt(96));
-      fireTurnEnd(pi, ctx);
-      assert.equal(pi.sendMessageCalls.length, 2);
-      ctx.model = sonnet;
-      ctx.setContextUsage(usageAt(95.5));
-      fireTurnEnd(pi, ctx);
-      assert.equal(pi.sendMessageCalls.length, 2);
-    } finally {
-      cleanupConfigFixture(fixture);
-    }
-  });
-
   it("a model without a string provider and id uses the base reserve", async () => {
     const { fixture, pi, ctx } = await overrideSetup({
       rewindHintReserveTokens: 100_000,

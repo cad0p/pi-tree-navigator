@@ -45,30 +45,11 @@ describe("RewindHintTracker", () => {
     assert.equal(tracker.observe(18_000, 20_000), false);
   });
 
-  it("re-arms only above both the fired and the current reserve (#86)", () => {
-    const t = new RewindHintTracker();
-    assert.equal(t.observe(50_000, 50_000), true);
-    // Above the new 40k reserve, inside the fired 50k one: still spent.
-    assert.equal(t.observe(45_000, 40_000), false);
-    assert.equal(t.isSpent(), true);
-    assert.equal(t.observe(40_000, 50_000), false);
-    // Above both: re-arms.
-    assert.equal(t.observe(50_001, 40_000), false);
-    assert.equal(t.isSpent(), false);
-    // Fired under 40k; a 50k reserve with 45k left does not re-fire.
-    assert.equal(t.observe(40_000, 40_000), true);
-    assert.equal(t.observe(45_000, 50_000), false);
-    assert.equal(t.isSpent(), true);
-  });
-
-  it("a null reserve never fires but re-arms above the fired reserve", () => {
+  it("a null reserve never fires and re-arms (#86)", () => {
     const t = new RewindHintTracker();
     assert.equal(t.observe(1_000, null), false);
-    assert.equal(t.isSpent(), false);
     assert.equal(t.observe(50_000, 50_000), true);
-    assert.equal(t.observe(50_000, null), false);
-    assert.equal(t.isSpent(), true);
-    assert.equal(t.observe(50_001, null), false);
+    assert.equal(t.observe(1_000, null), false);
     assert.equal(t.isSpent(), false);
   });
 

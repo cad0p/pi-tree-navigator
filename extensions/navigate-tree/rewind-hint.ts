@@ -3,7 +3,7 @@
  *
  * Pure state + copy builders. `RewindHintTracker` fires exactly once per
  * reserve crossing and re-arms only when the tokens left climb back above
- * the reserve (a rewind or compaction; see the class for reserve changes). The builders render the two
+ * the reserve (a rewind or compaction). The builders render the two
  * user-visible strings (agent hint + TUI-only no-anchor warning).
  *
  * No pi runtime imports — the tracker and builders take plain values; the
@@ -17,26 +17,21 @@ export const REWIND_HINT_CUSTOM_TYPE = "navigate-tree-rewind-hint";
 
 /**
  * One-shot crossing tracker. `observe` returns true exactly on a fresh
- * crossing (`tokensLeft <= reserve` while unspent). A spent tracker
- * re-arms only once the tokens left exceed both the reserve it fired under
- * and the current one, so a per-model reserve change (#86) never turns one
- * crossing into two. A `null` reserve (hint off for the active model)
- * never fires but can still re-arm.
+ * crossing (`tokensLeft <= reserve` while unspent); an observation with
+ * more than `reserve` tokens left re-arms, and a spent tracker stays silent
+ * while still inside the reserve. A `null` reserve (hint off for the
+ * active model, #86) never fires, and always re-arms.
  */
 export class RewindHintTracker {
   private spent = false;
-  private spentReserve = 0;
 
   observe(tokensLeft: number, reserve: number | null): boolean {
-    if (this.spent) {
-      if (tokensLeft <= Math.max(this.spentReserve, reserve ?? 0)) {
-        return false;
-      }
+    if (reserve === null || tokensLeft > reserve) {
       this.spent = false;
+      return false;
     }
-    if (reserve === null || tokensLeft > reserve) return false;
+    if (this.spent) return false;
     this.spent = true;
-    this.spentReserve = reserve;
     return true;
   }
 
