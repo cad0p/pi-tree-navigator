@@ -559,6 +559,28 @@ function findLabelHint(
 // Extension
 // =============================================================================
 
+/** A `navigate-tree-rewind` message, delivered as a `turn_end` boundary entry. */
+interface RewindMessageDraft {
+  type: "custom_message";
+  customType: string;
+  content: string;
+  display: boolean;
+  details: Record<string, unknown>;
+}
+
+function rewindMessageDraft(
+  content: string,
+  details: Record<string, unknown>,
+): RewindMessageDraft {
+  return {
+    type: "custom_message",
+    customType: REWIND_CUSTOM_TYPE,
+    content,
+    display: true,
+    details,
+  };
+}
+
 /** A rewind waiting for its in-band summary turn (#80). */
 interface PendingRewind {
   /** The rewind tool call; its own turn is not the summary turn. */
@@ -626,7 +648,8 @@ function rewindStaleReason(
  * assistant that issued the rewind) from outside the conversation's own
  * turns: user messages (steers drained at the rewind turn's boundary) and
  * other extensions' custom messages (subagent results, timers). Oldest
- * first; this extension's own rewind messages are excluded.
+ * first; this extension's own rewind and rewind-hint messages are excluded
+ * (a pre-rewind "context is running low" hint is stale once it lands).
  */
 type LateEntry =
   | {
@@ -659,7 +682,8 @@ function collectLateEntries(
       late.push({ kind: "user", message: entry.message });
     } else if (
       entry.type === "custom_message" &&
-      entry.customType !== REWIND_CUSTOM_TYPE
+      entry.customType !== REWIND_CUSTOM_TYPE &&
+      entry.customType !== REWIND_HINT_CUSTOM_TYPE
     ) {
       late.push({
         kind: "custom",
@@ -733,49 +757,27 @@ export default function (pi: ExtensionAPI) {
   // tool call, completed (or cancelled) by the summary turn's `turn_end`.
   const pendingRewinds = new Map<string, PendingRewind>();
 
-  // Deliver a rewind message to the model. `triggerTurn` steers the running
-  // loop (a text-only summary turn would otherwise end the run, and the
-  // rewound context must reach a real turn without a user prompt); when idle
-  // it starts the continuation run. The direct append is the stale-runtime
-  // fallback: the `context` handler still carries it to the next LLM call.
-  function sendRewindMessage(
-    sm: SessionManager,
-    content: string,
-    details: Record<string, unknown>,
-  ): void {
-    try {
-      pi.sendMessage(
-        { customType: REWIND_CUSTOM_TYPE, content, display: true, details },
-        { triggerTurn: true },
-      );
-    } catch {
-      try {
-        (sm as Partial<SessionManager>).appendCustomMessageEntry?.(
-          REWIND_CUSTOM_TYPE,
-          content,
-          true,
-          details,
-        );
-      } catch {
-        // Fail-open: never throw into the agent loop.
-      }
-    }
-  }
+  // Turns the rewind handler owned (the rewind call's turn, summary
+  // attempts, the completing turn): the hint handler skips them, so a stale
+  // "context is running low" hint never lands on a rewind in progress.
+  const rewindTurns = new WeakSet<object>();
 
   function cancelRewind(
-    sm: SessionManager,
     sessionId: string,
     pending: PendingRewind,
     reason: string,
-  ): void {
+  ): RewindMessageDraft {
     pendingRewinds.delete(sessionId);
-    sendRewindMessage(sm, buildRewindCancelledText(pending.rewindTo, reason), {
-      status: "cancelled",
-      rewindTo: pending.rewindTo,
-      newLabel: pending.newLabel,
-      reason,
-      summaryAttempts: pending.attempts,
-    });
+    return rewindMessageDraft(
+      buildRewindCancelledText(pending.rewindTo, reason),
+      {
+        status: "cancelled",
+        rewindTo: pending.rewindTo,
+        newLabel: pending.newLabel,
+        reason,
+        summaryAttempts: pending.attempts,
+      },
+    );
   }
 
   // Phase 2 of an in-band rewind (#80): branch from the anchor with the
@@ -788,34 +790,29 @@ export default function (pi: ExtensionAPI) {
     sessionId: string,
     pending: PendingRewind,
     summaryText: string,
-  ): Promise<void> {
+  ): Promise<RewindMessageDraft> {
     // A compaction or tree move during the summary turn invalidates the
     // rewind: the anchor must still be the same labeled entry on the active
     // branch, and the new label must still be free.
     if (
       findLabeledEntry(sm, LABEL_PREFIX + pending.rewindTo) !== pending.target
     ) {
-      cancelRewind(
-        sm,
+      return cancelRewind(
         sessionId,
         pending,
         `'${pending.rewindTo}' is no longer on the active branch`,
       );
-      return;
     }
     if (findLabeledEntry(sm, LABEL_PREFIX + pending.newLabel)) {
-      cancelRewind(
-        sm,
+      return cancelRewind(
         sessionId,
         pending,
         `a label '${pending.newLabel}' now exists on the active branch`,
       );
-      return;
     }
     const staleReason = rewindStaleReason(sm, pending.rewindEntryId);
     if (staleReason) {
-      cancelRewind(sm, sessionId, pending, staleReason);
-      return;
+      return cancelRewind(sessionId, pending, staleReason);
     }
     const oldLeafId = sm.getLeafId();
     // Input that arrived after the rewind call (user steers drained at the
@@ -851,13 +848,11 @@ export default function (pi: ExtensionAPI) {
     } catch (err) {
       // Nothing branched: tell the model, or a text-only summary turn would
       // end the run with no word of the failed rewind.
-      cancelRewind(
-        sm,
+      return cancelRewind(
         sessionId,
         pending,
         `the branch could not be written (${err instanceof Error ? err.message : String(err)})`,
       );
-      return;
     }
     pendingRewinds.delete(sessionId);
     const fullLabel = LABEL_PREFIX + pending.newLabel;
@@ -910,8 +905,7 @@ export default function (pi: ExtensionAPI) {
       oldLeafId,
       summaryId,
     );
-    sendRewindMessage(
-      sm,
+    return rewindMessageDraft(
       buildRewindDoneText(pending, afterTokens) +
         (reappended > 0 ? `\n\n${buildLateEntriesNote(reappended)}` : "") +
         (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
@@ -962,6 +956,18 @@ export default function (pi: ExtensionAPI) {
     }
     const pending = pendingRewinds.get(sessionId);
     if (!pending) return;
+    if (event.message && typeof event.message === "object") {
+      rewindTurns.add(event.message);
+    }
+    // Rewind messages are returned as boundary entries: pi commits them right
+    // after this handler, BEFORE it drains queued steers, and `continue`
+    // guarantees one more provider request — so the continuation reaches a
+    // real turn in the same run, ahead of anything the user typed meanwhile.
+    // Other handlers' entries are kept (pi replaces the list per handler).
+    const deliver = (draft: RewindMessageDraft) => ({
+      entries: [...(event.entries ?? []), draft],
+      continue: true,
+    });
     const message = event.message as {
       role?: string;
       content?: unknown;
@@ -1006,36 +1012,41 @@ export default function (pi: ExtensionAPI) {
     if (hasToolCall || summary === null || message.stopReason === "length") {
       pending.attempts++;
       if (pending.attempts >= MAX_SUMMARY_ATTEMPTS) {
-        cancelRewind(
-          sm,
-          sessionId,
-          pending,
-          `no summary after ${pending.attempts} attempts`,
+        return deliver(
+          cancelRewind(
+            sessionId,
+            pending,
+            `no summary after ${pending.attempts} attempts`,
+          ),
         );
-      } else if (!hasToolCall) {
+      }
+      if (!hasToolCall) {
         // A text-only turn ends the loop; blocked tool calls already re-ask.
-        sendRewindMessage(sm, buildSummaryRetryText(pending.rewindTo), {
-          status: "summary-retry",
-          rewindTo: pending.rewindTo,
-          newLabel: pending.newLabel,
-          summaryAttempts: pending.attempts,
-        });
+        return deliver(
+          rewindMessageDraft(buildSummaryRetryText(pending.rewindTo), {
+            status: "summary-retry",
+            rewindTo: pending.rewindTo,
+            newLabel: pending.newLabel,
+            summaryAttempts: pending.attempts,
+          }),
+        );
       }
       return;
     }
     try {
-      await completeRewind(sm, sessionId, pending, summary);
+      return deliver(await completeRewind(sm, sessionId, pending, summary));
     } catch (err) {
       // A throw before the branch write (the stale checks read the session)
       // leaves the rewind pending: cancel it so the model hears about it.
-      if (pendingRewinds.get(sessionId) === pending) {
+      // Every step after the write is guarded, so the branch never lands
+      // without its continuation.
+      return deliver(
         cancelRewind(
-          sm,
           sessionId,
           pending,
           `the rewind could not be completed (${err instanceof Error ? err.message : String(err)})`,
-        );
-      }
+        ),
+      );
     }
   });
 
@@ -1263,6 +1274,16 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (!hintToolActive || rewindHintAtPercent === null) return;
+    // A rewind owns this turn (its call, a summary attempt, or the
+    // completion): a "running low" nudge would be stale or push a second
+    // rewind. The crossing stays unspent for the next turn.
+    if (
+      event.message &&
+      typeof event.message === "object" &&
+      rewindTurns.has(event.message)
+    ) {
+      return;
+    }
     const usage = ctx.getContextUsage();
     // `percent == null` is pi's post-compaction state (unknown tokens), and
     // `contextWindow <= 0` has no meaningful bar to compare against. Both

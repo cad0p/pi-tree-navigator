@@ -104,14 +104,34 @@ interface FakePi {
   /**
    * Raw argument arrays for every `sendMessage` call. Storing the full args
    * (not just the message object) is deliberate: the rewind hint's pinned
-   * contract is a ONE-argument call, while the rewind continuation passes
-   * `{ triggerTurn: true }` — tests must be able to tell them apart.
+   * contract is a ONE-argument call (no options bag). Rewind messages never
+   * go through `sendMessage`: they are `turn_end` boundary entries.
    */
   sendMessageCalls: unknown[][];
-  /** Raw argument arrays for every `sendUserMessage` call (steer re-delivery). */
+  /**
+   * Raw argument arrays for every `sendUserMessage` call. Late input is
+   * re-appended directly, never re-sent: tests pin this stays empty.
+   */
   sendUserMessageCalls: unknown[][];
   /** Interleaved `sendMessage` / `sendUserMessage` call order. */
   sendLog: Array<"sendMessage" | "sendUserMessage">;
+  /** Folded `turn_end` boundary results, one per `fireTurnEndAll`. */
+  boundaryResults: BoundaryResult[];
+}
+
+/** A `turn_end` boundary entry draft (pi's custom_message shape). */
+interface BoundaryDraft {
+  type: string;
+  customType: string;
+  content: string;
+  display: boolean;
+  details: Record<string, unknown>;
+}
+
+/** The folded `turn_end` boundary result, as `emitBoundary` returns it. */
+interface BoundaryResult {
+  entries: BoundaryDraft[];
+  continue: boolean;
 }
 
 /**
@@ -128,6 +148,7 @@ function makeFakePi(sm: SessionManager): FakePi {
   const sendMessageCalls: unknown[][] = [];
   const sendUserMessageCalls: unknown[][] = [];
   const sendLog: FakePi["sendLog"] = [];
+  const boundaryResults: BoundaryResult[] = [];
   const pi = {
     registerTool(tool: CapturedTool) {
       registered.push(tool);
@@ -161,6 +182,7 @@ function makeFakePi(sm: SessionManager): FakePi {
     sendMessageCalls,
     sendUserMessageCalls,
     sendLog,
+    boundaryResults,
   };
 }
 
@@ -441,23 +463,57 @@ function setupRewindable(
 
 /**
  * Fire every registered `turn_end` handler in registration order, awaiting
- * each — the agent loop's `runner.emit` semantics. `turnIndex` defaults to 0
- * so the auto start-anchor (default X=2) stays out of the way.
+ * each, and fold their results exactly as pi's `ExtensionRunner.emitBoundary`
+ * does: every handler sees the running `{ entries, continue }`, and a result
+ * carrying `entries` / `continue` replaces it. The folded result is returned
+ * and recorded on `pi.boundaryResults`. `entries` seeds the list (another
+ * extension's drafts earlier in the chain). `commit` replicates pi's commit
+ * of the drafts onto the session right after the handlers, for tests that
+ * assert branch order. `turnIndex` defaults to 0 so the auto start-anchor
+ * (default X=2) stays out of the way.
  */
 async function fireTurnEndAll(
   pi: FakePi,
   ctx: FakeCtx,
   message: unknown,
-  turnIndex = 0,
-): Promise<void> {
+  opts: {
+    turnIndex?: number;
+    entries?: BoundaryDraft[];
+    commit?: boolean;
+  } = {},
+): Promise<BoundaryResult> {
   const handlers = pi.onCalls.get("turn_end");
   assert.ok(handlers, "factory must register turn_end handlers");
+  let entries = opts.entries ?? [];
+  let shouldContinue = false;
   for (const handler of handlers) {
-    await handler(
-      { type: "turn_end", turnIndex, message, toolResults: [] } as never,
+    const result = (await handler(
+      {
+        type: "turn_end",
+        turnIndex: opts.turnIndex ?? 0,
+        message,
+        toolResults: [],
+        entries,
+        continue: shouldContinue,
+      } as never,
       ctx as never,
-    );
+    )) as { entries?: BoundaryDraft[]; continue?: boolean } | undefined;
+    if (result?.entries !== undefined) entries = result.entries;
+    if (result?.continue !== undefined) shouldContinue = result.continue;
   }
+  const folded = { entries, continue: shouldContinue };
+  pi.boundaryResults.push(folded);
+  if (opts.commit) {
+    for (const draft of entries) {
+      ctx.sessionManager.appendCustomMessageEntry(
+        draft.customType,
+        draft.content,
+        draft.display,
+        draft.details,
+      );
+    }
+  }
+  return folded;
 }
 
 /** Fire the `tool_call` gate for a tool call in `ctx`'s session. */
@@ -523,38 +579,39 @@ async function summaryTurn(
   f: { sm: SessionManager; pi: FakePi; ctx: FakeCtx },
   text: string = SUMMARY_TEXT,
   stopReason = "stop",
-): Promise<{ entryId: string; message: AssistantTurn }> {
+  opts: { commit?: boolean } = {},
+): Promise<{
+  entryId: string;
+  message: AssistantTurn;
+  boundary: BoundaryResult;
+}> {
   const message = assistantMessage([{ type: "text", text }], stopReason, 100);
   const entryId = f.sm.appendMessage(message as never);
-  await fireTurnEndAll(f.pi, f.ctx, message);
-  return { entryId, message };
+  const boundary = await fireTurnEndAll(f.pi, f.ctx, message, opts);
+  return { entryId, message, boundary };
 }
 
-/** sendMessage calls carrying the rewind custom type (continuation etc.). */
-function rewindMessages(pi: FakePi): Array<{
-  message: {
-    customType: string;
-    content: string;
-    display: boolean;
-    details: Record<string, unknown>;
-  };
-  options: unknown;
-}> {
-  return pi.sendMessageCalls
-    .filter(
+/**
+ * Rewind messages delivered as `turn_end` boundary entries, oldest first,
+ * each with its boundary's folded `continue`. Also pins that no rewind
+ * message ever goes through `pi.sendMessage`.
+ */
+function rewindMessages(
+  pi: FakePi,
+): Array<{ message: BoundaryDraft; continue: boolean }> {
+  assert.ok(
+    !pi.sendMessageCalls.some(
       (args) =>
         (args[0] as { customType?: string } | undefined)?.customType ===
         REWIND_CUSTOM_TYPE,
-    )
-    .map((args) => ({
-      message: args[0] as {
-        customType: string;
-        content: string;
-        display: boolean;
-        details: Record<string, unknown>;
-      },
-      options: args[1],
-    }));
+    ),
+    "rewind messages must be boundary entries, never pi.sendMessage",
+  );
+  return pi.boundaryResults.flatMap((result) =>
+    result.entries
+      .filter((draft) => draft.customType === REWIND_CUSTOM_TYPE)
+      .map((message) => ({ message, continue: result.continue })),
+  );
 }
 
 /**
@@ -562,7 +619,7 @@ function rewindMessages(pi: FakePi): Array<{
  * fixture plus the phase-1 result and the continuation message.
  */
 async function rewindFixture(
-  opts: { capture?: boolean; summary?: string } = {},
+  opts: { capture?: boolean; summary?: string; commit?: boolean } = {},
 ) {
   const f = setup();
   const { fake, anchorId } = setupRewindable(f.sm, f.pi, {
@@ -571,7 +628,9 @@ async function rewindFixture(
   const oldLeafBeforeCall = f.sm.getLeafId();
   const { result } = await requestRewind(f);
   const leafBeforeSummary = f.sm.getLeafId();
-  const summary = await summaryTurn(f, opts.summary ?? SUMMARY_TEXT);
+  const summary = await summaryTurn(f, opts.summary ?? SUMMARY_TEXT, "stop", {
+    commit: opts.commit,
+  });
   const messages = rewindMessages(f.pi);
   return {
     ...f,
@@ -693,16 +752,10 @@ describe("context event handler", () => {
     // the anchor, the branch_summary, and the continuation message — and
     // none of the collapsed turns, the rewind tool call, its instruction
     // result, or the summary turn itself (all on the abandoned branch).
-    const f = await rewindFixture();
-    assert.ok(f.done, "the rewind must send its continuation message");
-    // pi persists the triggerTurn custom message as a custom_message entry
-    // before the continuation run; replicate it.
-    f.sm.appendCustomMessageEntry(
-      REWIND_CUSTOM_TYPE,
-      f.done.message.content,
-      true,
-      f.done.message.details,
-    );
+    // `commit`: pi persists the boundary entry as a custom_message entry
+    // right after the turn_end handlers, before the next LLM call.
+    const f = await rewindFixture({ commit: true });
+    assert.ok(f.done, "the rewind must deliver its continuation message");
 
     const handlers = f.pi.onCalls.get("context");
     assert.ok(handlers, "factory must register a context handler");
@@ -2071,12 +2124,13 @@ describe("rewind phase 2: completion", () => {
     assert.ok(!f.sm.getBranch().some((e) => e.id === f.summaryEntryId));
   });
 
-  it("sends the continuation: buildRewindDoneText content, triggerTurn, done details", async () => {
+  it("delivers the continuation as a boundary entry: buildRewindDoneText content, continue, done details", async () => {
     const f = await rewindFixture();
     const calls = rewindMessages(f.pi);
     assert.equal(calls.length, 1);
-    const { message, options } = calls[0];
-    assert.deepEqual(options, { triggerTurn: true });
+    const { message } = calls[0];
+    assert.equal(calls[0].continue, true);
+    assert.equal(message.type, "custom_message");
     assert.equal(message.customType, REWIND_CUSTOM_TYPE);
     assert.equal(message.display, true);
     const d = message.details;
@@ -2210,12 +2264,12 @@ describe("rewind phase 2: completion", () => {
     const fake = makeFakeSession(f.sm);
     const events: Array<Record<string, unknown>> = [];
     let messagesAtEmit: unknown[] | undefined;
-    let sentBeforeEmit = -1;
+    let deliveredBeforeEmit = -1;
     fake._extensionRunner = {
       emit: async (event) => {
         events.push(event as Record<string, unknown>);
         messagesAtEmit = fake.agent.state.messages;
-        sentBeforeEmit = rewindMessages(f.pi).length;
+        deliveredBeforeEmit = rewindMessages(f.pi).length;
       },
     };
     __testHooks.captureSession(fake as unknown as AgentSession);
@@ -2241,7 +2295,11 @@ describe("rewind phase 2: completion", () => {
     );
     assert.equal(event.fromExtension, true);
     assert.deepEqual(messagesAtEmit, f.sm.buildSessionContext().messages);
-    assert.equal(sentBeforeEmit, 0, "emit precedes the continuation message");
+    assert.equal(
+      deliveredBeforeEmit,
+      0,
+      "emit precedes the continuation message",
+    );
   });
 
   it("reports historyRewriteNotified=false without a reachable runner (#79)", async () => {
@@ -2268,7 +2326,7 @@ describe("rewind phase 2: completion", () => {
     assert.match(done.content, /^\[rewind to 'start'/);
   });
 
-  it("sendMessage throw falls back to appendCustomMessageEntry on the captured SessionManager", async () => {
+  it("a throwing pi.sendMessage cannot affect delivery (rewind messages never use it)", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
     (
@@ -2277,15 +2335,18 @@ describe("rewind phase 2: completion", () => {
       throw new Error("stale session runtime");
     };
     await requestRewind(f);
-    await summaryTurn(f);
+    const { boundary } = await summaryTurn(f, SUMMARY_TEXT, "stop", {
+      commit: true,
+    });
+    assert.equal(boundary.continue, true);
+    assert.equal(boundary.entries.length, 1);
+    assert.equal(boundary.entries[0].details.status, "done");
+    // Committed by pi (replicated by `commit`) after the branch_summary.
     const leaf = f.sm.getEntry(f.sm.getLeafId() as string);
     assert.ok(leaf && leaf.type === "custom_message");
     assert.equal(leaf.customType, REWIND_CUSTOM_TYPE);
+    assert.equal(leaf.display, true);
     assert.match(String(leaf.content), /^\[rewind to 'start'/);
-    assert.equal(
-      (leaf.details as { status?: string } | undefined)?.status,
-      "done",
-    );
     assert.ok(
       f.sm.getBranch().some((e) => e.type === "branch_summary"),
       "the continuation follows the branch_summary on the active branch",
@@ -2316,16 +2377,10 @@ describe("rewind phase 2: completion", () => {
     );
 
     await requestRewind(f, { ...REWIND_ARGS, rewindTo: "a", newLabel: "b" });
-    await summaryTurn(f);
+    await summaryTurn(f, SUMMARY_TEXT, "stop", { commit: true });
     const first = rewindMessages(f.pi)[0].message;
     assert.equal(first.details.status, "done");
     const sumB = first.details.summaryId as string;
-    f.sm.appendCustomMessageEntry(
-      REWIND_CUSTOM_TYPE,
-      first.content,
-      true,
-      first.details,
-    );
 
     appendTurn(f.sm, "u4", "a4", 24_000);
     appendTurn(f.sm, "u5", "a5", 30_000);
@@ -2365,6 +2420,62 @@ describe("rewind phase 2: completion", () => {
     assert.equal(result.isError, true);
     assert.equal(result.details.rejected, "min-savings");
     assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
+  it("never calls pi.sendMessage / sendUserMessage for rewind messages", async () => {
+    const f = await rewindFixture();
+    assert.equal(f.done.message.details.status, "done");
+    assert.deepEqual(f.pi.sendMessageCalls, []);
+    assert.deepEqual(f.pi.sendUserMessageCalls, []);
+  });
+
+  it("keeps entries from a handler earlier in the chain: [foreign, ours]", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    const foreign: BoundaryDraft = {
+      type: "custom_message",
+      customType: "other-extension",
+      content: "queued by another extension",
+      display: false,
+      details: { from: "other" },
+    };
+    const message = assistantMessage(
+      [{ type: "text", text: SUMMARY_TEXT }],
+      "stop",
+      100,
+    );
+    f.sm.appendMessage(message as never);
+    const boundary = await fireTurnEndAll(f.pi, f.ctx, message, {
+      entries: [foreign],
+    });
+    assert.equal(boundary.continue, true);
+    assert.equal(boundary.entries.length, 2);
+    assert.equal(boundary.entries[0], foreign, "the foreign draft, untouched");
+    assert.equal(boundary.entries[1].customType, REWIND_CUSTOM_TYPE);
+    assert.equal(boundary.entries[1].details.status, "done");
+  });
+
+  it("returns nothing on turns without a pending rewind", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    const handlers = f.pi.onCalls.get("turn_end");
+    assert.ok(handlers);
+    const result = await handlers[0](
+      {
+        type: "turn_end",
+        turnIndex: 0,
+        message: assistantMessage(
+          [{ type: "text", text: SUMMARY_TEXT }],
+          "stop",
+        ),
+        toolResults: [],
+        entries: [],
+        continue: false,
+      } as never,
+      f.ctx as never,
+    );
+    assert.equal(result, undefined);
   });
 
   it("ignores turn_end from another session and non-assistant messages", async () => {
@@ -2434,6 +2545,28 @@ describe("rewind phase 2: failures", () => {
     assert.equal(done.details.summaryAttempts, MAX_SUMMARY_ATTEMPTS);
   });
 
+  it("a tool-call failure below the cap returns no boundary result", async () => {
+    const f = await pending();
+    const { message } = appendToolCallAssistant(f.sm, [
+      { id: "tc-bash-1", name: "bash", arguments: { command: "ls" } },
+    ]);
+    const handlers = f.pi.onCalls.get("turn_end");
+    assert.ok(handlers);
+    const result = await handlers[0](
+      {
+        type: "turn_end",
+        turnIndex: 0,
+        message,
+        toolResults: [],
+        entries: [],
+        continue: false,
+      } as never,
+      f.ctx as never,
+    );
+    assert.equal(result, undefined);
+    assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
+  });
+
   it("a mixed text + tool-call turn is a failure even with a ## Goal heading", async () => {
     const f = await pending();
     const message = assistantMessage(
@@ -2455,7 +2588,8 @@ describe("rewind phase 2: failures", () => {
     await summaryTurn(f, "Okay, I'll summarize now.");
     const calls = rewindMessages(f.pi);
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].options, { triggerTurn: true });
+    assert.equal(calls[0].continue, true);
+    assert.equal(calls[0].message.customType, REWIND_CUSTOM_TYPE);
     assert.equal(calls[0].message.content, buildSummaryRetryText("start"));
     assert.equal(calls[0].message.display, true);
     assert.deepEqual(calls[0].message.details, {
@@ -2491,7 +2625,7 @@ describe("rewind phase 2: failures", () => {
     }
     const cancel = calls[MAX_SUMMARY_ATTEMPTS - 1];
     const reason = `no summary after ${MAX_SUMMARY_ATTEMPTS} attempts`;
-    assert.deepEqual(cancel.options, { triggerTurn: true });
+    assert.equal(cancel.continue, true);
     assert.equal(
       cancel.message.content,
       buildRewindCancelledText("start", reason),
@@ -2638,7 +2772,7 @@ describe("rewind phase 2: failures", () => {
     assertNotBranched(f.sm);
   });
 
-  it("a throwing branchWithSummary cancels: message sent, pending cleared, gate reopened", async () => {
+  it("a throwing branchWithSummary cancels: message delivered, pending cleared, gate reopened", async () => {
     const f = await pending();
     (f.sm as unknown as { branchWithSummary: () => string }).branchWithSummary =
       () => {
@@ -2649,7 +2783,7 @@ describe("rewind phase 2: failures", () => {
     const calls = rewindMessages(f.pi);
     assert.equal(calls.length, 1);
     const reason = "the branch could not be written (disk full)";
-    assert.deepEqual(calls[0].options, { triggerTurn: true });
+    assert.equal(calls[0].continue, true);
     assert.equal(
       calls[0].message.content,
       buildRewindCancelledText("start", reason),
@@ -2749,7 +2883,7 @@ describe("extractSummaryText", () => {
   });
 });
 // =============================================================================
-// rewind phase 2: multi-block summary turns and steer re-delivery (#80)
+// rewind phase 2: multi-block summary turns and late-entry re-append (#80)
 // =============================================================================
 
 describe("rewind phase 2: multi-block text and late entries", () => {
@@ -2868,15 +3002,8 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     setupRewindable(f.sm, f.pi, { capture: true });
     await requestRewind(f);
     appendLateUser(f.sm, "steer");
-    await summaryTurn(f);
+    await summaryTurn(f, SUMMARY_TEXT, "stop", { commit: true });
     const done = rewindMessages(f.pi)[0].message;
-    // pi persists the triggerTurn custom message; replicate it.
-    f.sm.appendCustomMessageEntry(
-      REWIND_CUSTOM_TYPE,
-      done.content,
-      true,
-      done.details,
-    );
     assert.deepEqual(tailAfterSummary(f.sm), [
       "branch_summary",
       "label",
@@ -2896,28 +3023,67 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}`));
     assert.equal(buildLateEntriesNote(1), NOTE_ONE);
     assert.equal(buildLateEntriesNote(2), NOTE_TWO);
+    assert.equal(
+      buildLateEntriesNote(3),
+      "The 3 messages between the branch_summary and this one arrived while the rewind was pending — they are new and still unanswered; handle them now.",
+    );
   });
 
   it("does not re-append this extension's own rewind messages (e.g. a summary-retry)", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
     await requestRewind(f);
-    await summaryTurn(f, "Okay, summarizing now.");
+    // `commit`: pi persists the delivered retry message.
+    await summaryTurn(f, "Okay, summarizing now.", "stop", { commit: true });
     const retry = rewindMessages(f.pi)[0].message;
     assert.equal(retry.details.status, "summary-retry");
-    // pi persists the delivered retry message; replicate it.
-    f.sm.appendCustomMessageEntry(
-      REWIND_CUSTOM_TYPE,
-      retry.content,
-      true,
-      retry.details,
-    );
     await summaryTurn(f);
     const done = rewindMessages(f.pi)[1].message;
     assert.equal(done.details.status, "done");
     assert.equal(done.details.reappendedLateMessages, 0);
     assert.deepEqual(tailAfterSummary(f.sm), ["branch_summary", "label"]);
     assert.ok(!done.content.includes("arrived while the rewind was pending"));
+  });
+
+  it("does not re-append a rewind-hint message that landed after the rewind call", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    f.sm.appendCustomMessageEntry(
+      REWIND_HINT_CUSTOM_TYPE,
+      buildRewindHintText(91, 1_000_000),
+      true,
+      undefined,
+    );
+    appendLateUser(f.sm, "steer");
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.reappendedLateMessages, 1);
+    assert.deepEqual(tailAfterSummary(f.sm), [
+      "branch_summary",
+      "label",
+      'user:[{"type":"text","text":"steer"}]',
+    ]);
+  });
+
+  it("a re-appended hidden custom message stays hidden (display: false)", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    f.sm.appendCustomMessageEntry("timer", "tick", false, { n: 1 });
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.reappendedLateMessages, 1);
+    assert.deepEqual(tailAfterSummary(f.sm), [
+      "branch_summary",
+      "label",
+      'custom:timer:"tick"',
+    ]);
+    const leaf = f.sm.getEntry(f.sm.getLeafId() as string);
+    assert.ok(leaf && leaf.type === "custom_message");
+    assert.equal(leaf.display, false);
+    assert.deepEqual(leaf.details, { n: 1 });
   });
 
   it("entries before the rewind call are not re-appended", async () => {
@@ -2964,7 +3130,7 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     ]);
   });
 
-  it("an estimator throw after the branch still sends the continuation with contextAfter 0", async () => {
+  it("an estimator throw after the branch still delivers the continuation with contextAfter 0", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
     await requestRewind(f);
@@ -3009,12 +3175,20 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     const calls = rewindMessages(f.pi);
     assert.equal(calls.length, 1);
     const reason = "the rewind could not be completed (branch boom)";
+    assert.equal(calls[0].continue, true);
+    assert.equal(calls[0].message.type, "custom_message");
+    assert.equal(calls[0].message.display, true);
     assert.equal(
       calls[0].message.content,
       buildRewindCancelledText("start", reason),
     );
-    assert.equal(calls[0].message.details.status, "cancelled");
-    assert.equal(calls[0].message.details.reason, reason);
+    assert.deepEqual(calls[0].message.details, {
+      status: "cancelled",
+      rewindTo: "start",
+      newLabel: "end",
+      reason,
+      summaryAttempts: 0,
+    });
     assert.ok(!f.sm.getEntries().some((e) => e.type === "branch_summary"));
     assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
   });
@@ -4639,6 +4813,88 @@ describe("rewind hint: turn_end handler (#44)", () => {
 // fixtures (real loader, real fs) and in-memory SessionManagers. No LLM is
 // involved.
 // =============================================================================
+
+describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
+  /** Hint `sendMessage` calls (the only kind this extension makes). */
+  function hintCalls(pi: FakePi): unknown[][] {
+    return pi.sendMessageCalls.filter(
+      (args) =>
+        (args[0] as { customType?: string } | undefined)?.customType ===
+        REWIND_HINT_CUSTOM_TYPE,
+    );
+  }
+
+  it("skips the rewind call, a failed attempt and the completing turn; the crossing fires on the next normal turn", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await runSessionStart(f.pi, f.ctx, fixture);
+      f.ctx.setContextUsage(usageAt(95));
+
+      await requestRewind(f);
+      assert.equal(hintCalls(f.pi).length, 0, "the rewind call's turn");
+      await summaryTurn(f, "Okay, summarizing now.");
+      assert.equal(
+        rewindMessages(f.pi)[0].message.details.status,
+        "summary-retry",
+      );
+      assert.equal(hintCalls(f.pi).length, 0, "a failed attempt");
+      await summaryTurn(f);
+      assert.equal(rewindMessages(f.pi)[1].message.details.status, "done");
+      assert.equal(hintCalls(f.pi).length, 0, "the completing turn");
+
+      // The crossing stayed unspent: the next normal turn fires it once.
+      const next = assistantMessage([{ type: "text", text: "next" }], "stop");
+      f.sm.appendMessage(next as never);
+      const boundary = await fireTurnEndAll(f.pi, f.ctx, next);
+      assert.deepEqual(boundary, { entries: [], continue: false });
+      assert.deepEqual(hintCalls(f.pi), [
+        [
+          {
+            customType: REWIND_HINT_CUSTOM_TYPE,
+            content: buildRewindHintText(95, 1_000_000),
+            display: true,
+          },
+        ],
+      ]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("skips a tool-call failure turn too, and the start anchor still runs on it", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      const f = setup();
+      // Anchor `a`, not `start`: the auto start anchor must be the writer.
+      setupRewindable(f.sm, f.pi, { capture: true, rewindToName: "a" });
+      await runSessionStart(f.pi, f.ctx, fixture);
+      assert.deepEqual(f.ctx.notifyCalls, []);
+      f.ctx.setContextUsage(usageAt(95));
+      await requestRewind(f, { ...REWIND_ARGS, rewindTo: "a" });
+      assert.equal(hintCalls(f.pi).length, 0);
+      assert.equal(
+        __testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL),
+        null,
+        "turn 1 is below the default X=2",
+      );
+      const { message } = appendToolCallAssistant(f.sm, [
+        { id: "tc-bash-1", name: "bash", arguments: { command: "ls" } },
+      ]);
+      await fireTurnEndAll(f.pi, f.ctx, message, { turnIndex: 1 });
+      assert.equal(hintCalls(f.pi).length, 0, "a tool-call failure turn");
+      assert.ok(
+        __testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL),
+        "the start anchor is not gated by the rewind",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+});
 
 describe("automatic start anchor (#55)", () => {
   const ENV_KEY = "PI_NAVIGATE_TREE_START_ANCHOR";

@@ -19,9 +19,10 @@
  *      extensions (pi-claude-bridge) rebuild from the rewound chain.
  *
  * Load-bearing host ordering (#80): the in-band rewind completes in a
- * `turn_end` handler and steers the continuation into the same run, so the
- * loop must await `finishTurn` (which awaits the extension `turn_end`
- * dispatch) before draining steering messages.
+ * `turn_end` handler and returns its continuation as a boundary entry with
+ * `continue: true`, so pi must await the extension `turn_end` dispatch in
+ * `finishTurn`, commit the returned entries, and honour `continue`, all
+ * before the loop drains steering messages.
  *
  * #80 deleted the #33/#75 cache-preserving summary request (live-request
  * capture via `Agent.transformContext`, `ModelRegistry.streamSimple`
@@ -228,12 +229,14 @@ try {
   );
 
   // --- 8. turn_end handlers settle before the steering drain (#80) ---
-  // The in-band rewind completes in a `turn_end` handler and steers the
-  // continuation message into the SAME run: a text-only summary turn would
-  // otherwise end the loop, and the rewound context would only reach a real
-  // turn on the next user prompt. That needs (a) the loop to await
-  // `finishTurn` before reading steering messages, and (b) AgentSession's
-  // `finishTurn` to await the extension `turn_end` dispatch.
+  // The in-band rewind completes in a `turn_end` handler and returns its
+  // continuation as a boundary entry with `continue: true`: a text-only
+  // summary turn would otherwise end the loop, and the rewound context would
+  // only reach a real turn on the next user prompt. That needs (a) the loop
+  // to await `finishTurn` before reading steering messages, (b)
+  // AgentSession's `finishTurn` to await the extension `turn_end` dispatch,
+  // and (c) that dispatch to commit the returned entries and return
+  // `continue`.
   let loopSrc = "";
   try {
     loopSrc = readFileSync(path.join(path.dirname(coreDist), "agent-loop.js"), "utf8");
@@ -251,6 +254,13 @@ try {
     "AgentSession.finishTurn awaits the turn_end dispatch (#80)",
     finishDispatch,
     finishDispatch ? "await _dispatchTurnEndBoundary found" : "dispatch MISSING",
+  );
+  const boundaryCommit =
+    /_dispatchTurnEndBoundary\([\s\S]{0,1500}?this\._commitBoundaryDrafts\(boundary\.entries\)[\s\S]{0,400}?return boundary\.continue;/.test(sessionSrc);
+  check(
+    "turn_end dispatch commits boundary entries and returns continue (#80)",
+    boundaryCommit,
+    boundaryCommit ? "_commitBoundaryDrafts(boundary.entries) … return boundary.continue found" : "commit/continue MISSING",
   );
 
   // --- 9. Assistant persisted before tool execution (#37, #80) ---
