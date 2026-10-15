@@ -1101,8 +1101,6 @@ export default function (pi: ExtensionAPI) {
   // never inherit a spent crossing, and an in-process sibling (a subagent)
   // never resets, reconfigures, or spends another session's hint. A
   // session with no entry (no `session_start` seen) gets no hint.
-  // `toolActive` fails open until `before_agent_start` says otherwise.
-  let toolActive = true;
   // `byModel` (#86) holds the `modelOverrides` reserves; the reserve is
   // resolved against the live `ctx.model` on every `turn_end`, so a model
   // switch mid-session takes effect on the next turn.
@@ -1199,7 +1197,6 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui;
     const sessionId = ctx.sessionManager.getSessionId();
     pendingRewinds.delete(sessionId);
-    toolActive = true;
     let reserve: number | null = null;
     let byModel: ReadonlyMap<string, number | null> = new Map();
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
@@ -1258,10 +1255,9 @@ export default function (pi: ExtensionAPI) {
   // fire `turn_end` nudges the model can't act on.
   pi.on("before_agent_start", async (event, ctx) => {
     const selected = event.systemPromptOptions?.selectedTools;
-    toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
-    // Per-session copy of the gate (#55): the shared `toolActive` above
-    // drives the hint, but an in-process sibling session must not clear this
-    // session's auto-anchor gate.
+    const toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
+    // Per-session gate (#55, #58): an in-process sibling session must not
+    // clear this session's hint or auto-anchor gate.
     try {
       const sessionId = ctx.sessionManager.getSessionId();
       toolActiveBySession.set(sessionId, toolActive);
@@ -1317,18 +1313,17 @@ export default function (pi: ExtensionAPI) {
     // Per-session hint gate (#58): an in-process sibling session's
     // `before_agent_start` (e.g. a subagent whose tool subset omits
     // `navigate_tree`) must not clear THIS session's hint. Mirrors the auto
-    // start-anchor's per-session gate; the shared `toolActive` remains the
-    // fallback for sessions with no recorded gate (fail-open).
-    let hintToolActive = toolActive;
+    // start-anchor's per-session gate; a session with no recorded gate
+    // fails open.
+    let hintToolActive = true;
     let hint: HintState | undefined;
     if (sm) {
       try {
         const sessionId = sm.getSessionId();
-        const gated = toolActiveBySession.get(sessionId);
-        if (gated !== undefined) hintToolActive = gated;
+        hintToolActive = toolActiveBySession.get(sessionId) ?? true;
         hint = hintBySession.get(sessionId);
       } catch {
-        // Stale ctx: keep the shared fallback; no hint state.
+        // Stale ctx: no hint state.
       }
     }
     if (!hintToolActive || !hint) return;
