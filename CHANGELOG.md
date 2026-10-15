@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 - *(anchor)* Automatic low-floor anchor:start (closes #55)
 - *(rewind)* In-band summary + session_tree emit (closes #79, closes #80, closes #28)
 - *(hint)* Absolute rewindHintReserveTokens + name the anchors in the hint (closes #84)
+- *(hint)* Per-model rewindHintReserveTokens via modelOverrides (closes #86)
 
 ### 🐛 Bug Fixes
 
