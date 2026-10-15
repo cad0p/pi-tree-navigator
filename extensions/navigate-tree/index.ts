@@ -1367,7 +1367,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!hintTracker.observe(tokensLeft, rewindHintReserveTokens)) return;
-    if (anchors.names.length > 0) {
+    // `some(Boolean)`: an empty-named manual `/tree` label (`anchor:`) is not
+    // a rewind target (`rewindTo` rejects an empty name).
+    if (anchors.names.some(Boolean)) {
       const text = buildRewindHintText(
         usage.percent,
         tokensLeft,
