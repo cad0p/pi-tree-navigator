@@ -33,10 +33,13 @@
  * - **System messages.** pi 1.0.0's `estimateTokens` adds a `system` case
  *   (counts `content`, `sections`, and `toolsAdded`) where 0.84.2 returned
  *   `0`. `buildSessionContext(...).messages` carries `system` entries on
- *   1.0.0, so an estimate is self-consistent per host and matches pi's own
- *   `estimateProjectedContextTokens` there — but a chain containing system
- *   entries does not produce the same number on both versions. No
- *   cross-version parity is claimed.
+ *   1.0.0, so an estimate is self-consistent per host — but a chain
+ *   containing system entries does not produce the same number on both
+ *   versions. No cross-version parity is claimed. Nor is parity with pi's
+ *   `estimateProjectedContextTokens` on the no-usage path: pi folds the
+ *   system entries into the current system state (`getCurrentSystemMessage`)
+ *   while this helper sums every entry, so replaced or removed sections and
+ *   tool changes count here but not in pi.
  * - **`JSON.stringify` vs `safeJsonStringify`.** The removed pi-agent-core
  *   helper wrapped toolCall `arguments` serialization in a
  *   `safeJsonStringify` guard (falling back to `"[unserializable]"`); the
