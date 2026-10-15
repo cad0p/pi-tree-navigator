@@ -4559,6 +4559,78 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("a sibling session's session_start does not reset or reconfigure this session's hint (#85)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      // Sibling session B starts in a trusted project that disables the hint.
+      writeProjectConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: "off" }),
+      );
+      const smB = SessionManager.inMemory("/tmp");
+      const ctxB = makeCtx(smB);
+      ctxB.cwd = fixture.projectDir;
+      ctxB.isProjectTrusted = () => true;
+      await runSessionStart(pi, ctxB, fixture);
+
+      // A is still spent (B's start must not re-arm it)...
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1, "B must not re-arm A");
+      // ...and still configured (B's "off" must not disable A).
+      ctx.setContextUsage(usageAt(10));
+      fireTurnEnd(pi, ctx);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 2, "B must not disable A");
+
+      // B itself is off.
+      ctxB.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctxB);
+      assert.equal(pi.sendMessageCalls.length, 2);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("one session's spent crossing does not silence a sibling's hint (#85)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+
+      const smB = SessionManager.inMemory("/tmp");
+      const tB = appendTurn(smB, "u-anchor-b", "a-anchor-b");
+      smB.appendLabelChange(tB.assistantId, "anchor:start");
+      const ctxB = makeCtx(smB);
+      await runSessionStart(pi, ctxB, fixture);
+
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      ctxB.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctxB);
+      assert.equal(
+        pi.sendMessageCalls.length,
+        2,
+        "A's spent crossing must not silence B",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("keeps the tool gate per-session (#58): a sibling session must not clear this session's hint", async () => {
     const fixture = makeConfigFixture();
     try {
@@ -4571,8 +4643,13 @@ describe("rewind hint: turn_end handler (#44)", () => {
       await fireBeforeAgentStart(pi, ctx, [TOOL_NAME, "read"]);
 
       // Sibling session B (e.g. an in-process subagent) starts without it.
+      // B gets its own anchor and hint config (#85), so only its tool gate
+      // can keep it silent below.
       const smB = SessionManager.inMemory("/tmp");
+      const tB = appendTurn(smB, "u-anchor-b", "a-anchor-b");
+      smB.appendLabelChange(tB.assistantId, "anchor:start");
       const ctxB = makeCtx(smB);
+      await runSessionStart(pi, ctxB, fixture);
       await fireBeforeAgentStart(pi, ctxB, ["read"]);
 
       // A crosses: the hint must still fire — i.e. B's `before_agent_start`
@@ -4585,7 +4662,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
         "a sibling session's before_agent_start must not clear A's hint gate",
       );
 
-      // Re-arm the shared tracker, then flip the shared fallback back on.
+      // Re-arm A's tracker, then flip the shared fallback back on.
       ctx.setContextUsage(usageAt(10));
       fireTurnEnd(pi, ctx);
       await fireBeforeAgentStart(pi, ctx, [TOOL_NAME, "read"]);

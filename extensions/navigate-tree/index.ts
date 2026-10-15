@@ -1088,13 +1088,17 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Rewind-hint closure state (#44): fresh per factory invocation and reset
-  // on every `session_start`, so `/new` / `/resume` / `/reload` sessions
-  // never inherit a spent crossing or another session's config. `toolActive`
-  // fails open until `before_agent_start` says otherwise.
+  // Rewind-hint state (#44, #85), keyed by session id and replaced on that
+  // session's `session_start`, so `/new` / `/resume` / `/reload` sessions
+  // never inherit a spent crossing, and an in-process sibling (a subagent)
+  // never resets, reconfigures, or spends another session's hint. A
+  // session with no entry (no `session_start` seen) gets no hint.
+  // `toolActive` fails open until `before_agent_start` says otherwise.
   let toolActive = true;
-  let rewindHintReserveTokens: number | null = null;
-  let hintTracker = new RewindHintTracker();
+  const hintBySession = new Map<
+    string,
+    { reserve: number | null; tracker: RewindHintTracker }
+  >();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
   // and NEVER cleared in-process: once a session has settled (write or
@@ -1187,8 +1191,6 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui;
     const sessionId = ctx.sessionManager.getSessionId();
     pendingRewinds.delete(sessionId);
-    rewindHintReserveTokens = null;
-    hintTracker = new RewindHintTracker();
     toolActive = true;
     let reserve: number | null = null;
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
@@ -1211,7 +1213,7 @@ export default function (pi: ExtensionAPI) {
       startTurns = START_ANCHOR_DEFAULT_TURNS;
       warnings = [];
     }
-    rewindHintReserveTokens = reserve;
+    hintBySession.set(sessionId, { reserve, tracker: new RewindHintTracker() });
     anchorStartTurnsBySession.set(sessionId, startTurns);
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
@@ -1303,15 +1305,21 @@ export default function (pi: ExtensionAPI) {
     // start-anchor's per-session gate; the shared `toolActive` remains the
     // fallback for sessions with no recorded gate (fail-open).
     let hintToolActive = toolActive;
+    let hint:
+      | { reserve: number | null; tracker: RewindHintTracker }
+      | undefined;
     if (sm) {
       try {
-        const gated = toolActiveBySession.get(sm.getSessionId());
+        const sessionId = sm.getSessionId();
+        const gated = toolActiveBySession.get(sessionId);
         if (gated !== undefined) hintToolActive = gated;
+        hint = hintBySession.get(sessionId);
       } catch {
-        // Stale ctx: keep the shared fallback.
+        // Stale ctx: keep the shared fallback; no hint state.
       }
     }
-    if (!hintToolActive || rewindHintReserveTokens === null) return;
+    if (!hintToolActive || !hint || hint.reserve === null) return;
+    const { reserve: rewindHintReserveTokens, tracker: hintTracker } = hint;
     // A rewind owns this turn (its call, a summary attempt, or the
     // completion): a rewind hint would be stale or push a second
     // rewind. The crossing stays unspent for the next turn.
