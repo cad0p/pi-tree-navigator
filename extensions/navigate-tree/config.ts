@@ -25,9 +25,8 @@
  *     global entry), then a matching entry beats the base value — so a
  *     global model entry beats a project-wide base, as in pi. Entry values
  *     follow the base field's rules; an invalid entry disables the hint for
- *     that model. A non-object `modelOverrides` or entry, a key with
- *     surrounding whitespace, or an entry without `rewindHintReserveTokens`
- *     warns and is ignored; other keys inside an entry are ignored.
+ *     that model. A non-object `modelOverrides` or entry warns and is
+ *     ignored; an entry without `rewindHintReserveTokens` is ignored.
  *
  * Failure semantics (issues #44/#55; authoritative):
  *   - File-level problems (non-ENOENT read failure, invalid JSON, non-object
@@ -143,19 +142,10 @@ function parseStartTurns(n: number): StartAnchorField {
 export interface ModelOverridesProblems {
   notObject: boolean;
   nonObjectEntries: string[];
-  /** Empty keys and keys with surrounding whitespace: never match a model. */
-  paddedKeys: string[];
-  /** Entries without `rewindHintReserveTokens` (e.g. pi's `reserveTokens`). */
-  entriesWithoutReserve: string[];
 }
 
 function noModelOverridesProblems(): ModelOverridesProblems {
-  return {
-    notObject: false,
-    nonObjectEntries: [],
-    paddedKeys: [],
-    entriesWithoutReserve: [],
-  };
+  return { notObject: false, nonObjectEntries: [] };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -176,17 +166,12 @@ function parseModelOverrides(
     return { modelHints, modelOverridesProblems: problems };
   }
   for (const [key, entry] of Object.entries(overrides)) {
-    if (key === "" || key.trim() !== key) {
-      problems.paddedKeys.push(key);
-      continue;
-    }
     if (!isPlainObject(entry)) {
       problems.nonObjectEntries.push(key);
       continue;
     }
     const hint = parseHintField(entry);
-    if (hint.kind === "absent") problems.entriesWithoutReserve.push(key);
-    else modelHints.set(key, hint);
+    if (hint.kind !== "absent") modelHints.set(key, hint);
   }
   return { modelHints, modelOverridesProblems: problems };
 }
@@ -403,19 +388,9 @@ async function loadLayer(
       `navigate_tree: modelOverrides in ${layer} config at ${path} must be an object keyed by "provider/modelId" — ignored.`,
     );
   }
-  for (const key of parsed.layer.modelOverridesProblems.paddedKeys) {
-    warnings.push(
-      `navigate_tree: modelOverrides key ${JSON.stringify(key)} in ${layer} config at ${path} is empty or has surrounding whitespace and can never match a model — ignored.`,
-    );
-  }
   for (const key of parsed.layer.modelOverridesProblems.nonObjectEntries) {
     warnings.push(
       `navigate_tree: modelOverrides[${JSON.stringify(key)}] in ${layer} config at ${path} must be an object — ignored.`,
-    );
-  }
-  for (const key of parsed.layer.modelOverridesProblems.entriesWithoutReserve) {
-    warnings.push(
-      `navigate_tree: modelOverrides[${JSON.stringify(key)}] in ${layer} config at ${path} sets no rewindHintReserveTokens — ignored.`,
     );
   }
   for (const [key, field] of parsed.layer.modelHints) {

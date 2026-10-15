@@ -767,13 +767,6 @@ export function buildRewindCancelledText(
   return `[${TOOL_NAME}] Rewind to '${rewindTo}' cancelled: ${reason}. Nothing was collapsed — continue the work and rewind again later.`;
 }
 
-/** One session's rewind-hint config and crossing (#44, #85, #86). */
-interface HintState {
-  rewindHintReserveTokens: number | null;
-  rewindHintModelReserveTokens: ReadonlyMap<string, number | null>;
-  tracker: RewindHintTracker;
-}
-
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
@@ -1097,17 +1090,17 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Rewind-hint state (#44, #85), keyed by session id and replaced on that
-  // session's `session_start`, so `/new` / `/resume` / `/reload` sessions
-  // never inherit a spent crossing, and a sibling session served by the
-  // same extension instance never resets, reconfigures, or spends another
-  // session's hint. Hardening, like the other per-session maps: pi-subagents
-  // currently builds a fresh extension instance per child. A session with
-  // no entry (no `session_start` seen) gets no hint.
-  // `byModel` (#86) holds the `modelOverrides` reserves; the reserve is
-  // resolved against the live `ctx.model` on every `turn_end`, so a model
-  // switch mid-session takes effect on the next turn.
-  const hintBySession = new Map<string, HintState>();
+  // Rewind-hint closure state (#44): fresh per factory invocation and reset
+  // on every `session_start`, so `/new` / `/resume` / `/reload` sessions
+  // never inherit a spent crossing or another session's config. `toolActive`
+  // fails open until `before_agent_start` says otherwise. `hintByModel`
+  // (#86) holds the `modelOverrides` reserves; the reserve is resolved
+  // against the live `ctx.model` on every `turn_end`, so a model switch
+  // mid-session takes effect on the next turn.
+  let toolActive = true;
+  let rewindHintReserveTokens: number | null = null;
+  let hintByModel: ReadonlyMap<string, number | null> = new Map();
+  let hintTracker = new RewindHintTracker();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
   // and NEVER cleared in-process: once a session has settled (write or
@@ -1200,6 +1193,10 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui;
     const sessionId = ctx.sessionManager.getSessionId();
     pendingRewinds.delete(sessionId);
+    rewindHintReserveTokens = null;
+    hintByModel = new Map();
+    hintTracker = new RewindHintTracker();
+    toolActive = true;
     let reserve: number | null = null;
     let byModel: ReadonlyMap<string, number | null> = new Map();
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
@@ -1224,11 +1221,8 @@ export default function (pi: ExtensionAPI) {
       startTurns = START_ANCHOR_DEFAULT_TURNS;
       warnings = [];
     }
-    hintBySession.set(sessionId, {
-      rewindHintReserveTokens: reserve,
-      rewindHintModelReserveTokens: byModel,
-      tracker: new RewindHintTracker(),
-    });
+    rewindHintReserveTokens = reserve;
+    hintByModel = byModel;
     anchorStartTurnsBySession.set(sessionId, startTurns);
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
@@ -1258,9 +1252,10 @@ export default function (pi: ExtensionAPI) {
   // fire `turn_end` nudges the model can't act on.
   pi.on("before_agent_start", async (event, ctx) => {
     const selected = event.systemPromptOptions?.selectedTools;
-    const toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
-    // Per-session gate (#55, #58): an in-process sibling session must not
-    // clear this session's hint or auto-anchor gate.
+    toolActive = !Array.isArray(selected) || selected.includes(TOOL_NAME);
+    // Per-session copy of the gate (#55): the shared `toolActive` above
+    // drives the hint, but an in-process sibling session must not clear this
+    // session's auto-anchor gate.
     try {
       const sessionId = ctx.sessionManager.getSessionId();
       toolActiveBySession.set(sessionId, toolActive);
@@ -1316,44 +1311,41 @@ export default function (pi: ExtensionAPI) {
     // Per-session hint gate (#58): an in-process sibling session's
     // `before_agent_start` (e.g. a subagent whose tool subset omits
     // `navigate_tree`) must not clear THIS session's hint. Mirrors the auto
-    // start-anchor's per-session gate; a session with no recorded gate
-    // fails open.
-    let hintToolActive = true;
-    let hint: HintState | undefined;
+    // start-anchor's per-session gate; the shared `toolActive` remains the
+    // fallback for sessions with no recorded gate (fail-open).
+    let hintToolActive = toolActive;
     if (sm) {
       try {
-        const sessionId = sm.getSessionId();
-        hintToolActive = toolActiveBySession.get(sessionId) ?? true;
-        hint = hintBySession.get(sessionId);
+        const gated = toolActiveBySession.get(sm.getSessionId());
+        if (gated !== undefined) hintToolActive = gated;
       } catch {
-        // Stale ctx: no hint state.
+        // Stale ctx: keep the shared fallback.
       }
     }
-    if (!hintToolActive || !hint) return;
     // Hint off everywhere: nothing can fire or re-arm.
     if (
-      hint.rewindHintReserveTokens === null &&
-      hint.rewindHintModelReserveTokens.size === 0
+      !hintToolActive ||
+      (rewindHintReserveTokens === null && hintByModel.size === 0)
     ) {
       return;
     }
     let modelKey: string | undefined;
-    if (hint.rewindHintModelReserveTokens.size > 0) {
+    if (hintByModel.size > 0) {
       try {
         const model = ctx.model;
-        if (
-          typeof model?.provider === "string" &&
-          typeof model.id === "string"
-        ) {
-          modelKey = `${model.provider}/${model.id}`;
-        }
+        if (model) modelKey = `${model.provider}/${model.id}`;
       } catch {
         // Stale ctx: no hint this turn.
         return;
       }
     }
-    const rewindHintReserveTokens = resolveRewindHintReserve(hint, modelKey);
-    const hintTracker = hint.tracker;
+    const reserve = resolveRewindHintReserve(
+      {
+        rewindHintReserveTokens,
+        rewindHintModelReserveTokens: hintByModel,
+      },
+      modelKey,
+    );
     // A rewind owns this turn (its call, a summary attempt, or the
     // completion): a rewind hint would be stale or push a second
     // rewind. The crossing stays unspent for the next turn.
@@ -1377,12 +1369,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const tokensLeft = usage.contextWindow - usage.tokens;
-    if (
-      rewindHintReserveTokens === null ||
-      tokensLeft > rewindHintReserveTokens
-    ) {
+    if (reserve === null || tokensLeft > reserve) {
       // Hint off for this model, or outside the reserve: re-arm only.
-      hintTracker.observe(tokensLeft, rewindHintReserveTokens);
+      hintTracker.observe(tokensLeft, reserve);
       return;
     }
     // Spent: skip the anchor walk below (it estimates every anchor).
@@ -1403,12 +1392,12 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    if (!hintTracker.observe(tokensLeft, rewindHintReserveTokens)) return;
+    if (!hintTracker.observe(tokensLeft, reserve)) return;
     if (anchors.names.length > 0) {
       const text = buildRewindHintText(
         usage.percent,
         tokensLeft,
-        rewindHintReserveTokens,
+        reserve,
         usage.contextWindow,
         anchors.text,
       );
