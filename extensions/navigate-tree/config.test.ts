@@ -104,7 +104,12 @@ function layer(partial: {
     hint: partial.hint ?? { kind: "absent" },
     startAnchor: partial.startAnchor ?? { kind: "absent" },
     modelHints: new Map(partial.modelHints ?? []),
-    modelOverridesProblems: { notObject: false, nonObjectEntries: [] },
+    modelOverridesProblems: {
+      notObject: false,
+      nonObjectEntries: [],
+      paddedKeys: [],
+      entriesWithoutReserve: [],
+    },
   };
 }
 
@@ -910,8 +915,10 @@ describe("modelOverrides (#86)", () => {
           [HAIKU]: { rewindHintReserveTokens: "off" },
           "x/bad": { rewindHintReserveTokens: 5 },
           "x/str": { rewindHintReserveTokens: " 30000 " },
-          // No reserve key: not an override (other pi-style keys ignored).
+          // No reserve key (e.g. pi's `reserveTokens`): a problem, not an
+          // override.
           "x/none": { reserveTokens: 1 },
+          " x/padded ": { rewindHintReserveTokens: 30000 },
         },
       });
       assert.deepEqual(
@@ -926,6 +933,8 @@ describe("modelOverrides (#86)", () => {
       assert.deepEqual(parsed.modelOverridesProblems, {
         notObject: false,
         nonObjectEntries: [],
+        paddedKeys: [" x/padded "],
+        entriesWithoutReserve: ["x/none"],
       });
     });
 
@@ -942,6 +951,8 @@ describe("modelOverrides (#86)", () => {
       assert.deepEqual(parsed.modelOverridesProblems, {
         notObject: false,
         nonObjectEntries: ["a", "b", "c"],
+        paddedKeys: [],
+        entriesWithoutReserve: [DEEPSEEK],
       });
     });
 
@@ -951,6 +962,8 @@ describe("modelOverrides (#86)", () => {
       assert.deepEqual(parsed.modelOverridesProblems, {
         notObject: false,
         nonObjectEntries: [],
+        paddedKeys: [],
+        entriesWithoutReserve: [],
       });
     });
   });
@@ -1100,7 +1113,32 @@ describe("modelOverrides (#86)", () => {
       });
     });
 
-    it("a file-level problem drops that layer's entries too", async () => {
+    it("warns on a padded key and on an entry without rewindHintReserveTokens", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({
+          rewindHintReserveTokens: 40000,
+          modelOverrides: {
+            [` ${DEEPSEEK}`]: { rewindHintReserveTokens: 50000 },
+            [HAIKU]: { reserveTokens: 50000 },
+          },
+        }),
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: false,
+        readFile: reader.readFile,
+      });
+      assert.deepEqual(out, {
+        config: cfg(40000),
+        warnings: [
+          `navigate_tree: modelOverrides key " ${DEEPSEEK}" in global config at ${GLOBAL_PATH} has surrounding whitespace and can never match a model — ignored.`,
+          `navigate_tree: modelOverrides["${HAIKU}"] in global config at ${GLOBAL_PATH} sets no rewindHintReserveTokens — ignored.`,
+        ],
+      });
+    });
+
+    it("a project file-level problem keeps the global entries", async () => {
       const reader = readerFor({
         [GLOBAL_PATH]: JSON.stringify({
           modelOverrides: { [DEEPSEEK]: { rewindHintReserveTokens: 50000 } },

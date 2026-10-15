@@ -105,7 +105,7 @@ With no anchors the extension sends **no model message** (a rewind is impossible
 
 ### Per-model reserve (`modelOverrides`)
 
-Different models need different budgets: a model that writes long summaries or grows context fast per turn needs a larger reserve. `modelOverrides` sets `rewindHintReserveTokens` per model, in the same shape as pi's `compaction.modelOverrides`:
+Different models need different budgets: a model that writes long summaries or grows context fast per turn needs a larger reserve. `modelOverrides` sets `rewindHintReserveTokens` per model. It is keyed like pi's `compaction.modelOverrides`, but each entry takes `rewindHintReserveTokens` (not pi's `reserveTokens`) with this extension's value rules, including the disable sentinels pi does not accept:
 
 ```json
 {
@@ -116,10 +116,10 @@ Different models need different budgets: a model that writes long summaries or g
 }
 ```
 
-- Keys are the exact `provider/modelId` of the active model (as in pi's `/model` list). The reserve is resolved against the live model on every turn, so a mid-session `/model` switch takes effect on the next turn; the crossing state is shared across the switch.
+- Keys are the exact `provider/modelId` of the active model (as in pi's `/model` list). The reserve is resolved against the live model on every turn, so a mid-session `/model` switch takes effect on the next turn. The crossing is shared across the switch: once the hint fires, it re-arms only after the tokens left climb above both the reserve it fired under and the active model's reserve (a model with the hint off never fires, but its turns can still re-arm), so switching between reserves never turns one crossing into two hints.
 - A matching entry wins over the base `rewindHintReserveTokens`, including an entry sentinel (`"off"` disables the hint for that model only) and an entry that enables the hint while the base is off. No matching entry, or no active model → the base value.
 - Layers merge per key: a trusted project entry replaces the global entry for the same model, other keys pass through. As in pi, a matching entry from either layer beats the base value from either layer, so a global model entry beats a project-wide base.
-- Entry values follow the base field's rules. An invalid entry value disables the hint for that model (no fallback to the base) with a field-scoped warning; a non-object `modelOverrides` or entry warns and is ignored; other keys in an entry are ignored.
+- Entry values follow the base field's rules. An invalid entry value disables the hint for that model (no fallback to the base) with a field-scoped warning. A non-object `modelOverrides` or entry, a key with surrounding whitespace, or an entry without `rewindHintReserveTokens` (e.g. a pasted pi `reserveTokens` entry) warns and is ignored; other keys inside an entry are ignored.
 
 ### Rewind hygiene (always on)
 

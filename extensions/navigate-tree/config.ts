@@ -25,8 +25,9 @@
  *     global entry), then a matching entry beats the base value — so a
  *     global model entry beats a project-wide base, as in pi. Entry values
  *     follow the base field's rules; an invalid entry disables the hint for
- *     that model. A non-object `modelOverrides` or entry warns and is
- *     ignored; unknown entry keys are ignored.
+ *     that model. A non-object `modelOverrides` or entry, a key with
+ *     surrounding whitespace, or an entry without `rewindHintReserveTokens`
+ *     warns and is ignored; other keys inside an entry are ignored.
  *
  * Failure semantics (issues #44/#55; authoritative):
  *   - File-level problems (non-ENOENT read failure, invalid JSON, non-object
@@ -41,6 +42,10 @@
  *     the default: a touched-but-invalid value must not disable a
  *     non-optional feature, and any unintended turn index only places a
  *     benign label.
+ *   - `modelOverrides` problems (#86) are scoped to the entry: an invalid
+ *     entry value disables the hint for that model only (no fallback to the
+ *     base, same reasoning as the base field); shape problems warn and drop
+ *     the entry or the whole object, leaving the base value in force.
  *   - A missing file is the normal "not configured" state → silent. Warning
  *     on it would toast every session of every user without a config.
  *
@@ -104,10 +109,7 @@ export interface ParsedLayer {
    */
   modelHints: Map<string, HintField>;
   /** Shape problems for the loader to warn about (each is ignored). */
-  modelOverridesProblems: {
-    notObject: boolean;
-    nonObjectEntries: string[];
-  };
+  modelOverridesProblems: ModelOverridesProblems;
 }
 
 /**
@@ -137,6 +139,25 @@ function parseStartTurns(n: number): StartAnchorField {
     : { kind: "invalid" };
 }
 
+/** `modelOverrides` shape problems; each one warns and is ignored. */
+export interface ModelOverridesProblems {
+  notObject: boolean;
+  nonObjectEntries: string[];
+  /** Keys with surrounding whitespace: they can never match a model. */
+  paddedKeys: string[];
+  /** Entries without `rewindHintReserveTokens` (e.g. pi's `reserveTokens`). */
+  entriesWithoutReserve: string[];
+}
+
+function noModelOverridesProblems(): ModelOverridesProblems {
+  return {
+    notObject: false,
+    nonObjectEntries: [],
+    paddedKeys: [],
+    entriesWithoutReserve: [],
+  };
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -145,7 +166,7 @@ function parseModelOverrides(
   record: Record<string, unknown>,
 ): Pick<ParsedLayer, "modelHints" | "modelOverridesProblems"> {
   const modelHints = new Map<string, HintField>();
-  const problems = { notObject: false, nonObjectEntries: [] as string[] };
+  const problems = noModelOverridesProblems();
   if (!("modelOverrides" in record)) {
     return { modelHints, modelOverridesProblems: problems };
   }
@@ -155,12 +176,17 @@ function parseModelOverrides(
     return { modelHints, modelOverridesProblems: problems };
   }
   for (const [key, entry] of Object.entries(overrides)) {
+    if (key.trim() !== key) {
+      problems.paddedKeys.push(key);
+      continue;
+    }
     if (!isPlainObject(entry)) {
       problems.nonObjectEntries.push(key);
       continue;
     }
     const hint = parseHintField(entry);
-    if (hint.kind !== "absent") modelHints.set(key, hint);
+    if (hint.kind === "absent") problems.entriesWithoutReserve.push(key);
+    else modelHints.set(key, hint);
   }
   return { modelHints, modelOverridesProblems: problems };
 }
@@ -272,7 +298,7 @@ export function mergeTreeNavigatorConfig(
       ...globalLayer.modelHints,
       ...projectLayer.modelHints,
     ]),
-    modelOverridesProblems: { notObject: false, nonObjectEntries: [] },
+    modelOverridesProblems: noModelOverridesProblems(),
   };
 }
 
@@ -306,7 +332,7 @@ const ABSENT_LAYER: ParsedLayer = {
   hint: { kind: "absent" },
   startAnchor: { kind: "absent" },
   modelHints: new Map(),
-  modelOverridesProblems: { notObject: false, nonObjectEntries: [] },
+  modelOverridesProblems: noModelOverridesProblems(),
 };
 
 interface LayerLoadResult {
@@ -363,20 +389,30 @@ async function loadLayer(
       `navigate_tree: rewindHintAtPercent in ${layer} config at ${path} was removed in 0.3.0 and is ignored — use rewindHintReserveTokens (tokens left in the window when the hint fires, e.g. 50000).`,
     );
   }
+  const hintExpectation = `expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled")`;
   if (parsed.layer.hint.kind === "invalid") {
     warnings.push(
-      `navigate_tree: invalid rewindHintReserveTokens in ${layer} config at ${path} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
+      `navigate_tree: invalid rewindHintReserveTokens in ${layer} config at ${path} — ${hintExpectation}; rewind hint disabled for this session.`,
     );
   }
-  const hintExpectation = `expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled")`;
   if (parsed.layer.modelOverridesProblems.notObject) {
     warnings.push(
       `navigate_tree: modelOverrides in ${layer} config at ${path} must be an object keyed by "provider/modelId" — ignored.`,
     );
   }
+  for (const key of parsed.layer.modelOverridesProblems.paddedKeys) {
+    warnings.push(
+      `navigate_tree: modelOverrides key ${JSON.stringify(key)} in ${layer} config at ${path} has surrounding whitespace and can never match a model — ignored.`,
+    );
+  }
   for (const key of parsed.layer.modelOverridesProblems.nonObjectEntries) {
     warnings.push(
       `navigate_tree: modelOverrides[${JSON.stringify(key)}] in ${layer} config at ${path} must be an object — ignored.`,
+    );
+  }
+  for (const key of parsed.layer.modelOverridesProblems.entriesWithoutReserve) {
+    warnings.push(
+      `navigate_tree: modelOverrides[${JSON.stringify(key)}] in ${layer} config at ${path} sets no rewindHintReserveTokens — ignored.`,
     );
   }
   for (const [key, field] of parsed.layer.modelHints) {
