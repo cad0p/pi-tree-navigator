@@ -18,8 +18,10 @@
  *   - the eight r5d headings are present in order;
  *   - total length <= 4500 chars (r5d asks for "under about 4000");
  *   - no leftover `{first}` placeholder.
- * It also prints the newest rewind tool-result `details.summaryCache` block
- * when present (provider-measured cache evidence).
+ * It also prints the in-band summary turn's provider usage (#80: the
+ * assistant entry appended right before the newest `branch_summary`, whose
+ * `cacheRead` is the cache evidence) and the newest `navigate-tree-rewind`
+ * continuation message's `details`.
  *
  * Scope is deliberately NOT asserted here: "describes only the collapsed
  * branch, background excluded, work not continued" needs a reader. The
@@ -134,19 +136,30 @@ function main() {
     process.exit(1);
   }
 
-  const cacheBlocks = [];
-  for (const e of entries) {
-    if (e.type !== "message") continue;
-    const details = e.message?.details;
-    if (details?.summaryCache) cacheBlocks.push(details.summaryCache);
+  const lastSummaryIndex = entries.lastIndexOf(summaries[summaries.length - 1]);
+  let summaryTurn = null;
+  for (let i = lastSummaryIndex - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.type === "message" && e.message?.role === "assistant") {
+      summaryTurn = e;
+      break;
+    }
   }
-  if (cacheBlocks.length > 0) {
-    const latest = cacheBlocks[cacheBlocks.length - 1];
+  if (summaryTurn?.message?.usage) {
+    const u = summaryTurn.message.usage;
     console.log(
-      `cache ${JSON.stringify(latest)}`,
+      `summary turn usage ${JSON.stringify({ input: u.input, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output })}`,
     );
   } else {
-    console.log("cache (no details.summaryCache found in this session)");
+    console.log("summary turn usage (no assistant entry before the newest branch_summary)");
+  }
+  const continuations = entries.filter(
+    (e) => e.type === "custom_message" && e.customType === "navigate-tree-rewind",
+  );
+  if (continuations.length > 0) {
+    console.log(`continuation ${JSON.stringify(continuations[continuations.length - 1].details)}`);
+  } else {
+    console.log("continuation (no navigate-tree-rewind message found in this session)");
   }
 
   const checked = all ? summaries : [summaries[summaries.length - 1]];

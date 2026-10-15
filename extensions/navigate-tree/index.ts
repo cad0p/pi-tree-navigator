@@ -2,13 +2,15 @@
  * navigate-tree — agent-callable session tree navigation.
  *
  * See README “Implementation notes” for the user-facing narrative
- * (Anthropic tool_use↔tool_result pairing, same-loop context refresh,
- * reflection bootstrap). This file-level JSDoc carries only
- * source-internal facts the README doesn't.
+ * (in-band summary turn, same-loop context refresh, reflection
+ * bootstrap). This file-level JSDoc carries only source-internal facts
+ * the README doesn't.
  *
  * `/tree`-visible artifacts (empirical):
- *   • Synthetic assistant message right after each `branch_summary`,
- *     with one tool_call sharing the in-flight `toolCallId`.
+ *   • The abandoned branch of every rewind ends with the rewind tool
+ *     call, its instruction result, and the model's summary turn; the
+ *     active branch continues from the `branch_summary` with the
+ *     `navigate-tree-rewind` continuation message.
  *   • Dangling tool_use on the anchor entry whose original
  *     tool_results were cut off by the rewind. Anthropic accepts this
  *     — the dangling tool_use is buffered behind the branch_summary's
@@ -34,24 +36,15 @@
  *     the pi process, including sessions that never call
  *     `navigate_tree`.
  *
- * Verified against pi 1.1.0 via `scripts/pi-upstream-probe.mjs` (the
- * two remaining reflection points plus the #75 capture/transport
- * seams). In-loop context refresh runs through the public `context`
- * extension event (see `buildContextMessages`), not
- * `agent.prepareNextTurn*` reflection; the cache-preserving summary
- * path (#75) captures the FINAL live request by wrapping the public
- * `agent.transformContext` field (after the host's forced-prompt and
- * hidden-declaration projections) and replays it through the public
- * `modelRegistry.streamSimple`.
+ * Verified against pi 1.2.0 via `scripts/pi-upstream-probe.mjs`.
+ * In-loop context refresh runs through the public `context` extension
+ * event (see `buildContextMessages`), not `agent.prepareNextTurn*`
+ * reflection. The rewind summary is written in-band by the live model
+ * (#80): no out-of-loop summarization request exists.
  */
 
-import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type {
-  AgentMessage,
-  StreamFn,
-  ThinkingLevel,
-} from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   AgentSession,
   buildSessionContext,
@@ -60,26 +53,13 @@ import {
   collectEntriesForBranchSummary,
   convertToLlm,
   type ExtensionAPI,
-  estimateTokens,
-  generateBranchSummary,
   getAgentDir,
-  keyHint,
-  type ModelRegistry,
+  prepareBranchEntries,
   type SessionEntry,
   type SessionManager,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import {
-  buildSummaryInstructionMessage,
-  type CacheRequest,
-  createCachePreservingStreamFn,
-  detectBranchSummaryCacheMiss,
-  formatBranchSummaryCacheMissNotice,
-  measureSummaryCache,
-  resolveSummaryCacheRetention,
-} from "./cache-summary.ts";
 import {
   loadTreeNavigatorConfig,
   START_ANCHOR_DEFAULT_TURNS,
@@ -105,6 +85,11 @@ import {
   REWIND_HINT_CUSTOM_TYPE,
   RewindHintTracker,
 } from "./rewind-hint.ts";
+import {
+  buildStoredSummary,
+  buildSummaryInstruction,
+  computeFileLists,
+} from "./summary-prompt.ts";
 
 /**
  * Always-on anchor mandate appended to the system prompt on every agent
@@ -125,7 +110,7 @@ export const START_ANCHOR_LABEL = `${LABEL_PREFIX}start`;
 // ---------------------------------------------------------------------------
 // Exported boundary constants below (MAX_SESSION_REFS, MAX_HINT_WALK_DEPTH,
 // MIN_SUMMARY_FOCUS_LENGTH, MIN_REWIND_SAVINGS_TOKENS,
-// MAX_SYNTHETIC_FOCUS_LENGTH).
+// MAX_SUMMARY_ATTEMPTS).
 //
 // Stability: these are internal tunables. Exported only so the test suite
 // can pin boundary cases by constant rather than literal. Re-tuning is
@@ -134,7 +119,6 @@ export const START_ANCHOR_LABEL = `${LABEL_PREFIX}start`;
 // these constants directly. The `__testHooks` JSDoc carries the same
 // caveat for module-internal helpers.
 // ---------------------------------------------------------------------------
-
 // Cap on captured AgentSession refs across /new + /resume + /reload cycles.
 // Worst case is ~one ref per long-lived session before reaping dead WeakRefs;
 // 16 leaves headroom for the deepest session-fanout pattern observed (a few
@@ -158,24 +142,20 @@ export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // window-relative: % semantics drift with window size, so a fixed token bar
 // is the only stable shape. Every rewind carries ≈350–900 tokens of fixed
 // overhead (the branch_summary adds ~300–800 permanent tokens on the kept
-// chain; the synthetic assistant re-emits ~50 on every subsequent turn), so
+// chain, plus the continuation message), so
 // apparent savings OVERSTATES true freed context. Empirically the degenerate
 // anchor→immediate-rewind case measures ~100 apparent tokens while a healthy
 // stage measures ~20k — 4k separates them cleanly (~200×) and roughly equals
 // one 300-line source-file read (~5.9k tokens measured). Below the floor a
-// rewind burns a summarizer LLM call, forks a junk branch_summary, consumes
+// rewind burns a summary turn, forks a junk branch_summary, consumes
 // a milestone label, and GROWS live context.
 export const MIN_REWIND_SAVINGS_TOKENS = 4000;
-// Cap on the `summaryFocus` length stored in the synthetic assistant's
-// arguments. The full focus is passed live to `generateBranchSummary`, so
-// the summarizer always sees the original; we only need a trimmed copy in
-// the synthetic's args because pi's `convertToLlm` re-emits the synthetic's
-// toolCall block (including its arguments) on every subsequent turn until
-// another rewind. Without a cap, a 100K-char focus inflates every later
-// turn's input by ~100K chars indefinitely. 1024 chars is generous — well
-// above empirically useful focus length, and the agent already saw the
-// full focus string when it issued the rewind.
-export const MAX_SYNTHETIC_FOCUS_LENGTH = 1024;
+// Summary turns a pending rewind tolerates before it is cancelled (#80). A
+// summary turn fails when it calls a tool (blocked while the rewind is
+// pending) or carries no `## Goal` summary; each failure re-asks. Failed
+// attempts sit on the segment the rewind collapses, so a retry costs one
+// cached turn and nothing after the rewind lands.
+export const MAX_SUMMARY_ATTEMPTS = 3;
 // Hint length cap for the per-row hint shown in `list` output. 50 chars
 // fits one terminal column without wrapping in typical 80-column TUIs.
 const LIST_HINT_MAX_LENGTH = 50;
@@ -192,12 +172,6 @@ const LIST_PCT_COL_WIDTH = 5;
 // hint column visible without truncating common names.
 const LIST_LABEL_COL_WIDTH = 28;
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
-
-/**
- * Stashed host transformContext (#75), so a `/reload` re-wraps the host's own
- * transform instead of chaining another observer layer.
- */
-const ORIG_TRANSFORM_KEY = Symbol.for("navigate-tree.orig-transform-context");
 
 // Two warnings: list-site (read-only path; warns about the next turn's
 // context view) and rewind-site (wrote to disk; leads with that). Both
@@ -221,21 +195,7 @@ interface PiInternals {
   agent: {
     state: {
       messages: unknown[];
-      /** Live system prompt (cache-preserving request mirror; #33). */
-      systemPrompt: string;
-      /** Live tool instances (cache-preserving request mirror; #33). */
-      tools: unknown[];
     };
-    /** Live thinking token budgets (plain field on pi-agent-core's Agent). */
-    thinkingBudgets?: unknown;
-  };
-  /**
-   * Plain field on `AgentSession`; the extension ctx does not expose
-   * settings. Used only to gate the TUI cache notice on pi's own
-   * `showCacheMissNotices` setting (default off).
-   */
-  settingsManager?: {
-    getShowCacheMissNotices?: () => boolean;
   };
   /**
    * Plain field on `AgentSession` (#79). Used only to emit `session_tree`
@@ -260,82 +220,10 @@ function asInternals(session: AgentSession): PiInternals {
 const sessionInstances: WeakRef<AgentSession>[] = [];
 let seenSessions = new WeakSet<AgentSession>();
 
-/**
- * Most recent FINAL live request captured per session (#75): the exact
- * `[head, ...messages]` array the agent loop hands to the provider, i.e. the
- * output of the host's composed `transformContext` (runner `context` /
- * `context_with_system` handlers, then the forced-prompt and
- * hidden-declaration projections). Stored post-transform on purpose: the
- * public `context_with_system` event fires BEFORE those host projections, so
- * capturing there misses the forced head (live evidence: pi 1.1.0
- * `AgentSession._installAgentForcedPromptProjection` wraps
- * `agent.transformContext` outside `runner.emitContext`).
- */
-interface LiveCapture {
-  messages: AgentMessage[];
-  leafId: string | null;
-}
-const liveCaptures = new Map<string, LiveCapture>();
-
-/**
- * Install the observation-only live-request capture on a session's Agent by
- * wrapping `agent.transformContext` (a public Agent field) once per session.
- * The wrapper delegates to the host's own transform, stores the result, and
- * returns it unchanged — it can never alter the live request. Replace, never
- * stack: the original is stashed under `ORIG_TRANSFORM_KEY` the first time,
- * presence-checked with `hasOwnProperty` so an absent host transform (stashed
- * as `undefined`) is not re-wrapped on `/reload`.
- */
-function installLiveCaptureWrapper(session: AgentSession): void {
-  try {
-    const agent = asInternals(session).agent as
-      | (Record<PropertyKey, unknown> & {
-          transformContext?: (
-            messages: AgentMessage[],
-            signal?: AbortSignal,
-          ) => Promise<AgentMessage[]> | AgentMessage[];
-        })
-      | undefined;
-    if (!agent) return;
-    if (!Object.hasOwn(agent, ORIG_TRANSFORM_KEY)) {
-      agent[ORIG_TRANSFORM_KEY] = agent.transformContext;
-    }
-    const orig = agent[ORIG_TRANSFORM_KEY] as
-      | ((
-          messages: AgentMessage[],
-          signal?: AbortSignal,
-        ) => Promise<AgentMessage[]> | AgentMessage[])
-      | undefined;
-    agent.transformContext = async (messages, signal) => {
-      const transformed = orig ? await orig(messages, signal) : messages;
-      try {
-        const sessionId = session.sessionManager.getSessionId();
-        // Refresh insertion order so the cap evicts the stalest session.
-        liveCaptures.delete(sessionId);
-        liveCaptures.set(sessionId, {
-          messages: transformed.slice(),
-          leafId: session.sessionManager.getLeafId(),
-        });
-        if (liveCaptures.size > MAX_SESSION_REFS) {
-          const oldest = liveCaptures.keys().next().value;
-          if (oldest !== undefined) liveCaptures.delete(oldest);
-        }
-      } catch {
-        // Observation-only: a throwing sessionManager must never break the
-        // live request. A missing capture just takes the cold fallback.
-      }
-      return transformed;
-    };
-  } catch {
-    // Older/reshaped host: no wrapper ⇒ no capture ⇒ cold fallback.
-  }
-}
-
 function captureSession(session: AgentSession): void {
   if (seenSessions.has(session)) return;
   seenSessions.add(session);
   sessionInstances.push(new WeakRef(session));
-  installLiveCaptureWrapper(session);
   // Reap dead WeakRefs occasionally so the array doesn't grow unbounded
   // across /new and /resume cycles.
   if (sessionInstances.length > MAX_SESSION_REFS) {
@@ -377,107 +265,6 @@ function findOwningSession(sm: SessionManager): AgentSession | null {
     }
   }
   return null;
-}
-
-/**
- * Resolve the live-streaming transport for summarization via the PUBLIC
- * `modelRegistry.streamSimple` API (no reflection).
- *
- * `ModelRegistry.streamSimple` runs the same `ModelRuntime` pipeline the
- * agent loop uses — `normalizeContext` (no prepend: the wrapper passes only
- * `messages`), `prepareRequest` auth resolution (apiKey / headers /
- * credential baseUrl / provider env), virtual-model routing, and the
- * composed provider. The composed provider is what keeps custom providers
- * registered via `pi.registerProvider(name, { api: <custom-id>,
- * streamSimple })` routable: `completeSummarization` alone falls back to the
- * pi-ai compat registry (builtin apis only) and throws "No API provider
- * registered for api: <custom-id>".
- *
- * The `typeof` guard covers mocked/older registries; when `streamSimple` is
- * absent the caller passes no `streamFn` and upstream's cold request runs
- * through its own dispatch.
- */
-function resolveLiveStreamFn(
-  modelRegistry: ModelRegistry,
-): { streamFn: StreamFn } | undefined {
-  try {
-    return typeof modelRegistry.streamSimple === "function"
-      ? {
-          streamFn: (model, context, options) =>
-            modelRegistry.streamSimple(model, context, options),
-        }
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Drop `null` header-deletion markers (pi 0.84+ `ProviderHeaders` can carry
- * `string | null` values). Mirrors pi's own `withoutDeletedHeaders` in
- * agent-session.js — `generateBranchSummary` expects `Record<string, string>`.
- */
-function stripNullHeaders(
-  headers: Record<string, string | null> | undefined,
-): Record<string, string> | undefined {
-  if (!headers) return undefined;
-  const entries = Object.entries(headers).filter((entry) => entry[1] !== null);
-  return entries.length > 0
-    ? (Object.fromEntries(entries) as Record<string, string>)
-    : undefined;
-}
-
-/**
- * Session-routing headers for the summarization request.
- *
- * Pi's live turns merge these in `sdk.ts` via `mergeProviderAttributionHeaders`
- * (session headers + install-telemetry attribution). Out-of-loop summarization
- * callers — pi's own `agent-session.navigateTree` and this extension — pass only
- * auth headers, so providers that REQUIRE the session header 400 the request
- * (`MissingSessionID`; observed on opencode-go 2026-09-07: every rewind and every
- * native `/tree` summary fails deterministically).
- *
- * The tool-execute ctx exposes neither `settingsManager` (telemetry attribution)
- * nor the live routing `sessionId` on 0.81.x, so this replicates only the session
- * half of pi's merge (`getSessionHeaders` in `provider-attribution.ts`): for
- * opencode-family providers, inject `x-opencode-session` + `x-opencode-client`.
- *
- * `sessionId` is the LIVE session id when the caller can supply one
- * (`sm.getSessionId()`), so the summarization request routes to the same
- * replica/affinity bucket as the turns it summarizes. A fresh UUID is only the
- * fallback for callers that cannot supply one (upstream's `completeSummarization`
- * does the same via `uuidv7()`). The header is routing-only — on
- * openai-responses the *cache key* is `prompt_cache_key`, derived from the
- * forwarded `sessionId` option, not from this header (pi-ai sets the header from
- * `sessionId` only when the provider opts into session affinity).
- *
- * Never overrides a header the auth layer already set.
- */
-function withSessionHeaders(
-  model: { provider?: string; baseUrl?: string } | undefined,
-  headers: Record<string, string> | undefined,
-  sessionId?: string,
-): Record<string, string> | undefined {
-  const provider = model?.provider ?? "";
-  let host = "";
-  try {
-    host = model?.baseUrl ? new URL(model.baseUrl).hostname : "";
-  } catch {
-    host = "";
-  }
-  const needsSession =
-    provider === "opencode" ||
-    provider === "opencode-go" ||
-    host === "opencode.ai";
-  if (!needsSession) return headers;
-  const merged = { ...(headers ?? {}) };
-  if (!merged["x-opencode-session"]) {
-    merged["x-opencode-session"] = sessionId || randomUUID();
-  }
-  if (!merged["x-opencode-client"]) {
-    merged["x-opencode-client"] = "pi";
-  }
-  return merged;
 }
 
 /**
@@ -659,20 +446,6 @@ async function emitSessionTree(
   }
 }
 
-/**
- * Providers whose live turns run through a conversation mirror the cache
- * replay cannot target (#79). pi-claude-bridge serves each turn from a Claude
- * Code session; a non-`none` summary request while the rewinding query is
- * parked would be handled as a reentrant query on that same session. Its
- * supported summarization route is `cacheRetention: "none"` (an isolated
- * query), which is exactly the cold path.
- */
-function isMirroredSessionProvider(
-  model: { api?: string; provider?: string } | undefined,
-): boolean {
-  return model?.api === "claude-bridge" || model?.provider === "claude-bridge";
-}
-
 // =============================================================================
 // Helpers (extension-internal; pure helpers in ./helpers.ts)
 // =============================================================================
@@ -686,108 +459,6 @@ function findLabeledEntry(
     if (sm.getLabel(path[i].id) === fullLabel) return path[i].id;
   }
   return null;
-}
-
-/** Shape of a `toolCall` content block on an assistant message. */
-interface ToolCallBlock {
-  id: string;
-  name?: unknown;
-}
-
-/**
- * Find the assistant message that declared the in-flight tool call and
- * return its full tool-call batch as emitted (emission order), or `null`
- * when neither the active branch nor the captured session's live messages
- * carry it.
- *
- * `rewind` is only structurally safe as a solo call (#37): it forks the
- * tree and re-declares ONLY its own tool call in a synthetic assistant, so
- * a sibling call's result — appended by pi's sequential loop after the
- * fork — would land on the new branch with no declaring assistant and
- * brick every subsequent request. This helper is the detection seam for
- * the pre-mutation refusal guard.
- *
- * Primary source is `sm.getBranch()`: pi persists the assistant
- * SessionEntry on `message_end` before `tool_execution_start`, so the
- * in-flight assistant is already on the active branch when `execute` runs
- * (asserted by `scripts/pi-upstream-probe.mjs`). The walk matches by
- * tool-call id, not by tail position, because preceding sibling results
- * may already trail the assistant. `getBranch()` reads internal session
- * state and can throw, and tree-write lag can leave it stale; both cases
- * fall back to the same scan over the captured session's
- * `agent.state.messages`. A miss returns `null` so callers fall through to
- * the pre-guard behavior — never hard-fail on undetectable state.
- *
- * Detection fails open on shape, not count: every `toolCall` block with a
- * string `id` counts toward the returned batch, even if its `name` is
- * missing or malformed (`name` falls back to `"unknown"`), so a sibling
- * call can't be silently dropped from the count by an unexpected shape.
- */
-function findInFlightAssistantToolCalls(
-  sm: SessionManager,
-  toolCallId: string,
-): Array<{ id: string; name: string }> | null {
-  const scan = (
-    items: ReadonlyArray<unknown>,
-  ): Array<{ id: string; name: string }> | null => {
-    for (let i = items.length - 1; i >= 0; i--) {
-      const item = items[i] as
-        | { type?: unknown; message?: unknown }
-        | null
-        | undefined;
-      if (!item || typeof item !== "object") continue;
-      // SessionEntry: `{ type: "message", message: {...} }`. Raw
-      // `agent.state.messages` entries are the message itself.
-      const candidate = (item.type === "message" ? item.message : item) as
-        | { role?: unknown; content?: unknown }
-        | null
-        | undefined;
-      if (
-        !candidate ||
-        typeof candidate !== "object" ||
-        candidate.role !== "assistant" ||
-        !Array.isArray(candidate.content)
-      ) {
-        continue;
-      }
-      const toolCalls = candidate.content.filter(
-        (block): block is ToolCallBlock =>
-          !!block &&
-          typeof block === "object" &&
-          (block as { type?: unknown }).type === "toolCall" &&
-          typeof (block as { id?: unknown }).id === "string",
-      );
-      if (toolCalls.some((block) => block.id === toolCallId)) {
-        return toolCalls.map((block) => ({
-          id: block.id,
-          name: typeof block.name === "string" ? block.name : "unknown",
-        }));
-      }
-    }
-    return null;
-  };
-
-  let branch: SessionEntry[] | undefined;
-  try {
-    branch = sm.getBranch();
-  } catch {
-    // getBranch() reads internal session state; fall through to the
-    // captured-session scan instead of aborting the rewind.
-  }
-  if (branch) {
-    const onBranch = scan(branch);
-    if (onBranch) return onBranch;
-  }
-  const session = findOwningSession(sm);
-  const liveMessages = session
-    ? asInternals(session).agent?.state?.messages
-    : undefined;
-  if (!Array.isArray(liveMessages)) return null;
-  try {
-    return scan(liveMessages);
-  } catch {
-    return null;
-  }
 }
 
 function estimateActiveBranchTokens(sm: SessionManager): number {
@@ -884,54 +555,64 @@ function findLabelHint(
   return null;
 }
 
-/**
- * Build a synthetic assistant message containing a single tool_call whose id
- * matches the in-flight tool_call id. Appended after `branchWithSummary` so
- * the real tool_result lands paired with a matching tool_use.
- *
- * `usage` fields are zeroed except `totalTokens`, which is set to the
- * chain size measured BEFORE this synthetic is appended (the post-rewind
- * baseline that the local `estimateContextTokens` (context-tokens.ts)
- * reads off the last assistant). `stopReason: "toolUse"` survives Kiro's `normalizeMessages`
- * filter (which strips `error` / `aborted`); without it the synthetic would
- * be filtered out and the tool_result would re-orphan.
- */
-function buildSyntheticAssistant(
-  toolCallId: string,
-  toolName: string,
-  args: Record<string, unknown>,
-  model: { api?: string; provider?: string; id?: string } | undefined,
-  totalTokens: number,
-) {
-  return {
-    role: "assistant" as const,
-    content: [
-      {
-        type: "toolCall" as const,
-        id: toolCallId,
-        name: toolName,
-        arguments: args,
-      },
-    ],
-    api: model?.api ?? "unknown",
-    provider: model?.provider ?? "unknown",
-    model: model?.id ?? "unknown",
-    stopReason: "toolUse" as const,
-    timestamp: Date.now(),
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-  };
-}
-
 // =============================================================================
 // Extension
 // =============================================================================
+
+/** A rewind waiting for its in-band summary turn (#80). */
+interface PendingRewind {
+  /** The rewind tool call; its own turn is not the summary turn. */
+  toolCallId: string;
+  target: string;
+  rewindTo: string;
+  newLabel: string;
+  beforeTokens: number;
+  contextWindow: number;
+  /** Failed summary turns so far (tool call / no `## Goal` / truncated). */
+  attempts: number;
+}
+
+/** customType of the rewind continuation / retry / cancel messages (#80). */
+export const REWIND_CUSTOM_TYPE = "navigate-tree-rewind";
+
+export const SUMMARY_PENDING_BLOCK_REASON = `${TOOL_NAME}: a rewind is waiting for its summary — tool calls are blocked until it lands. Your entire next reply must be the summary in the format the rewind result requested, starting with '## Goal' — no acknowledgement, no tool calls.`;
+
+/**
+ * The summary turn's text, from its `## Goal` heading on (r5d's first
+ * required heading), or `null` when the heading is missing — an
+ * acknowledgement or commentary turn is a failed attempt, never a stored
+ * summary. Any preamble before the heading is dropped.
+ */
+export function extractSummaryText(text: string): string | null {
+  const start = text.search(/^## Goal\b/m);
+  if (start < 0) return null;
+  const summary = text.slice(start).trim();
+  return summary.length > 0 ? summary : null;
+}
+
+export function buildRewindDoneText(
+  pending: Pick<
+    PendingRewind,
+    "rewindTo" | "newLabel" | "beforeTokens" | "contextWindow"
+  >,
+  afterTokens: number,
+): string {
+  return (
+    `[rewind to '${pending.rewindTo}' · collapsed as '${pending.newLabel}'] · ${formatContextDelta(pending.beforeTokens, afterTokens, pending.contextWindow)}\n\n` +
+    `A branch_summary of the collapsed work has been appended to your context. It is the newest branch_summary, the current state; earlier branch_summary messages, if present, are older collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work. User messages retained above predate this rewind — do not re-answer them.`
+  );
+}
+
+export function buildSummaryRetryText(rewindTo: string): string {
+  return `[${TOOL_NAME}] The rewind to '${rewindTo}' is still waiting for its summary. Your entire reply must be the summary in the format the rewind result requested, starting with '## Goal' — no acknowledgement, no tool calls.`;
+}
+
+export function buildRewindCancelledText(
+  rewindTo: string,
+  reason: string,
+): string {
+  return `[${TOOL_NAME}] Rewind to '${rewindTo}' cancelled: ${reason}. Nothing was collapsed — continue the work and rewind again later.`;
+}
 
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -956,16 +637,231 @@ function toolError(
   };
 }
 
-export default function (
-  pi: ExtensionAPI,
-  opts?: { summarize?: typeof generateBranchSummary },
-) {
-  // DI seam: tests inject a stub `summarize` to avoid hitting the real
-  // model. Production callers (pi's extension loader) pass no second
-  // argument, so this falls back to the real `generateBranchSummary`
-  // import.
-  const summarize = opts?.summarize ?? generateBranchSummary;
+export default function (pi: ExtensionAPI) {
   patchAgentSessionPrototype();
+
+  // Pending in-band rewinds (#80), keyed by session id: set by the rewind
+  // tool call, completed (or cancelled) by the summary turn's `turn_end`.
+  const pendingRewinds = new Map<string, PendingRewind>();
+
+  // Deliver a rewind message to the model. `triggerTurn` steers the running
+  // loop (a text-only summary turn would otherwise end the run, and the
+  // rewound context must reach a real turn without a user prompt); when idle
+  // it starts the continuation run. The direct append is the stale-runtime
+  // fallback: the `context` handler still carries it to the next LLM call.
+  function sendRewindMessage(
+    sm: SessionManager,
+    content: string,
+    details: Record<string, unknown>,
+  ): void {
+    try {
+      pi.sendMessage(
+        { customType: REWIND_CUSTOM_TYPE, content, display: true, details },
+        { triggerTurn: true },
+      );
+    } catch {
+      try {
+        (sm as Partial<SessionManager>).appendCustomMessageEntry?.(
+          REWIND_CUSTOM_TYPE,
+          content,
+          true,
+          details,
+        );
+      } catch {
+        // Fail-open: never throw into the agent loop.
+      }
+    }
+  }
+
+  function cancelRewind(
+    sm: SessionManager,
+    sessionId: string,
+    pending: PendingRewind,
+    reason: string,
+  ): void {
+    pendingRewinds.delete(sessionId);
+    sendRewindMessage(sm, buildRewindCancelledText(pending.rewindTo, reason), {
+      status: "cancelled",
+      rewindTo: pending.rewindTo,
+      newLabel: pending.newLabel,
+      reason,
+      summaryAttempts: pending.attempts,
+    });
+  }
+
+  // Phase 2 of an in-band rewind (#80): branch from the anchor with the
+  // summary the live model just wrote. Nothing is in flight — the summary
+  // turn has ended — so the rewind tool call, its instruction result and the
+  // summary all stay on the abandoned branch and no synthetic tool_use is
+  // needed to keep the new branch structurally valid.
+  async function completeRewind(
+    sm: SessionManager,
+    sessionId: string,
+    pending: PendingRewind,
+    summaryText: string,
+  ): Promise<void> {
+    // A compaction or tree move during the summary turn invalidates the
+    // rewind: the anchor must still be the same labeled entry on the active
+    // branch, and the new label must still be free.
+    if (
+      findLabeledEntry(sm, LABEL_PREFIX + pending.rewindTo) !== pending.target
+    ) {
+      cancelRewind(
+        sm,
+        sessionId,
+        pending,
+        `'${pending.rewindTo}' is no longer on the active branch`,
+      );
+      return;
+    }
+    if (findLabeledEntry(sm, LABEL_PREFIX + pending.newLabel)) {
+      cancelRewind(
+        sm,
+        sessionId,
+        pending,
+        `a label '${pending.newLabel}' now exists on the active branch`,
+      );
+      return;
+    }
+    pendingRewinds.delete(sessionId);
+    const oldLeafId = sm.getLeafId();
+    const { entries } = collectEntriesForBranchSummary(
+      sm,
+      oldLeafId,
+      pending.target,
+    );
+    const { fileOps } = prepareBranchEntries(entries, Number.MAX_SAFE_INTEGER);
+    const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+    const summaryId = sm.branchWithSummary(
+      pending.target,
+      buildStoredSummary(summaryText, readFiles, modifiedFiles),
+      { readFiles, modifiedFiles },
+    );
+    const fullLabel = LABEL_PREFIX + pending.newLabel;
+    try {
+      pi.setLabel(summaryId, fullLabel);
+    } catch {
+      // Stale runtime: the captured SessionManager still writes.
+      try {
+        sm.appendLabelChange(summaryId, fullLabel);
+      } catch {
+        // The summary landed unlabeled; `list` simply won't show it.
+      }
+    }
+    const afterTokens = estimateActiveBranchTokens(sm);
+    const refreshed = refreshAgentMessages(sm);
+    const historyRewriteNotified = await emitSessionTree(
+      sm,
+      oldLeafId,
+      summaryId,
+    );
+    sendRewindMessage(
+      sm,
+      buildRewindDoneText(pending, afterTokens) +
+        (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
+      {
+        status: "done",
+        rewindTo: pending.rewindTo,
+        newLabel: pending.newLabel,
+        targetId: pending.target,
+        summaryId,
+        collapsedEntries: entries.length,
+        contextBefore: pending.beforeTokens,
+        contextAfter: afterTokens,
+        contextWindow: pending.contextWindow,
+        summaryAttempts: pending.attempts + 1,
+        agentMessagesRefreshed: refreshed,
+        historyRewriteNotified,
+        readFiles,
+        modifiedFiles,
+      },
+    );
+  }
+
+  // While a rewind waits for its summary, every tool call is blocked: the
+  // next turn must be the summary itself. The blocked result re-asks.
+  pi.on("tool_call", (_event, ctx) => {
+    let sessionId: string;
+    try {
+      sessionId = ctx.sessionManager.getSessionId();
+    } catch {
+      return undefined;
+    }
+    if (!pendingRewinds.has(sessionId)) return undefined;
+    return { block: true, reason: SUMMARY_PENDING_BLOCK_REASON };
+  });
+
+  // Summary turn (#80). Registered before the hint / start-anchor handler so
+  // a completed rewind is already on the branch when that handler reads the
+  // context usage.
+  pi.on("turn_end", async (event, ctx) => {
+    let sm: SessionManager;
+    let sessionId: string;
+    try {
+      sm = ctx.sessionManager as SessionManager;
+      sessionId = sm.getSessionId();
+    } catch {
+      return;
+    }
+    const pending = pendingRewinds.get(sessionId);
+    if (!pending) return;
+    const message = event.message as {
+      role?: string;
+      content?: unknown;
+      stopReason?: string;
+    };
+    if (message?.role !== "assistant") return;
+    const content = Array.isArray(message.content)
+      ? (message.content as Array<{
+          type?: string;
+          id?: string;
+          text?: string;
+        }>)
+      : [];
+    // The turn that issued the rewind ends after its own tool result; the
+    // summary is the NEXT turn.
+    if (
+      content.some((b) => b?.type === "toolCall" && b.id === pending.toolCallId)
+    ) {
+      return;
+    }
+    if (message.stopReason === "aborted") {
+      // The user's abort wins: drop the rewind without a model message.
+      pendingRewinds.delete(sessionId);
+      return;
+    }
+    // Provider errors go through pi's auto-retry; a run that ends without a
+    // summary drops the pending rewind at `agent_end` (no model message).
+    if (message.stopReason === "error") return;
+    const hasToolCall = content.some((b) => b?.type === "toolCall");
+    const summary = extractSummaryText(
+      content
+        .filter((b) => b?.type === "text" && typeof b.text === "string")
+        .map((b) => b.text)
+        .join(""),
+    );
+    if (hasToolCall || summary === null || message.stopReason === "length") {
+      pending.attempts++;
+      if (pending.attempts >= MAX_SUMMARY_ATTEMPTS) {
+        cancelRewind(
+          sm,
+          sessionId,
+          pending,
+          `no summary after ${pending.attempts} attempts`,
+        );
+      } else if (!hasToolCall) {
+        // A text-only turn ends the loop; blocked tool calls already re-ask.
+        sendRewindMessage(sm, buildSummaryRetryText(pending.rewindTo), {
+          status: "summary-retry",
+          rewindTo: pending.rewindTo,
+          newLabel: pending.newLabel,
+          summaryAttempts: pending.attempts,
+        });
+      }
+      return;
+    }
+    await completeRewind(sm, sessionId, pending, summary);
+  });
 
   // Rewind-hint closure state (#44): fresh per factory invocation and reset
   // on every `session_start`, so `/new` / `/resume` / `/reload` sessions
@@ -996,7 +892,7 @@ export default function (
     sm: SessionManager,
     completedTurns: number,
   ): void {
-    // Kill switch read at write time (mirrors PI_NAVIGATE_TREE_SUMMARY_CACHE):
+    // Kill switch read at write time:
     // a mid-process change applies without an extension reload.
     if (process.env.PI_NAVIGATE_TREE_START_ANCHOR === "0") return;
     let sessionId: string;
@@ -1065,6 +961,7 @@ export default function (
     const hasUI = ctx.hasUI;
     const ui = ctx.ui;
     const sessionId = ctx.sessionManager.getSessionId();
+    pendingRewinds.delete(sessionId);
     rewindHintAtPercent = null;
     hintTracker = new RewindHintTracker();
     toolActive = true;
@@ -1105,7 +1002,7 @@ export default function (
   // fires inside `streamAssistantResponse` (via `Agent.transformContext` →
   // `runner.emitContext`), before EVERY LLM call including the turn right
   // after a mid-loop rewind, so the rewound chain (branch_summary +
-  // synthetic assistant + tool_result) reaches the next API call.
+  // continuation message) reaches the next API call.
   pi.on("context", (_event, ctx) => ({
     messages: buildContextMessages(ctx.sessionManager),
   }));
@@ -1273,6 +1170,13 @@ export default function (
       return;
     }
     writeStartAnchorIfNeeded(sm as SessionManager, Number.POSITIVE_INFINITY);
+    // A run that ends with a rewind still waiting for its summary (aborted
+    // before the summary turn, or an unrecovered provider error) drops it.
+    try {
+      pendingRewinds.delete(sm.getSessionId());
+    } catch {
+      // Stale ctx: nothing to drop.
+    }
   });
 
   pi.registerTool({
@@ -1331,7 +1235,7 @@ Operations (set \`action\`):
         }),
       ),
     }),
-    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
       const sm = ctx.sessionManager as SessionManager;
       const p = params as {
         action: "anchor" | "rewind" | "list";
@@ -1460,35 +1364,14 @@ Operations (set \`action\`):
       }
 
       // Label uniqueness (issue #55, C8): a `newLabel` already on the
-      // active branch is refused BEFORE any summarization or mutation —
+      // active branch is refused BEFORE the summary turn or any mutation —
       // labels are immutable once written, so the anchor→rewind
       // rename-forward idiom is retired. The check sits with the
-      // name/summaryFocus validations so no summarizer call is wasted; the
+      // name/summaryFocus validations so no summary turn is wasted; the
       // existing label stays addressable via `rewindTo`.
       if (findLabeledEntry(sm, LABEL_PREFIX + p.newLabel)) {
         return toolError(
           `A label '${p.newLabel}' already exists on the active branch — labels are unique and immutable once written, so rewind requires a fresh \`newLabel\`. The existing '${p.newLabel}' label stays addressable via \`rewindTo\`. Use action='list' to review the active labels, then pick a fresh newLabel.`,
-        );
-      }
-
-      // Solo-batch guard (#37): a rewind must be the only tool call in its
-      // assistant batch. Pi runs a batch containing this sequential-mode tool
-      // sequentially; `branchWithSummary` then puts the declaring assistant
-      // on the abandoned branch, and the synthetic assistant re-declares
-      // ONLY this call — so any sibling result pi appends afterwards would
-      // land on the new branch with no declaring `tool_calls`, 400-ing every
-      // subsequent request. Refuse before any mutation or LLM call. A missed
-      // detection returns null and falls through to today's behavior. The
-      // validations above ran first so the copy can interpolate a valid
-      // rewindTo.
-      const inFlightBatch = findInFlightAssistantToolCalls(sm, toolCallId);
-      if (inFlightBatch && inFlightBatch.length > 1) {
-        return toolError(
-          `rewind must be the only tool call in its batch — after it, the next context is everything up to '${p.rewindTo}' plus the new summary, so any other call's result would be orphaned — never read by anyone. Those other calls already ran; re-issue only the rewind, alone.`,
-          {
-            rejected: "batched-rewind",
-            batchedToolCalls: inFlightBatch.map((call) => call.name),
-          },
         );
       }
 
@@ -1504,9 +1387,8 @@ Operations (set \`action\`):
         return toolError(`Already at '${p.rewindTo}' — nothing to summarize.`);
       }
 
-      // Token math hoisted ABOVE the model check / auth await (#21): these
-      // are pure SessionManager reads, and the min-savings floor below must
-      // be evaluable — and able to reject — before any auth resolution.
+      // Token math (#21): pure SessionManager reads, so the min-savings
+      // floor below can reject before a pending rewind is recorded.
       // `allEntries`/`byId` are hoisted out of the parented-assistant branch
       // because the floor rejection copy reports per-anchor percentages from
       // the same maps.
@@ -1541,48 +1423,10 @@ Operations (set \`action\`):
           `No entries between leaf and '${p.rewindTo}' — nothing to summarize.`,
         );
       }
-      // Chained-rewind-no-turns guard: bail if the only message between
-      // leaf and target matches our synthetic shape (single navigate_tree
-      // toolCall block + stopReason "toolUse" + zero usage), meaning the
-      // agent didn't append a real turn between rewinds. Keep only message
-      // entries — label / compaction / branch_summary / etc. carry no
-      // rewindable semantic content for this guard. The synthetic-shape
-      // predicate avoids false-positives on real navigate_tree calls
-      // (which have nonzero usage from the model).
-      const messageEntries = entries.filter((e) => e.type === "message");
-      if (messageEntries.length === 1) {
-        const lone = messageEntries[0];
-        if (lone.type === "message" && lone.message.role === "assistant") {
-          const msg = lone.message as {
-            content: Array<{ type?: string; name?: string }>;
-            stopReason?: string;
-            usage?: { input?: number; output?: number };
-          };
-          const block = msg.content[0];
-          const isSyntheticShape =
-            msg.stopReason === "toolUse" &&
-            (msg.usage?.input ?? 0) === 0 &&
-            (msg.usage?.output ?? 0) === 0;
-          if (
-            block &&
-            block.type === "toolCall" &&
-            block.name === TOOL_NAME &&
-            isSyntheticShape
-          ) {
-            return toolError(
-              `Already at synthetic boundary — no work to summarize. Append at least one turn between rewinds.`,
-            );
-          }
-        }
-      }
-
       // Minimum-savings floor (#21): refuse rewinds whose apparent savings
       // is below MIN_REWIND_SAVINGS_TOKENS — collapsing a near-empty segment
-      // burns a summarizer LLM call, forks a junk branch_summary, consumes
-      // a milestone label, and grows live context. Placed AFTER the
-      // synthetic-boundary guard so the chained rewind-with-no-turns case
-      // keeps its specific diagnostic, and BEFORE the model/auth checks so
-      // the rejection fires without touching provider config.
+      // burns a summary turn, forks a junk branch_summary, consumes a
+      // milestone label, and grows live context.
       const apparentSavings = beforeTokens - tokensAtTarget;
       if (apparentSavings < MIN_REWIND_SAVINGS_TOKENS) {
         return toolError(
@@ -1599,477 +1443,64 @@ Operations (set \`action\`):
         );
       }
 
-      if (!ctx.model) {
-        return toolError("No model configured for summarization.");
-      }
-
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-      if (!auth.ok) {
-        return toolError(`Auth resolution failed: ${auth.error}`);
-      }
-
-      // -----------------------------------------------------------------
-      // Cache-preserving summary request (#33)
-      //
-      // `generateBranchSummary` builds a cold, standalone request (generic
-      // summarization prompt, serialized blob, no tools, cacheRetention
-      // "none", fresh session id). The live turns being collapsed were just
-      // cache-served, so the summary re-bills the whole input. We cannot
-      // patch upstream (the extension loader aliases @earendil-works/* to the
-      // host process), but the `streamFn` seam we already inject is the exact
-      // point where upstream's cold context/options exist — wrap it and
-      // rewrite them to the live shape. Every live input is read
-      // defensively: on any miss we leave `summaryCacheRequest` null and the
-      // wrapper delegates today's cold request (with a user-visible warning).
-      //
-      // Two evidence guards also refuse the cache path and fall back to the
-      // cold request, because raw branch evidence must beat a cache hit when
-      // the two disagree:
-      //
-      //   - "branch-crosses-compaction": `buildContextEntries()` applies the
-      //     compaction cut — entries before the latest compaction's
-      //     `firstKeptEntryId` are dropped from the live projection. When a
-      //     rewind segment reaches older than that cut, the capture would
-      //     summarize the lossy compacted projection while the legacy path
-      //     summarizes the raw segment, so the request falls back. The
-      //     predicate is the id difference between the collapsed entries and
-      //     the live projection — NOT "the segment contains a compaction": a
-      //     segment that contains the compaction entry but whose target sits
-      //     at/after `firstKeptEntryId` loses no evidence and must still take
-      //     the capture path.
-      // -----------------------------------------------------------------
-      const liveStream = resolveLiveStreamFn(ctx.modelRegistry);
-      let summaryCacheRequest: CacheRequest | null = null;
-      let summaryCacheFallbackReason: string | undefined;
-
-      if (process.env.PI_NAVIGATE_TREE_SUMMARY_CACHE === "0") {
-        // Kill switch: an env-var escape hatch to force the pre-#33 cold
-        // request without unloading the extension.
-        summaryCacheFallbackReason = "disabled";
-      } else if (isMirroredSessionProvider(ctx.model)) {
-        summaryCacheFallbackReason = "bridge-provider";
-      } else if (!liveStream) {
-        summaryCacheFallbackReason = "no-live-stream";
-      } else {
-        const contextEntries = sm.buildContextEntries();
-        const contextIds = new Set(contextEntries.map((e) => e.id));
-        // Evidence-loss guard: any segment entry missing from the live
-        // projection means the compaction cut dropped raw evidence, so the
-        // capture (the projection) would summarize a lossy view while the
-        // cold path summarizes the raw segment. Use the id-difference
-        // predicate — NOT a "segment contains a compaction" check: a segment
-        // that contains the compaction entry but whose target sits at/after
-        // `firstKeptEntryId` loses no evidence and must still take the cache
-        // path.
-        if (entries.some((e) => !contextIds.has(e.id))) {
-          summaryCacheFallbackReason = "branch-crosses-compaction";
-        } else {
-          const sessionId = sm.getSessionId();
-          const capture = liveCaptures.get(sessionId);
-          // Freshness: the capture must be the live request that produced
-          // the in-flight assistant. The capture-time leaf is exactly that
-          // assistant's parent, so a mismatch means the tree moved
-          // (resume/fork/reload) between the capture and this rewind. A
-          // batched rewind was refused above, so the leaf here is the
-          // assistant itself; a failed in-flight detection (leaf not an
-          // assistant) forces the cold delegation rather than a wrong
-          // replay.
-          if (!capture) {
-            summaryCacheFallbackReason = "no-capture";
-          } else if (capture.leafId !== oldLeafEntry?.parentId) {
-            summaryCacheFallbackReason = "stale-capture";
-          } else {
-            // Replay the captured live request verbatim. The leading
-            // captured system message carries the live prompt AND the live
-            // tool declarations, so the provider replays the exact live
-            // order — no mirroring, no `context.tools` re-derivation.
-            //
-            // `{first}` must number the branch start the way the model
-            // sees the payload, so count the PROJECTED (context-edit-aware)
-            // entries at the capture leaf. The guard below refuses the
-            // replay when the capture and that projection disagree in
-            // length: the transformed live list was changed by another
-            // extension or a host rewrite, and a guessed `{first}` could
-            // scope the summary wrong.
-            const captureProjection = (() => {
-              try {
-                return buildSessionProjection(allEntries, capture.leafId, byId);
-              } catch {
-                // A malformed projection cannot be trusted for `{first}`;
-                // fall back cold rather than numbering the branch wrong.
-                return null;
-              }
-            })();
-            const nonSystem = (messages: AgentMessage[]): number =>
-              convertToLlm(messages).filter((m) => m.role !== "system").length;
-            const captureVisible = nonSystem(capture.messages);
-            const projectedVisible = captureProjection
-              ? nonSystem(captureProjection.messages)
-              : -1;
-            if (!captureProjection || captureVisible !== projectedVisible) {
-              summaryCacheFallbackReason = "capture-diverged";
-            } else {
-              const first =
-                countBackgroundMessages(captureProjection.entries, target) + 1;
-              const payload = [
-                ...convertToLlm(capture.messages),
-                buildSummaryInstructionMessage(first, p.summaryFocus),
-              ];
-              // No truncation: cutting the live prefix breaks parity by
-              // definition. When the replay plus the instruction cannot fit
-              // the window, hand the rewind to upstream's cold path (which
-              // truncates at the evidence budget).
-              const tokenBudget = (ctx.model.contextWindow || 128000) - 16384;
-              const payloadTokens = payload.reduce(
-                (sum, message) => sum + estimateTokens(message as AgentMessage),
-                0,
-              );
-              if (payloadTokens > tokenBudget) {
-                summaryCacheFallbackReason = "overflow";
-              } else {
-                // Public since 0.81.0; `ctx.thinkingLevel` only exists >=
-                // 0.84.2, so never read it directly. "off" is omitted,
-                // mirroring the live loop's request shape.
-                const reasoning =
-                  typeof pi.getThinkingLevel === "function"
-                    ? pi.getThinkingLevel()
-                    : undefined;
-                // `thinkingBudgets` is a plain field on pi-agent-core's Agent;
-                // forwarded on the capture path exactly like the live loop.
-                const owning = findOwningSession(sm);
-                const thinkingBudgets = owning
-                  ? asInternals(owning).agent?.thinkingBudgets
-                  : undefined;
-                summaryCacheRequest = {
-                  messages: payload,
-                  // Provider-scoped `PI_CACHE_RETENTION` (auth.env) must win
-                  // over `process.env`, mirroring pi-ai's
-                  // `getProviderEnvValue`: the live turns resolve retention
-                  // from the provider env, so a provider-scoped "long" with
-                  // a process-level "short" would make live=long /
-                  // summary=short and silently miss.
-                  cacheRetention: resolveSummaryCacheRetention(auth.env),
-                  ...(sessionId ? { sessionId } : {}),
-                  ...(typeof reasoning === "string" && reasoning !== "off"
-                    ? { reasoning: reasoning as ThinkingLevel }
-                    : {}),
-                  ...(thinkingBudgets ? { thinkingBudgets } : {}),
-                };
-              }
-            }
-          }
+      // `{first}` numbers the collapsed segment's first message the way the
+      // summary turn sees the conversation: the context-edit-aware
+      // projection the `context` handler sends on every LLM call (system
+      // messages and provider-invisible assistants excluded). A target the
+      // projection no longer carries (older than the latest compaction cut)
+      // means every visible message is collapsed evidence.
+      let first = 1;
+      try {
+        const projection = buildSessionProjection(allEntries, oldLeaf, byId);
+        if (projection.entries.some((e) => e.sourceEntry.id === target)) {
+          first = countBackgroundMessages(projection.entries, target) + 1;
         }
+      } catch {
+        first = 1;
       }
 
-      // Always wrap when a live stream exists: with a request it replays the
-      // capture, without one it delegates today's cold request byte-for-byte
-      // (the `used` flag records which happened).
-      const cacheWrapped = liveStream
-        ? createCachePreservingStreamFn({
-            realStreamFn: liveStream.streamFn,
-            request: summaryCacheRequest,
-          })
-        : undefined;
-
-      // The summarization transport is `modelRegistry.streamSimple` (via
-      // the wrapper above), whose `prepareRequest` resolves the
-      // credential-derived baseUrl / apiKey / env exactly like the live
-      // path. So the summarize call passes the plain session model;
-      // overriding `baseUrl` here would be redundant (and would double-apply
-      // on OAuth-derived endpoints). The session-routing headers still come
-      // from `withSessionHeaders`: the registry path does not run the SDK's
-      // `getSessionHeaders`, and alias providers 400 without
-      // `x-opencode-session` (C4:A).
-      const result = await summarize(entries, {
-        model: ctx.model,
-        apiKey: auth.apiKey ?? "",
-        headers: withSessionHeaders(
-          ctx.model,
-          stripNullHeaders(auth.headers),
-          sm.getSessionId(),
-        ),
-        ...(auth.env ? { env: auth.env } : {}),
-        signal: signal ?? new AbortController().signal,
-        customInstructions: p.summaryFocus,
-        // Route through the composed provider's `streamSimple` (public
-        // modelRegistry API) instead of the pi-ai compat registry.
-        // Custom providers registered via `pi.registerProvider(name,
-        // { api: <custom-id>, streamSimple })` are NOT visible to the
-        // compat registry (which only knows builtin apis) — without this,
-        // rewind fails with "No API provider registered for api:
-        // <custom-id>" for any custom-api provider (e.g. commandcode 0.5.x
-        // with api "commandcode-custom"). The wrapper delegates to it in
-        // both the live-prefix and fallback cases.
-        ...(cacheWrapped ? { streamFn: cacheWrapped.streamFn } : {}),
-      });
-      if (result.aborted) {
-        return toolError("Summarization aborted.");
-      }
-      if (result.error || !result.summary) {
+      let sessionId: string;
+      try {
+        sessionId = sm.getSessionId();
+      } catch (err) {
         return toolError(
-          `Summarization failed: ${result.error ?? "no summary text"}`,
+          `Could not read the session id: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
 
-      // Cache outcome measured from provider usage. Mode reflects whether a
-      // cache-preserving request was BUILT; `used` reflects whether the
-      // wrapper actually delegated it (false when the summarizer is stubbed,
-      // aborted before the wire call, or the fallback path ran).
-      const summaryCacheMode = summaryCacheRequest ? "live-prefix" : "fallback";
-      const summaryCacheStats = measureSummaryCache(
-        result.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 },
-      );
-
-      // Fork-faithful miss accounting (cad0p/pi@eval/branch-summary-prompt):
-      // scan the entries as they stand (the branch_summary is not appended
-      // yet) and compare the summary's measured usage against the previous
-      // request's baseline — the baseline survives branch_summary entries
-      // (the summary request reuses the live prefix), while a summary miss
-      // after a model switch is suppressed as expected re-billing. HITS ARE
-      // SILENT — the footer/session totals already cover them; only an
-      // actionable miss is worth a transcript line. The fallback path (cache
-      // request not built) is NOT special-cased: the legacy cold request
-      // measures as a miss exactly when the numbers say so, and
-      // `fallbackReason` lives in `details.summaryCache` only. Upstream pi
-      // renders cache notices as transcript lines gated by
-      // `showCacheMissNotices`; the extension does the same by storing the
-      // notice string and rendering it from the tool's `renderResult`. The
-      // model-visible tool-result content stays cache-free (the model was
-      // proven to echo the line verbatim). The setting is read reflectively
-      // off the captured session — the extension ctx does not expose
-      // `settingsManager`. `Date.now()` is the summary timestamp, as the
-      // fork's `navigateTree` call site uses. Headless runs and setting-off
-      // runs surface the same numbers via `details.summaryCache`.
-      const summaryCacheMiss = result.usage
-        ? detectBranchSummaryCacheMiss(
-            allEntries,
-            result.usage,
-            ctx.model.provider,
-            ctx.model.id,
-            Date.now(),
-            {
-              getModel: (provider, model) =>
-                ctx.modelRegistry.find(provider, model),
-            },
-          )
-        : undefined;
-      let summaryCacheNotice: string | null = null;
-      if (summaryCacheMiss) {
-        const notice = formatBranchSummaryCacheMissNotice(summaryCacheMiss);
-        if (notice !== null) {
-          let showCacheNotices = false;
-          try {
-            const owning = findOwningSession(sm);
-            showCacheNotices =
-              (owning
-                ? asInternals(owning).settingsManager
-                : undefined
-              )?.getShowCacheMissNotices?.() ?? false;
-          } catch {
-            // Unreadable settings -> stay silent (mirror pi's default off).
-            showCacheNotices = false;
-          }
-          if (showCacheNotices) summaryCacheNotice = notice;
-        }
-      }
-
-      // Move the tree.
-      const summaryId = sm.branchWithSummary(target, result.summary, {
-        readFiles: result.readFiles ?? [],
-        modifiedFiles: result.modifiedFiles ?? [],
-      });
-
-      // Chain-validity invariants once `branchWithSummary` succeeds: a
-      // synthetic must land on every path with toolCallId === this
-      // in-flight call (so pi's appended tool_result pairs), and
-      // stopReason: "toolUse" (survives Kiro's normalizeMessages filter
-      // — see `buildSyntheticAssistant` JSDoc). The synthetic append
-      // sits OUTSIDE the try so it runs exactly once regardless of
-      // which earlier step threw. `summaryId` was freshly allocated by
-      // branchWithSummary above, so no pre-existing label can point at it
-      // and there is no prior label to clear (labels are unique; #55).
-      const fullLabelEnd = LABEL_PREFIX + p.newLabel;
-      let tokensAtNewLeaf = 0;
-      let originalErr: unknown;
-      let salvageDetail = "";
-      let failedStep: "setLabelEnd" | "estimate" | null = null;
-      try {
-        failedStep = "setLabelEnd";
-        pi.setLabel(summaryId, fullLabelEnd);
-
-        // Compute afterTokens NOW — before we append the synthetic. This
-        // captures the chain size at the new leaf (branch_summary) using
-        // the prior real assistant's usage as the baseline.
-        failedStep = "estimate";
-        tokensAtNewLeaf = estimateActiveBranchTokens(sm);
-        failedStep = null;
-      } catch (err) {
-        originalErr = err;
-        // Best-effort retry of the specific failed step (pi.setLabel is
-        // idempotent under re-application). Per-step recovery shape:
-        //   - setLabelEnd: retry pi.setLabel(summaryId, fullLabelEnd).
-        //   - estimate:    no retry — the label already wrote; a
-        //     redundant retry would mask the real cause.
-        if (failedStep === "setLabelEnd") {
-          try {
-            pi.setLabel(summaryId, fullLabelEnd);
-          } catch (retryErr) {
-            salvageDetail = `newLabel retry failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`;
-          }
-        }
-      }
-
-      // Synthetic append: runs in BOTH the happy path and the salvage path.
-      // If `originalErr` is set we use a degenerate synthetic
-      // (totalTokens=0, since `tokensAtNewLeaf` may not have been computed).
-      // The synthetic's matching toolCallId is the only structural
-      // requirement for chain validity — pi's appended tool_result pairs
-      // with this synthetic regardless of which earlier step threw.
-      //
-      // The full `summaryFocus` is already live in the LLM call to
-      // `generateBranchSummary`; we only need a trimmed copy in the
-      // synthetic's args (which pi will re-emit on every subsequent turn).
-      // Truncate to MAX_SYNTHETIC_FOCUS_LENGTH so a long focus string
-      // doesn't inflate every later turn indefinitely.
-      const syntheticArgs: Record<string, unknown> = {
-        action: "rewind",
+      // In-band summary (#80): no separate summarization request. This tool
+      // result IS the summary instruction, so the live model writes the
+      // summary as its next turn — an append to the live conversation,
+      // served from the prompt cache on every provider. The `turn_end`
+      // handler branches from the anchor with that text; until then every
+      // tool call is blocked.
+      pendingRewinds.set(sessionId, {
+        toolCallId,
+        target,
         rewindTo: p.rewindTo,
         newLabel: p.newLabel,
-        summaryFocus: p.summaryFocus,
-      };
-      if (
-        typeof p.summaryFocus === "string" &&
-        p.summaryFocus.length > MAX_SYNTHETIC_FOCUS_LENGTH
-      ) {
-        syntheticArgs.summaryFocus = `${p.summaryFocus.slice(0, MAX_SYNTHETIC_FOCUS_LENGTH)}… [truncated]`;
-      }
-      const syntheticMsg = buildSyntheticAssistant(
-        toolCallId,
-        TOOL_NAME,
-        syntheticArgs,
-        ctx.model as
-          | { api?: string; provider?: string; id?: string }
-          | undefined,
-        originalErr ? 0 : tokensAtNewLeaf,
-      );
-      // Host type drift (1.x): `appendMessage` wants pi-ai's `JsonObject` for
-      // toolCall arguments while the builder types the synthetic args as
-      // `Record<string, unknown>`; runtime shape is identical.
-      const syntheticId = sm.appendMessage(
-        syntheticMsg as Parameters<SessionManager["appendMessage"]>[0],
-      );
-
-      // Refresh agent.state.messages so the next prompt() snapshot reflects
-      // the rewound chain. Runs in both paths; `refreshAgentMessages`
-      // already swallows internal throws, so it can't re-trigger salvage.
-      const refreshed = refreshAgentMessages(sm);
-      // Tell history-mirroring extensions about the rewrite (#79). Runs in
-      // both paths: the tree moved even when a later step threw.
-      const historyRewriteNotified = await emitSessionTree(
-        sm,
-        oldLeaf,
-        summaryId,
-      );
-
-      if (originalErr) {
-        // Salvage path: synthetic landed (chain is valid), newLabel retry
-        // and refresh were best-effort. Re-throw the original error with
-        // any salvage detail attached so the failure surfaces to the
-        // agent and post-mortem reviewers can tell what was recovered.
-        // Preserve the original via `Error.cause` (ES2022) so callers
-        // doing `instanceof` checks against typed subclasses, or
-        // post-mortem readers walking the cause chain, can recover the
-        // original throw. Older runtimes silently ignore the options
-        // bag, so this is forward-compatible without a feature gate.
-        const baseMsg =
-          originalErr instanceof Error
-            ? originalErr.message
-            : String(originalErr);
-        throw new Error(
-          salvageDetail ? `${baseMsg} (salvage: ${salvageDetail})` : baseMsg,
-          { cause: originalErr },
-        );
-      }
-
-      const afterTokens = tokensAtNewLeaf;
+        beforeTokens,
+        contextWindow,
+        attempts: 0,
+      });
 
       return {
         content: [
           {
             type: "text",
-            text:
-              `[rewind to '${p.rewindTo}' · collapsed as '${p.newLabel}'] · ${formatContextDelta(beforeTokens, afterTokens, contextWindow)}\n\n` +
-              `A branch_summary of the collapsed work has been appended to your context. It is the newest branch_summary, the current state; earlier branch_summary messages, if present, are older collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work. User messages retained above predate this rewind — do not re-answer them.` +
-              (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
+            text: buildSummaryInstruction(first, p.summaryFocus),
           },
         ],
         details: {
+          status: "summary-requested",
           rewindTo: p.rewindTo,
           newLabel: p.newLabel,
           targetId: target,
-          summaryId,
-          syntheticAssistantId: syntheticId,
-          collapsedEntries: entries.length,
+          first,
           contextBefore: beforeTokens,
-          contextAfter: afterTokens,
           contextWindow,
-          agentMessagesRefreshed: refreshed,
-          historyRewriteNotified,
-          summaryCache: {
-            mode: summaryCacheMode,
-            fallbackReason: summaryCacheFallbackReason ?? null,
-            used: cacheWrapped?.used.value ?? false,
-            cacheRead: summaryCacheStats.cacheRead,
-            input: summaryCacheStats.fresh,
-            cacheWrite: summaryCacheStats.cacheWrite,
-            hit: summaryCacheStats.hit,
-            missedTokens: summaryCacheMiss?.missedTokens ?? 0,
-            missedCost: summaryCacheMiss?.missedCost ?? 0,
-            idleMs: summaryCacheMiss?.idleMs ?? 0,
-            modelChanged: summaryCacheMiss?.modelChanged ?? false,
-            notice: summaryCacheNotice,
-          },
-          readFiles: result.readFiles ?? [],
-          modifiedFiles: result.modifiedFiles ?? [],
         },
       };
-    },
-    // Upstream pi renders cache notices as transcript lines (its
-    // `maybeShowCacheMissNotice` + `createResultFallback`), not toasts.
-    // Reproduce the default tool-result rendering and append the notice that
-    // `execute` stored. `showCacheMissNotices` gating already happened in
-    // `execute`; this renderer only runs in the TUI.
-    renderResult(result, { expanded }, theme) {
-      const output = result.content
-        .filter((block) => block.type === "text")
-        .map((block) => (block.type === "text" ? block.text : ""))
-        .join("\n");
-      const lines = output.split("\n");
-      const displayLines = expanded ? lines : lines.slice(0, 10);
-      const remaining = lines.length - displayLines.length;
-      let text = displayLines
-        .map((line) => theme.fg("toolOutput", line))
-        .join("\n");
-      if (remaining > 0) {
-        text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint(
-          "app.tools.expand",
-          "to expand",
-        )}${theme.fg("muted", ")")}`;
-      }
-      const container = new Container();
-      container.addChild(new Text(text, 0, 0));
-      const notice = (
-        result.details as
-          | { summaryCache?: { notice?: string | null } }
-          | undefined
-      )?.summaryCache?.notice;
-      if (typeof notice === "string" && notice.length > 0) {
-        container.addChild(new Spacer(1));
-        container.addChild(new Text(theme.fg("warning", notice), 1, 0));
-      }
-      return container;
     },
   });
 }
@@ -2105,21 +1536,18 @@ export const __testHooks = {
       delete proto[ORIG_PROMPT_KEY];
     }
     sessionInstances.length = 0;
-    liveCaptures.clear();
     // WeakSet has no .clear(); rebind to a fresh instance so a test that
     // re-captures the SAME session identity post-reset isn't deduped by
     // stale state from the previous test's capture.
     seenSessions = new WeakSet();
   },
   /** Module-internal helpers exposed for hermetic unit tests. */
-  liveCaptures,
-  buildSyntheticAssistant,
   findLabelHint,
   findLabeledEntry,
-  findInFlightAssistantToolCalls,
   buildContextMessages,
   refreshAgentMessages,
   captureSession,
+  countBackgroundMessages,
   /** Read-only view of captured-session ref count for reaping assertions. */
   sessionRefCount(): number {
     return sessionInstances.length;
