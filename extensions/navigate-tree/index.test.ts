@@ -107,6 +107,10 @@ interface FakePi {
    * `{ triggerTurn: true }` — tests must be able to tell them apart.
    */
   sendMessageCalls: unknown[][];
+  /** Raw argument arrays for every `sendUserMessage` call (steer re-delivery). */
+  sendUserMessageCalls: unknown[][];
+  /** Interleaved `sendMessage` / `sendUserMessage` call order. */
+  sendLog: Array<"sendMessage" | "sendUserMessage">;
 }
 
 /**
@@ -121,6 +125,8 @@ function makeFakePi(sm: SessionManager): FakePi {
   const registered: CapturedTool[] = [];
   const onCalls = new Map<string, Array<(e: never, c: never) => unknown>>();
   const sendMessageCalls: unknown[][] = [];
+  const sendUserMessageCalls: unknown[][] = [];
+  const sendLog: FakePi["sendLog"] = [];
   const pi = {
     registerTool(tool: CapturedTool) {
       registered.push(tool);
@@ -139,9 +145,22 @@ function makeFakePi(sm: SessionManager): FakePi {
     },
     sendMessage(...args: unknown[]) {
       sendMessageCalls.push(args);
+      sendLog.push("sendMessage");
+    },
+    sendUserMessage(...args: unknown[]) {
+      sendUserMessageCalls.push(args);
+      sendLog.push("sendUserMessage");
     },
   } as unknown as ExtensionAPI;
-  return { pi, setLabelCalls, registered, onCalls, sendMessageCalls };
+  return {
+    pi,
+    setLabelCalls,
+    registered,
+    onCalls,
+    sendMessageCalls,
+    sendUserMessageCalls,
+    sendLog,
+  };
 }
 
 interface FakeCtx {
@@ -2035,6 +2054,8 @@ describe("rewind phase 2: completion", () => {
     assert.equal(entry.parentId, f.anchorId, "child of the anchor entry");
     assert.equal(entry.summary, `${BRANCH_SUMMARY_PREAMBLE}${SUMMARY_TEXT}`);
     assert.deepEqual(entry.details, { readFiles: [], modifiedFiles: [] });
+    // Extension-provided summary, as pi's navigateTree marks it.
+    assert.equal(entry.fromHook, true);
     assert.equal(f.sm.getLabel(summaryId), "anchor:end");
     // The leaf is the label-change entry `setLabel` appends on the summary
     // (same shape as pi's own `/tree` label write).
@@ -2085,7 +2106,9 @@ describe("rewind phase 2: completion", () => {
       historyRewriteNotified: false,
       readFiles: [],
       modifiedFiles: [],
+      redeliveredUserMessages: 0,
     });
+    assert.equal(f.pi.sendUserMessageCalls.length, 0);
     // Collapsed: the anchor's label-change entry, u2..a4 (6), the rewind
     // call, its result, and the summary turn — all left on the abandoned
     // branch.
@@ -2542,6 +2565,109 @@ describe("rewind phase 2: failures", () => {
     }
   });
 
+  it("an error turn survives agent_end (pi's auto-retry follows it) and the retry completes", async () => {
+    const f = await pending();
+    await summaryTurn(f, "", "error");
+    fireAgentEnd(f.pi, f.ctx);
+    assert.ok(fireToolCall(f.pi, f.ctx), "still pending across agent_end");
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.summaryAttempts, 1);
+  });
+
+  it("a non-error turn after an error resets the mark: agent_end drops again", async () => {
+    const f = await pending();
+    await summaryTurn(f, "", "error");
+    await summaryTurn(f, "Okay, summarizing now.");
+    assert.equal(
+      rewindMessages(f.pi)[0].message.details.status,
+      "summary-retry",
+    );
+    fireAgentEnd(f.pi, f.ctx);
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
+  it("before_agent_start (a new user prompt) drops a pending rewind, even an errored one", async () => {
+    const f = await pending();
+    await summaryTurn(f, "", "error");
+    await fireBeforeAgentStart(f.pi, f.ctx, undefined);
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+    await summaryTurn(f);
+    assert.equal(rewindMessages(f.pi).length, 0);
+    assertNotBranched(f.sm);
+  });
+
+  it("cancels when a compaction landed after the rewind call", async () => {
+    const f = await pending();
+    f.sm.appendCompaction("COMPACTED", f.anchorId, 20_000);
+    await summaryTurn(f);
+    const calls = rewindMessages(f.pi);
+    assert.equal(calls.length, 1);
+    const reason =
+      "the context was compacted while the summary was being written";
+    assert.equal(
+      calls[0].message.content,
+      buildRewindCancelledText("start", reason),
+    );
+    assert.equal(calls[0].message.details.reason, reason);
+    assertNotBranched(f.sm);
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
+  it("cancels when the rewind call is no longer on the active branch", async () => {
+    const f = await pending();
+    // Move the leaf back above the rewind call (anchor and labels intact).
+    const a4 = f.sm
+      .getBranch()
+      .find(
+        (e) =>
+          e.type === "message" &&
+          e.message.role === "assistant" &&
+          JSON.stringify(e.message.content).includes('"a4"'),
+      );
+    assert.ok(a4);
+    f.sm.branch(a4.id);
+    await summaryTurn(f);
+    const calls = rewindMessages(f.pi);
+    assert.equal(calls.length, 1);
+    assert.equal(
+      calls[0].message.details.reason,
+      "the rewind call is no longer on the active branch",
+    );
+    assertNotBranched(f.sm);
+  });
+
+  it("a throwing branchWithSummary cancels: message sent, pending cleared, gate reopened", async () => {
+    const f = await pending();
+    (f.sm as unknown as { branchWithSummary: () => string }).branchWithSummary =
+      () => {
+        throw new Error("disk full");
+      };
+    const labelCallsBefore = f.pi.setLabelCalls.length;
+    await summaryTurn(f);
+    const calls = rewindMessages(f.pi);
+    assert.equal(calls.length, 1);
+    const reason = "the branch could not be written (disk full)";
+    assert.deepEqual(calls[0].options, { triggerTurn: true });
+    assert.equal(
+      calls[0].message.content,
+      buildRewindCancelledText("start", reason),
+    );
+    assert.deepEqual(calls[0].message.details, {
+      status: "cancelled",
+      rewindTo: "start",
+      newLabel: "end",
+      reason,
+      summaryAttempts: 0,
+    });
+    assertNotBranched(f.sm);
+    assert.equal(f.pi.setLabelCalls.length, labelCallsBefore, "no label");
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
+    await summaryTurn(f);
+    assert.equal(rewindMessages(f.pi).length, 1, "nothing left to complete");
+  });
+
   it("cancels when the anchor no longer resolves to the same entry", async () => {
     const f = await pending();
     f.pi.pi.setLabel(f.anchorId, undefined);
@@ -2614,11 +2740,188 @@ describe("extractSummaryText", () => {
     }
   });
 
-  it("accepts a bare heading (only an empty slice is refused)", () => {
-    assert.equal(extractSummaryText("## Goal"), "## Goal");
-    assert.equal(extractSummaryText("## Goal: ship"), "## Goal: ship");
+  it("refuses a bare heading line: the body after it must be non-empty", () => {
+    assert.equal(extractSummaryText("## Goal"), null);
+    assert.equal(extractSummaryText("## Goal: ship"), null);
+    assert.equal(extractSummaryText("preamble\n## Goal   \n\n  "), null);
+    assert.equal(extractSummaryText("## Goal\nx"), "## Goal\nx");
+    assert.equal(extractSummaryText("## Goal: ship\nx"), "## Goal: ship\nx");
   });
 });
+// =============================================================================
+// rewind phase 2: multi-block summary turns and steer re-delivery (#80)
+// =============================================================================
+
+describe("rewind phase 2: multi-block text and late user messages", () => {
+  async function summaryBlocksTurn(
+    f: { sm: SessionManager; pi: FakePi; ctx: FakeCtx },
+    texts: string[],
+  ): Promise<void> {
+    const message = assistantMessage(
+      texts.map((text) => ({ type: "text", text })),
+      "stop",
+      100,
+    );
+    f.sm.appendMessage(message as never);
+    await fireTurnEndAll(f.pi, f.ctx, message);
+  }
+
+  it("joins text blocks with a newline: a preamble block before the summary completes", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryBlocksTurn(f, ["Here is the summary:", SUMMARY_TEXT]);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    const entry = f.sm.getEntry(done.details.summaryId as string);
+    assert.ok(entry && entry.type === "branch_summary");
+    assert.equal(entry.summary, `${BRANCH_SUMMARY_PREAMBLE}${SUMMARY_TEXT}`);
+  });
+
+  it("a heading split across blocks is joined with a newline, not glued", async () => {
+    // `""` join would yield "## GoalShip it." — no `## Goal\b` heading.
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryBlocksTurn(f, ["## Goal", "Ship it.\n\n## Next Steps\n1. x"]);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    const entry = f.sm.getEntry(done.details.summaryId as string);
+    assert.ok(entry && entry.type === "branch_summary");
+    assert.equal(
+      entry.summary,
+      `${BRANCH_SUMMARY_PREAMBLE}## Goal\nShip it.\n\n## Next Steps\n1. x`,
+    );
+  });
+
+  it("re-delivers user messages that landed after the rewind call as steers, oldest first", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    // Steers pi drained at the rewind turn's boundary, before the summary.
+    const steerOne = [{ type: "text", text: "steer one: also fix the docs" }];
+    const steerTwo = [
+      { type: "text", text: "steer two: and bump the version" },
+    ];
+    const ids = [
+      f.sm.appendMessage({
+        role: "user",
+        content: steerOne,
+        timestamp: 1,
+      } as never),
+      f.sm.appendMessage({
+        role: "user",
+        content: steerTwo,
+        timestamp: 2,
+      } as never),
+    ];
+    await summaryTurn(f);
+
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.redeliveredUserMessages, 2);
+    assert.deepEqual(f.pi.sendUserMessageCalls, [
+      [steerOne, { deliverAs: "steer", expandPromptTemplates: false }],
+      [steerTwo, { deliverAs: "steer", expandPromptTemplates: false }],
+    ]);
+    assert.deepEqual(
+      f.pi.sendLog,
+      ["sendMessage", "sendUserMessage", "sendUserMessage"],
+      "continuation first, then the steers",
+    );
+    // The originals sit on the abandoned segment, not the active branch.
+    const branchIds = new Set(f.sm.getBranch().map((e) => e.id));
+    for (const id of ids) {
+      assert.ok(f.sm.getEntry(id), "the original stays on disk");
+      assert.ok(!branchIds.has(id), "but off the active branch");
+    }
+    assert.ok(!JSON.stringify(f.sm.getBranch()).includes("steer one"));
+  });
+
+  it("user messages before the rewind call are not re-delivered", async () => {
+    const f = await rewindFixture();
+    assert.equal(f.done.message.details.redeliveredUserMessages, 0);
+    assert.deepEqual(f.pi.sendUserMessageCalls, []);
+  });
+
+  it("a throwing sendUserMessage does not fail the rewind", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    (
+      f.pi.pi as unknown as { sendUserMessage: (...a: unknown[]) => void }
+    ).sendUserMessage = () => {
+      throw new Error("stale session runtime");
+    };
+    await requestRewind(f);
+    f.sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "late steer" }],
+      timestamp: 1,
+    } as never);
+    await assert.doesNotReject(summaryTurn(f));
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.redeliveredUserMessages, 1);
+  });
+});
+
+// =============================================================================
+// rewind message copy — byte-exact literals (no builder recomputation)
+// =============================================================================
+
+describe("rewind message copy (byte-exact)", () => {
+  it("buildRewindDoneText", () => {
+    assert.equal(
+      buildRewindDoneText(
+        {
+          rewindTo: "start",
+          newLabel: "end",
+          beforeTokens: 30_000,
+          contextWindow: 1_000_000,
+        },
+        4_000,
+      ),
+      "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M\n\nA branch_summary of the collapsed work has been appended to your context. It is the newest branch_summary, the current state; earlier branch_summary messages, if present, are older collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work. User messages retained above predate this rewind — do not re-answer them.",
+    );
+  });
+
+  it("buildRewindDoneText without a context window uses the token form", () => {
+    assert.equal(
+      buildRewindDoneText(
+        {
+          rewindTo: "start",
+          newLabel: "end",
+          beforeTokens: 30_000,
+          contextWindow: 0,
+        },
+        4_000,
+      ).split("\n")[0],
+      "[rewind to 'start' · collapsed as 'end'] · tokens 30000 → 4000",
+    );
+  });
+
+  it("SUMMARY_PENDING_BLOCK_REASON", () => {
+    assert.equal(
+      SUMMARY_PENDING_BLOCK_REASON,
+      "navigate_tree: a rewind is waiting for its summary — tool calls are blocked until it lands. Your entire next reply must be the summary in the format the rewind result requested, starting with '## Goal' — no acknowledgement, no tool calls.",
+    );
+  });
+
+  it("buildSummaryRetryText", () => {
+    assert.equal(
+      buildSummaryRetryText("start"),
+      "[navigate_tree] The rewind to 'start' is still waiting for its summary. Your entire reply must be the summary in the format the rewind result requested, starting with '## Goal' — no acknowledgement, no tool calls.",
+    );
+  });
+
+  it("buildRewindCancelledText", () => {
+    assert.equal(
+      buildRewindCancelledText("start", "no summary after 3 attempts"),
+      "[navigate_tree] Rewind to 'start' cancelled: no summary after 3 attempts. Nothing was collapsed — continue the work and rewind again later.",
+    );
+  });
+});
+
 // =============================================================================
 // dispatch: rewind newLabel uniqueness (#55)
 // =============================================================================

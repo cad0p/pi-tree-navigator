@@ -366,8 +366,8 @@ function isProviderVisibleMessage(message: AgentMessage): boolean {
 
 /**
  * Count the non-system wire messages contributed by the projection entries
- * at or before `target` — the background prefix the captured payload carries
- * ahead of the collapsed segment. Substituted into the summary
+ * at or before `target` — the background prefix the summary turn sees ahead
+ * of the collapsed segment. Substituted into the summary
  * instruction's `{first}` placeholder.
  *
  * System messages are excluded because the instruction numbering explicitly
@@ -376,7 +376,7 @@ function isProviderVisibleMessage(message: AgentMessage): boolean {
  * `isProviderVisibleMessage`) so an aborted, non-`context_edit`ed attempt
  * cannot inflate `{first}`. Quantity is taken from the PROJECted entries
  * (`buildSessionProjection()`), so a compaction cut before `target` is
- * counted the way the captured payload presents it AND messages omitted by
+ * counted the way the live projection presents it AND messages omitted by
  * `context_edit` (pi's overflow recovery, the fallback provider's
  * failed-attempt edits) no longer inflate `{first}` past what the model sees.
  */
@@ -563,6 +563,8 @@ function findLabelHint(
 interface PendingRewind {
   /** The rewind tool call; its own turn is not the summary turn. */
   toolCallId: string;
+  /** The assistant entry that issued the rewind (leaf at phase 1). */
+  rewindEntryId: string;
   target: string;
   rewindTo: string;
   newLabel: string;
@@ -570,6 +572,8 @@ interface PendingRewind {
   contextWindow: number;
   /** Failed summary turns so far (tool call / no `## Goal` / truncated). */
   attempts: number;
+  /** The latest summary turn ended in a provider error (auto-retry pending). */
+  lastTurnErrored?: boolean;
 }
 
 /** customType of the rewind continuation / retry / cancel messages (#80). */
@@ -587,7 +591,59 @@ export function extractSummaryText(text: string): string | null {
   const start = text.search(/^## Goal\b/m);
   if (start < 0) return null;
   const summary = text.slice(start).trim();
-  return summary.length > 0 ? summary : null;
+  // A bare heading is not a summary: storing it would lose the collapsed work.
+  const body = summary.replace(/^## Goal\b[^\n]*/, "").trim();
+  return body.length > 0 ? summary : null;
+}
+
+/**
+ * Why a pending rewind no longer matches the active branch, or `null`. The
+ * assistant that issued the rewind (`afterEntryId`) must still be on the
+ * branch, and no compaction may have landed after it: pi's threshold
+ * compaction can run before the summary turn, so the instruction's
+ * `{first}` and the evidence the model summarized would no longer match the
+ * raw segment.
+ */
+function rewindStaleReason(
+  sm: SessionManager,
+  afterEntryId: string,
+): string | null {
+  let branch: SessionEntry[];
+  try {
+    branch = sm.getBranch();
+  } catch {
+    return null;
+  }
+  const start = branch.findIndex((e) => e.id === afterEntryId);
+  if (start < 0) return "the rewind call is no longer on the active branch";
+  return branch.slice(start + 1).some((e) => e.type === "compaction")
+    ? "the context was compacted while the summary was being written"
+    : null;
+}
+
+/**
+ * Contents of the user messages on the active branch after `afterEntryId`
+ * (the assistant that issued the rewind), oldest first.
+ */
+function collectLateUserMessages(
+  sm: SessionManager,
+  afterEntryId: string,
+): unknown[] {
+  let branch: SessionEntry[];
+  try {
+    branch = sm.getBranch();
+  } catch {
+    return [];
+  }
+  const start = branch.findIndex((e) => e.id === afterEntryId);
+  if (start < 0) return [];
+  const contents: unknown[] = [];
+  for (const entry of branch.slice(start + 1)) {
+    if (entry.type === "message" && entry.message.role === "user") {
+      contents.push(entry.message.content);
+    }
+  }
+  return contents;
 }
 
 export function buildRewindDoneText(
@@ -723,20 +779,53 @@ export default function (pi: ExtensionAPI) {
       );
       return;
     }
-    pendingRewinds.delete(sessionId);
+    const staleReason = rewindStaleReason(sm, pending.rewindEntryId);
+    if (staleReason) {
+      cancelRewind(sm, sessionId, pending, staleReason);
+      return;
+    }
     const oldLeafId = sm.getLeafId();
-    const { entries } = collectEntriesForBranchSummary(
-      sm,
-      oldLeafId,
-      pending.target,
-    );
-    const { fileOps } = prepareBranchEntries(entries, Number.MAX_SAFE_INTEGER);
-    const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-    const summaryId = sm.branchWithSummary(
-      pending.target,
-      buildStoredSummary(summaryText, readFiles, modifiedFiles),
-      { readFiles, modifiedFiles },
-    );
+    // User messages that arrived after the rewind call (steers drained at the
+    // rewind turn's boundary, before the summary turn) sit on the segment
+    // about to be abandoned. They are new input, not collapsed work:
+    // re-deliver them after the continuation.
+    const lateUserMessages = collectLateUserMessages(sm, pending.rewindEntryId);
+    let entries: SessionEntry[];
+    let readFiles: string[];
+    let modifiedFiles: string[];
+    let summaryId: string;
+    try {
+      ({ entries } = collectEntriesForBranchSummary(
+        sm,
+        oldLeafId,
+        pending.target,
+      ));
+      const { fileOps } = prepareBranchEntries(
+        entries,
+        Number.MAX_SAFE_INTEGER,
+      );
+      ({ readFiles, modifiedFiles } = computeFileLists(fileOps));
+      // `fromHook: true` pairs with the `session_tree` payload's
+      // `fromExtension: true`, as pi's own navigateTree does for an
+      // extension-provided summary.
+      summaryId = sm.branchWithSummary(
+        pending.target,
+        buildStoredSummary(summaryText, readFiles, modifiedFiles),
+        { readFiles, modifiedFiles },
+        true,
+      );
+    } catch (err) {
+      // Nothing branched: tell the model, or a text-only summary turn would
+      // end the run with no word of the failed rewind.
+      cancelRewind(
+        sm,
+        sessionId,
+        pending,
+        `the branch could not be written (${err instanceof Error ? err.message : String(err)})`,
+      );
+      return;
+    }
+    pendingRewinds.delete(sessionId);
     const fullLabel = LABEL_PREFIX + pending.newLabel;
     try {
       pi.setLabel(summaryId, fullLabel);
@@ -774,8 +863,22 @@ export default function (pi: ExtensionAPI) {
         historyRewriteNotified,
         readFiles,
         modifiedFiles,
+        redeliveredUserMessages: lateUserMessages.length,
       },
     );
+    for (const content of lateUserMessages) {
+      try {
+        pi.sendUserMessage(
+          content as Parameters<typeof pi.sendUserMessage>[0],
+          {
+            deliverAs: "steer",
+            expandPromptTemplates: false,
+          },
+        );
+      } catch {
+        // Fail-open: the original stays on disk on the abandoned branch.
+      }
+    }
   }
 
   // While a rewind waits for its summary, every tool call is blocked: the
@@ -830,15 +933,21 @@ export default function (pi: ExtensionAPI) {
       pendingRewinds.delete(sessionId);
       return;
     }
-    // Provider errors go through pi's auto-retry; a run that ends without a
-    // summary drops the pending rewind at `agent_end` (no model message).
-    if (message.stopReason === "error") return;
+    // Provider errors go through pi's auto-retry, which emits `agent_end`
+    // BEFORE it re-runs the turn (`agent.continue()`): mark the rewind so
+    // that `agent_end` keeps it. A new user prompt (`before_agent_start`)
+    // drops it if the retry never comes.
+    if (message.stopReason === "error") {
+      pending.lastTurnErrored = true;
+      return;
+    }
+    pending.lastTurnErrored = false;
     const hasToolCall = content.some((b) => b?.type === "toolCall");
     const summary = extractSummaryText(
       content
         .filter((b) => b?.type === "text" && typeof b.text === "string")
         .map((b) => b.text)
-        .join(""),
+        .join("\n"),
     );
     if (hasToolCall || summary === null || message.stopReason === "length") {
       pending.attempts++;
@@ -1021,7 +1130,12 @@ export default function (pi: ExtensionAPI) {
     // drives the hint, but an in-process sibling session must not clear this
     // session's auto-anchor gate.
     try {
-      toolActiveBySession.set(ctx.sessionManager.getSessionId(), toolActive);
+      const sessionId = ctx.sessionManager.getSessionId();
+      toolActiveBySession.set(sessionId, toolActive);
+      // A new prompt is not a retry (pi retries via `agent.continue()`,
+      // which skips this event): a rewind left waiting across an errored
+      // run's end is dropped.
+      pendingRewinds.delete(sessionId);
     } catch {
       // Fail-open: the per-session gate stays absent.
     }
@@ -1170,10 +1284,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     writeStartAnchorIfNeeded(sm as SessionManager, Number.POSITIVE_INFINITY);
-    // A run that ends with a rewind still waiting for its summary (aborted
-    // before the summary turn, or an unrecovered provider error) drops it.
+    // A run that ends with a rewind still waiting for its summary drops it
+    // — unless the last turn errored: pi emits `agent_end` before its
+    // auto-retry re-runs the turn, so that rewind waits for the retry.
     try {
-      pendingRewinds.delete(sm.getSessionId());
+      const sessionId = sm.getSessionId();
+      if (!pendingRewinds.get(sessionId)?.lastTurnErrored) {
+        pendingRewinds.delete(sessionId);
+      }
     } catch {
       // Stale ctx: nothing to drop.
     }
@@ -1312,8 +1430,7 @@ Operations (set \`action\`):
         // Atomic anchor: compute the estimate BEFORE writing the label. A
         // throw from the estimator must not leave a label on disk —
         // otherwise the agent sees an error yet a retry with the same
-        // name is rejected as a duplicate. The rewind path keeps its own
-        // (test-pinned) ordering because its salvage contract differs.
+        // name is rejected as a duplicate.
         const cw = ctx.model?.contextWindow ?? 0;
         const tokensHere = estimateActiveBranchTokens(sm);
         const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
@@ -1476,6 +1593,7 @@ Operations (set \`action\`):
       // tool call is blocked.
       pendingRewinds.set(sessionId, {
         toolCallId,
+        rewindEntryId: oldLeaf,
         target,
         rewindTo: p.rewindTo,
         newLabel: p.newLabel,
@@ -1512,7 +1630,7 @@ Operations (set \`action\`):
  * release without a semver-major bump. Intended exclusively for hermetic
  * tests within this package; the hooks reach into module-internal state
  * (the `AgentSession.prototype` patch, the `seenSessions` WeakSet, the
- * `sessionInstances` array, the `prepareNextTurn` marker symbol) and are
+ * `sessionInstances` array) and are
  * not designed for external consumption.
  *
  * If you found this via `node_modules` archaeology, you're holding it

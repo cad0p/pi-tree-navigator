@@ -97,7 +97,7 @@ describe("formatPct1", () => {
   });
   it("renders > 100.0% when tokens overflow the window", () => {
     // Pinning behavior, not a bug guard: a token estimate over the
-    // window can happen if the synthetic-assistant baseline lags the
+    // window can happen if the last assistant's usage baseline lags the
     // actual chain. The column should keep formatting; downstream
     // formatters (formatContextDelta, list output) inherit this.
     assert.equal(formatPct1(1_500_000, 1_000_000), "150.0%");
