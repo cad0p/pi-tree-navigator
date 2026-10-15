@@ -1091,9 +1091,11 @@ export default function (pi: ExtensionAPI) {
 
   // Rewind-hint state (#44, #85), keyed by session id and replaced on that
   // session's `session_start`, so `/new` / `/resume` / `/reload` sessions
-  // never inherit a spent crossing, and an in-process sibling (a subagent)
-  // never resets, reconfigures, or spends another session's hint. A
-  // session with no entry (no `session_start` seen) gets no hint.
+  // never inherit a spent crossing, and a sibling session served by the
+  // same extension instance never resets, reconfigures, or spends another
+  // session's hint. Hardening, like the other per-session maps: pi-subagents
+  // currently builds a fresh extension instance per child. A session with
+  // no entry (no `session_start` seen) gets no hint.
   const hintBySession = new Map<
     string,
     { reserve: number | null; tracker: RewindHintTracker }

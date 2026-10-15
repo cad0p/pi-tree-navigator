@@ -4559,7 +4559,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
-  it("a sibling session's session_start does not reset or reconfigure this session's hint (#85)", async () => {
+  it("a sibling session's session_start does not reset or reconfigure this session's hint (#85, same instance)", async () => {
     const fixture = makeConfigFixture();
     try {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
@@ -4601,7 +4601,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
-  it("one session's spent crossing does not silence a sibling's hint (#85)", async () => {
+  it("one session's spent crossing does not silence a sibling's hint (#85, same instance)", async () => {
     const fixture = makeConfigFixture();
     try {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
@@ -4683,7 +4683,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
-  it("a session with no recorded gate fails open, whatever a sibling's gate says (#85)", async () => {
+  it("a session with no recorded gate fails open, whatever a sibling's gate says (#85, same instance)", async () => {
     const fixture = makeConfigFixture();
     try {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
@@ -4702,6 +4702,47 @@ describe("rewind hint: turn_end handler (#44)", () => {
       ctxB.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctxB);
       assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a session with no session_start seen gets no hint, even when a sibling has one", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      const smB = SessionManager.inMemory("/tmp");
+      const tB = appendTurn(smB, "u-anchor-b", "a-anchor-b");
+      smB.appendLabelChange(tB.assistantId, "anchor:start");
+      const ctxB = makeCtx(smB);
+      ctxB.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctxB);
+      assert.equal(pi.sendMessageCalls.length, 0);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a disabled hint never fires, even on an overrun window", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: "off" }),
+      );
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage({
+        tokens: 1_050_000,
+        contextWindow: 1_000_000,
+        percent: 105,
+      });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
     } finally {
       cleanupConfigFixture(fixture);
     }
