@@ -13,8 +13,10 @@
  *     when the project is trusted (untrusted → ignored silently).
  *
  * Fields (each parsed and merged independently):
- *   - `rewindHintAtPercent` (issue #44): opt-in context-pressure hint, or a
- *     disable sentinel.
+ *   - `rewindHintReserveTokens` (issues #44/#84): opt-in context-pressure
+ *     hint, fired when the tokens left in the window drop to the reserve,
+ *     or a disable sentinel. Replaces `rewindHintAtPercent` (removed in
+ *     0.3.0): a present legacy key only warns and is otherwise ignored.
  *   - `anchorStartAfterTurns` (issue #55): turn bound for the automatic
  *     `anchor:start` write. Non-optional — an absent key still fires.
  *
@@ -22,7 +24,7 @@
  *   - File-level problems (non-ENOENT read failure, invalid JSON, non-object
  *     root) make that layer contribute nothing — every field falls through
  *     to the OTHER layer, which still applies.
- *   - HINT field-level problems (`rewindHintAtPercent` present but unusable)
+ *   - HINT field-level problems (`rewindHintReserveTokens` present but unusable)
  *     disable the hint for the session with NO cross-layer fallback: the
  *     user touched the field, so firing at the other layer's threshold would
  *     be an unintended rewind.
@@ -43,8 +45,8 @@ import { readFile as fsReadFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export const TREE_NAVIGATOR_CONFIG_FILENAME = "tree-navigator.json";
-export const REWIND_HINT_MIN_PERCENT = 20;
-export const REWIND_HINT_MAX_PERCENT = 95;
+export const REWIND_HINT_MIN_RESERVE = 1_000;
+export const REWIND_HINT_MAX_RESERVE = 1_000_000;
 export const START_ANCHOR_MIN_TURNS = 1;
 export const START_ANCHOR_MAX_TURNS = 50;
 /**
@@ -55,11 +57,11 @@ export const START_ANCHOR_MAX_TURNS = 50;
 export const START_ANCHOR_DEFAULT_TURNS = 2;
 
 /**
- * Per-field parse outcome for `rewindHintAtPercent`.
+ * Per-field parse outcome for `rewindHintReserveTokens`.
  *
  *   - `absent`:   no key — contributes nothing (falls through).
  *   - `disabled`: explicit sentinel — wins the merge.
- *   - `ok`:       valid threshold — wins the merge.
+ *   - `ok`:       valid reserve — wins the merge.
  *   - `invalid`:  key present, value unusable — wins the merge (disables
  *                 the session; no cross-layer fallback).
  */
@@ -100,10 +102,10 @@ export type ParsedRoot =
 /** Case-insensitive string sentinels that explicitly disable the hint. */
 const DISABLE_SENTINELS = new Set(["off", "disabled"]);
 
-function parseHintPercent(n: number): HintField {
+function parseHintReserve(n: number): HintField {
   return Number.isInteger(n) &&
-    n >= REWIND_HINT_MIN_PERCENT &&
-    n <= REWIND_HINT_MAX_PERCENT
+    n >= REWIND_HINT_MIN_RESERVE &&
+    n <= REWIND_HINT_MAX_RESERVE
     ? { kind: "ok", value: n }
     : { kind: "invalid" };
 }
@@ -117,8 +119,8 @@ function parseStartTurns(n: number): StartAnchorField {
 }
 
 function parseHintField(record: Record<string, unknown>): HintField {
-  if (!("rewindHintAtPercent" in record)) return { kind: "absent" };
-  const value = record.rewindHintAtPercent;
+  if (!("rewindHintReserveTokens" in record)) return { kind: "absent" };
+  const value = record.rewindHintReserveTokens;
   if (value === null || value === false) return { kind: "disabled" };
   if (typeof value === "string") {
     const trimmed = value.trim();
@@ -127,10 +129,10 @@ function parseHintField(record: Record<string, unknown>): HintField {
     }
     // Digits only: decimals, signs, exponents, and empty strings reject.
     return /^\d+$/.test(trimmed)
-      ? parseHintPercent(Number(trimmed))
+      ? parseHintReserve(Number(trimmed))
       : { kind: "invalid" };
   }
-  if (typeof value === "number") return parseHintPercent(value);
+  if (typeof value === "number") return parseHintReserve(value);
   return { kind: "invalid" };
 }
 
@@ -276,9 +278,14 @@ async function loadLayer(
     };
   }
   const warnings: string[] = [];
+  if ("rewindHintAtPercent" in (root as Record<string, unknown>)) {
+    warnings.push(
+      `navigate_tree: rewindHintAtPercent in ${layer} config at ${path} was removed in 0.3.0 and is ignored — use rewindHintReserveTokens (tokens left in the window when the hint fires, e.g. 50000).`,
+    );
+  }
   if (parsed.layer.hint.kind === "invalid") {
     warnings.push(
-      `navigate_tree: invalid rewindHintAtPercent in ${layer} config at ${path} — expected integer ${REWIND_HINT_MIN_PERCENT}-${REWIND_HINT_MAX_PERCENT} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
+      `navigate_tree: invalid rewindHintReserveTokens in ${layer} config at ${path} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
     );
   }
   if (parsed.layer.startAnchor.kind === "invalid") {
@@ -305,7 +312,7 @@ export async function loadTreeNavigatorConfig(opts: {
   readFile?: (path: string) => Promise<string>;
 }): Promise<{
   config: {
-    rewindHintAtPercent: number | null;
+    rewindHintReserveTokens: number | null;
     anchorStartAfterTurns: number;
   };
   warnings: string[];
@@ -335,7 +342,7 @@ export async function loadTreeNavigatorConfig(opts: {
   const effective = mergeTreeNavigatorConfig(globalResult.layer, projectLayer);
   return {
     config: {
-      rewindHintAtPercent:
+      rewindHintReserveTokens:
         effective.hint.kind === "ok" ? effective.hint.value : null,
       anchorStartAfterTurns:
         effective.startAnchor.kind === "ok"

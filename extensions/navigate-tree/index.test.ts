@@ -3115,7 +3115,7 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     await requestRewind(f);
     f.sm.appendCustomMessageEntry(
       REWIND_HINT_CUSTOM_TYPE,
-      buildRewindHintText(91, 1_000_000),
+      expectedHint(91),
       true,
       undefined,
     );
@@ -4143,6 +4143,27 @@ function usageAt(percent: number, contextWindow = 1_000_000): ContextUsage {
 }
 
 /**
+ * The hint text at `percent` of `contextWindow` (via `usageAt`), with the
+ * reserve the test config sets and the active-anchor list the handler must
+ * render (default: the lone `anchorStart` label at 0.0% of 1.0M).
+ */
+function expectedHint(
+  percent: number,
+  anchors = "'start' 0.0% of 1.0M",
+  reserve = 100_000,
+  contextWindow = 1_000_000,
+): string {
+  const usage = usageAt(percent, contextWindow);
+  return buildRewindHintText(
+    percent,
+    contextWindow - (usage.tokens ?? 0),
+    reserve,
+    contextWindow,
+    anchors,
+  );
+}
+
+/**
  * Drive the captured `session_start` handler with `PI_CODING_AGENT_DIR`
  * pointed at the fixture's agent dir (the loader reads the real fs). The env
  * var is always restored, so the suite never touches the user's real config.
@@ -4220,7 +4241,10 @@ describe("rewind hint: session_start config wiring (#44)", () => {
     try {
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       await runSessionStart(pi, ctx, fixture);
       assert.deepEqual(ctx.notifyCalls, [], "valid config must not warn");
 
@@ -4240,10 +4264,15 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       assert.deepEqual(pi.sendMessageCalls[0], [
         {
           customType: REWIND_HINT_CUSTOM_TYPE,
-          content: buildRewindHintText(90, 1_000_000),
+          content: expectedHint(90),
           display: true,
         },
       ]);
+      // Byte-exact pin: the anchors are named, so no `list` call is needed.
+      assert.equal(
+        pi.sendMessageCalls[0][0].content,
+        "[navigate_tree hint] Context is at 90.0% of 1.0M — 100.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 0.0% of 1.0M",
+      );
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -4252,8 +4281,14 @@ describe("rewind hint: session_start config wiring (#44)", () => {
   it("project layer overrides global when trusted; untrusted ignores the file", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
-      writeProjectConfig(fixture, JSON.stringify({ rewindHintAtPercent: 50 }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
+      writeProjectConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 500_000 }),
+      );
 
       // Trusted: the project's 50 wins over the global 90.
       {
@@ -4294,7 +4329,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       writeGlobalConfig(fixture, "{ not json");
       writeProjectConfig(
         fixture,
-        JSON.stringify({ rewindHintAtPercent: true }),
+        JSON.stringify({ rewindHintReserveTokens: true }),
       );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
@@ -4307,7 +4342,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
           "warning",
         ],
         [
-          `navigate_tree: invalid rewindHintAtPercent in project config at ${projectConfigPath(fixture)} — expected integer 20-95 or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
+          `navigate_tree: invalid rewindHintReserveTokens in project config at ${projectConfigPath(fixture)} — expected integer 1000-1000000 or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
           "warning",
         ],
       ]);
@@ -4319,6 +4354,27 @@ describe("rewind hint: session_start config wiring (#44)", () => {
         2,
         "the turn must not add config warnings",
       );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("the removed rewindHintAtPercent warns and leaves the hint off", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [
+        [
+          `navigate_tree: rewindHintAtPercent in global config at ${globalConfigPath(fixture)} was removed in 0.3.0 and is ignored — use rewindHintReserveTokens (tokens left in the window when the hint fires, e.g. 50000).`,
+          "warning",
+        ],
+      ]);
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -4355,7 +4411,10 @@ describe("rewind hint: session_start config wiring (#44)", () => {
   it("reload resets the tracker and the toolActive gate", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
       await runSessionStart(pi, ctx, fixture);
@@ -4393,7 +4452,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
 });
 
 describe("rewind hint: turn_end handler (#44)", () => {
-  const ENABLED_CONFIG = JSON.stringify({ rewindHintAtPercent: "90" });
+  const ENABLED_CONFIG = JSON.stringify({ rewindHintReserveTokens: 100_000 });
 
   async function enabledSetup(): Promise<{
     fixture: ConfigFixture;
@@ -4412,7 +4471,10 @@ describe("rewind hint: turn_end handler (#44)", () => {
   it("does not fire when disabled by a sentinel", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: null }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: null }),
+      );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
       await runSessionStart(pi, ctx, fixture);
@@ -4513,7 +4575,10 @@ describe("rewind hint: turn_end handler (#44)", () => {
   it("fires once per crossing and re-arms only after a drop below the bar", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "20" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 800_000 }),
+      );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
       await runSessionStart(pi, ctx, fixture);
@@ -4547,7 +4612,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.deepEqual(pi.sendMessageCalls[1], [
         {
           customType: REWIND_HINT_CUSTOM_TYPE,
-          content: buildRewindHintText(21, 1_000_000),
+          content: expectedHint(21, undefined, 800_000),
           display: true,
         },
       ]);
@@ -4627,7 +4692,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.deepEqual(appendCalls, [
-        [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
+        [REWIND_HINT_CUSTOM_TYPE, expectedHint(95), true],
       ]);
       assert.deepEqual(
         ctx.notifyCalls,
@@ -4778,7 +4843,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       fireTurnEnd(pi, proxyCtx);
       assert.equal(reads, 1, "sessionManager must be read exactly once");
       assert.deepEqual(appendCalls, [
-        [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
+        [REWIND_HINT_CUSTOM_TYPE, expectedHint(95), true],
       ]);
     } finally {
       cleanupConfigFixture(fixture);
@@ -4821,7 +4886,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       // entry via `appendCustomMessageEntry`; emulate that write, then run
       // the extension's own `context` projection and assert the hint text
       // survives (no customType filtering in `buildContextMessages`).
-      const text = buildRewindHintText(95, 1_000_000);
+      const text = expectedHint(95);
       sm.appendCustomMessageEntry(REWIND_HINT_CUSTOM_TYPE, text, true);
       const contextHandlers = pi.onCalls.get("context");
       assert.ok(contextHandlers, "factory must register a context handler");
@@ -4891,7 +4956,10 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
   it("skips the rewind call, a failed attempt and the completing turn; the crossing fires on the next normal turn", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       const f = setup();
       setupRewindable(f.sm, f.pi, { capture: true });
       await runSessionStart(f.pi, f.ctx, fixture);
@@ -4918,7 +4986,7 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
         [
           {
             customType: REWIND_HINT_CUSTOM_TYPE,
-            content: buildRewindHintText(95, 1_000_000),
+            content: expectedHint(95, "'start' 0.6% · 'end' 0.6% of 1.0M"),
             display: true,
           },
         ],
@@ -4931,7 +4999,10 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
   it("skips a tool-call failure turn too, and the start anchor still runs on it", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       const f = setup();
       // Anchor `a`, not `start`: the auto start anchor must be the writer.
       setupRewindable(f.sm, f.pi, { capture: true, rewindToName: "a" });

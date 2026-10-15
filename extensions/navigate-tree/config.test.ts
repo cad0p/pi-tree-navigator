@@ -9,10 +9,13 @@
  * pin the layer/merge/warning matrix without a session.
  *
  * Two fields with deliberately different failure semantics (issue #55):
- *   - `rewindHintAtPercent`: field-level invalid disables the hint for the
+ *   - `rewindHintReserveTokens`: field-level invalid disables the hint for the
  *     session with NO cross-layer fallback.
  *   - `anchorStartAfterTurns`: field-level invalid warns and falls through
  *     to the other layer's valid value, else the default 2.
+ *
+ * The removed `rewindHintAtPercent` key (0.3.0) only warns: it never
+ * enables, disables, or invalidates the hint.
  */
 
 import * as assert from "node:assert/strict";
@@ -23,8 +26,8 @@ import {
   mergeTreeNavigatorConfig,
   type ParsedLayer,
   parseTreeNavigatorConfig,
-  REWIND_HINT_MAX_PERCENT,
-  REWIND_HINT_MIN_PERCENT,
+  REWIND_HINT_MAX_RESERVE,
+  REWIND_HINT_MIN_RESERVE,
   START_ANCHOR_DEFAULT_TURNS,
   START_ANCHOR_MAX_TURNS,
   START_ANCHOR_MIN_TURNS,
@@ -44,8 +47,10 @@ const WARN_INVALID_JSON_GLOBAL = `navigate_tree: invalid JSON in global config a
 const WARN_INVALID_JSON_PROJECT = `navigate_tree: invalid JSON in project config at ${PROJECT_PATH} — that layer was ignored.`;
 const WARN_NOT_OBJECT_GLOBAL = `navigate_tree: global config at ${GLOBAL_PATH} must be a JSON object — that layer was ignored.`;
 const WARN_NOT_OBJECT_PROJECT = `navigate_tree: project config at ${PROJECT_PATH} must be a JSON object — that layer was ignored.`;
-const WARN_INVALID_HINT_GLOBAL = `navigate_tree: invalid rewindHintAtPercent in global config at ${GLOBAL_PATH} — expected integer ${REWIND_HINT_MIN_PERCENT}-${REWIND_HINT_MAX_PERCENT} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`;
-const WARN_INVALID_HINT_PROJECT = `navigate_tree: invalid rewindHintAtPercent in project config at ${PROJECT_PATH} — expected integer ${REWIND_HINT_MIN_PERCENT}-${REWIND_HINT_MAX_PERCENT} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`;
+const WARN_INVALID_HINT_GLOBAL = `navigate_tree: invalid rewindHintReserveTokens in global config at ${GLOBAL_PATH} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`;
+const warnLegacyPercent = (layerName: string, path: string) =>
+  `navigate_tree: rewindHintAtPercent in ${layerName} config at ${path} was removed in 0.3.0 and is ignored — use rewindHintReserveTokens (tokens left in the window when the hint fires, e.g. 50000).`;
+const WARN_INVALID_HINT_PROJECT = `navigate_tree: invalid rewindHintReserveTokens in project config at ${PROJECT_PATH} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`;
 const WARN_INVALID_START_GLOBAL = `navigate_tree: invalid anchorStartAfterTurns in global config at ${GLOBAL_PATH} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`;
 const WARN_INVALID_START_PROJECT = `navigate_tree: invalid anchorStartAfterTurns in project config at ${PROJECT_PATH} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`;
 
@@ -80,8 +85,8 @@ function throwingReader(code: string): (path: string) => Promise<string> {
   };
 }
 
-function configJson(rewindHintAtPercent: unknown): string {
-  return JSON.stringify({ rewindHintAtPercent });
+function configJson(rewindHintReserveTokens: unknown): string {
+  return JSON.stringify({ rewindHintReserveTokens });
 }
 
 function configJsonStart(anchorStartAfterTurns: unknown): string {
@@ -101,7 +106,7 @@ function layer(partial: {
 
 /** The loader's expected config object (start defaults unless overridden). */
 function cfg(hint: number | null, start = START_ANCHOR_DEFAULT_TURNS) {
-  return { rewindHintAtPercent: hint, anchorStartAfterTurns: start };
+  return { rewindHintReserveTokens: hint, anchorStartAfterTurns: start };
 }
 
 /** Parse a root expected to be an object and return its parsed layer. */
@@ -113,27 +118,27 @@ function parsedLayer(raw: unknown): ParsedLayer {
 }
 
 describe("parseTreeNavigatorConfig", () => {
-  describe("rewindHintAtPercent: accepts integer thresholds (number and string forms)", () => {
+  describe("rewindHintReserveTokens: accepts integer reserves (number and string forms)", () => {
     const accepted: Array<[string, unknown, number]> = [
-      ["number", 90, 90],
-      ["numeric string", "90", 90],
-      ["trimmed numeric string", " 90 ", 90],
-      ["min edge number", REWIND_HINT_MIN_PERCENT, REWIND_HINT_MIN_PERCENT],
-      ["max edge number", REWIND_HINT_MAX_PERCENT, REWIND_HINT_MAX_PERCENT],
+      ["number", 50000, 50000],
+      ["numeric string", "50000", 50000],
+      ["trimmed numeric string", " 50000 ", 50000],
+      ["min edge number", REWIND_HINT_MIN_RESERVE, REWIND_HINT_MIN_RESERVE],
+      ["max edge number", REWIND_HINT_MAX_RESERVE, REWIND_HINT_MAX_RESERVE],
       [
         "min edge string",
-        `${REWIND_HINT_MIN_PERCENT}`,
-        REWIND_HINT_MIN_PERCENT,
+        `${REWIND_HINT_MIN_RESERVE}`,
+        REWIND_HINT_MIN_RESERVE,
       ],
       [
         "max edge string",
-        `${REWIND_HINT_MAX_PERCENT}`,
-        REWIND_HINT_MAX_PERCENT,
+        `${REWIND_HINT_MAX_RESERVE}`,
+        REWIND_HINT_MAX_RESERVE,
       ],
     ];
     for (const [label, raw, want] of accepted) {
       it(label, () => {
-        assert.deepEqual(parsedLayer({ rewindHintAtPercent: raw }).hint, {
+        assert.deepEqual(parsedLayer({ rewindHintReserveTokens: raw }).hint, {
           kind: "ok",
           value: want,
         });
@@ -141,7 +146,7 @@ describe("parseTreeNavigatorConfig", () => {
     }
   });
 
-  describe("rewindHintAtPercent: treats explicit-disable sentinels as disabled", () => {
+  describe("rewindHintReserveTokens: treats explicit-disable sentinels as disabled", () => {
     const disabling: unknown[] = [
       null,
       false,
@@ -154,21 +159,21 @@ describe("parseTreeNavigatorConfig", () => {
     ];
     for (const raw of disabling) {
       it(JSON.stringify(raw), () => {
-        assert.deepEqual(parsedLayer({ rewindHintAtPercent: raw }).hint, {
+        assert.deepEqual(parsedLayer({ rewindHintReserveTokens: raw }).hint, {
           kind: "disabled",
         });
       });
     }
   });
 
-  describe("rewindHintAtPercent: rejects unusable field values as invalid", () => {
+  describe("rewindHintReserveTokens: rejects unusable field values as invalid", () => {
     const invalid: Array<[string, unknown]> = [
-      ["one below min", REWIND_HINT_MIN_PERCENT - 1],
-      ["one above max", REWIND_HINT_MAX_PERCENT + 1],
+      ["one below min", REWIND_HINT_MIN_RESERVE - 1],
+      ["one above max", REWIND_HINT_MAX_RESERVE + 1],
       ["zero", 0],
       ["negative", -1],
-      ["decimal", 90.5],
-      ["decimal string", "90.5"],
+      ["decimal", 50000.5],
+      ["decimal string", "50000.5"],
       ["non-numeric string", "ninety"],
       ["empty string", ""],
       ["whitespace string", "   "],
@@ -178,13 +183,13 @@ describe("parseTreeNavigatorConfig", () => {
       ["NaN number", Number.NaN],
       ["NaN string", "NaN"],
       ["negative string", "-1"],
-      ["plus-signed string", "+90"],
-      ["string below min", "19"],
-      ["string above max", "96"],
+      ["plus-signed string", "+50000"],
+      ["string below min", "999"],
+      ["string above max", "1000001"],
     ];
     for (const [label, raw] of invalid) {
       it(label, () => {
-        assert.deepEqual(parsedLayer({ rewindHintAtPercent: raw }).hint, {
+        assert.deepEqual(parsedLayer({ rewindHintReserveTokens: raw }).hint, {
           kind: "invalid",
         });
       });
@@ -247,7 +252,7 @@ describe("parseTreeNavigatorConfig", () => {
 
   it("parses each field independently (invalid hint leaves start valid)", () => {
     const parsed = parsedLayer({
-      rewindHintAtPercent: true,
+      rewindHintReserveTokens: true,
       anchorStartAfterTurns: 5,
     });
     assert.deepEqual(parsed.hint, { kind: "invalid" });
@@ -256,10 +261,10 @@ describe("parseTreeNavigatorConfig", () => {
 
   it("parses each field independently (invalid start leaves hint valid)", () => {
     const parsed = parsedLayer({
-      rewindHintAtPercent: 90,
+      rewindHintReserveTokens: 50000,
       anchorStartAfterTurns: "two",
     });
-    assert.deepEqual(parsed.hint, { kind: "ok", value: 90 });
+    assert.deepEqual(parsed.hint, { kind: "ok", value: 50000 });
     assert.deepEqual(parsed.startAnchor, { kind: "invalid" });
   });
 
@@ -267,12 +272,21 @@ describe("parseTreeNavigatorConfig", () => {
     assert.deepEqual(parsedLayer({}), layer({}));
     assert.deepEqual(parsedLayer({ other: 1 }), layer({}));
     // A present hint key leaves start absent (absent ≠ invalid).
-    assert.deepEqual(parsedLayer({ rewindHintAtPercent: 90 }).startAnchor, {
-      kind: "absent",
-    });
+    assert.deepEqual(
+      parsedLayer({ rewindHintReserveTokens: 50000 }).startAnchor,
+      {
+        kind: "absent",
+      },
+    );
     assert.deepEqual(parsedLayer({ anchorStartAfterTurns: 4 }).hint, {
       kind: "absent",
     });
+  });
+
+  it("ignores the removed rewindHintAtPercent key (the loader warns)", () => {
+    for (const raw of ["90", 90, null, "off", true]) {
+      assert.deepEqual(parsedLayer({ rewindHintAtPercent: raw }), layer({}));
+    }
   });
 
   it("returns unusable for a non-object root (file-level failure)", () => {
@@ -284,8 +298,8 @@ describe("parseTreeNavigatorConfig", () => {
 
 describe("mergeTreeNavigatorConfig", () => {
   describe("hint field (issue #44 semantics preserved)", () => {
-    const okGlobal: HintField = { kind: "ok", value: 90 };
-    const okProject: HintField = { kind: "ok", value: 50 };
+    const okGlobal: HintField = { kind: "ok", value: 50000 };
+    const okProject: HintField = { kind: "ok", value: 30000 };
     const cases: Array<{
       name: string;
       global: HintField;
@@ -434,7 +448,7 @@ describe("mergeTreeNavigatorConfig", () => {
   it("merges the two fields independently", () => {
     const merged = mergeTreeNavigatorConfig(
       layer({
-        hint: { kind: "ok", value: 90 },
+        hint: { kind: "ok", value: 50000 },
         startAnchor: { kind: "ok", value: 5 },
       }),
       layer({ hint: { kind: "invalid" } }),
@@ -448,11 +462,11 @@ describe("loadTreeNavigatorConfig", () => {
   it("reads both layers and lets a trusted project override global per field", async () => {
     const reader = readerFor({
       [GLOBAL_PATH]: JSON.stringify({
-        rewindHintAtPercent: "90",
+        rewindHintReserveTokens: "50000",
         anchorStartAfterTurns: 5,
       }),
       [PROJECT_PATH]: JSON.stringify({
-        rewindHintAtPercent: 50,
+        rewindHintReserveTokens: 30000,
         anchorStartAfterTurns: 3,
       }),
     });
@@ -462,18 +476,18 @@ describe("loadTreeNavigatorConfig", () => {
       projectTrusted: true,
       readFile: reader.readFile,
     });
-    assert.deepEqual(out, { config: cfg(50, 3), warnings: [] });
+    assert.deepEqual(out, { config: cfg(30000, 3), warnings: [] });
     assert.deepEqual(reader.paths, [GLOBAL_PATH, PROJECT_PATH]);
   });
 
   it("never reads the project layer when the project is untrusted", async () => {
     const reader = readerFor({
       [GLOBAL_PATH]: JSON.stringify({
-        rewindHintAtPercent: "90",
+        rewindHintReserveTokens: "50000",
         anchorStartAfterTurns: 5,
       }),
       [PROJECT_PATH]: JSON.stringify({
-        rewindHintAtPercent: 50,
+        rewindHintReserveTokens: 30000,
         anchorStartAfterTurns: 3,
       }),
     });
@@ -483,7 +497,7 @@ describe("loadTreeNavigatorConfig", () => {
       projectTrusted: false,
       readFile: reader.readFile,
     });
-    assert.deepEqual(out, { config: cfg(90, 5), warnings: [] });
+    assert.deepEqual(out, { config: cfg(50000, 5), warnings: [] });
     assert.deepEqual(reader.paths, [GLOBAL_PATH]);
   });
 
@@ -517,10 +531,43 @@ describe("loadTreeNavigatorConfig", () => {
     });
   });
 
+  it("warns on the removed rewindHintAtPercent key and leaves the hint off", async () => {
+    const reader = readerFor({
+      [GLOBAL_PATH]: JSON.stringify({ rewindHintAtPercent: "90" }),
+    });
+    const out = await loadTreeNavigatorConfig({
+      agentDir: AGENT_DIR,
+      projectPath: PROJECT_PATH,
+      projectTrusted: false,
+      readFile: reader.readFile,
+    });
+    assert.deepEqual(out, {
+      config: cfg(null),
+      warnings: [warnLegacyPercent("global", GLOBAL_PATH)],
+    });
+  });
+
+  it("warns on a legacy project key while the global reserve still applies", async () => {
+    const reader = readerFor({
+      [GLOBAL_PATH]: JSON.stringify({ rewindHintReserveTokens: 50000 }),
+      [PROJECT_PATH]: JSON.stringify({ rewindHintAtPercent: 80 }),
+    });
+    const out = await loadTreeNavigatorConfig({
+      agentDir: AGENT_DIR,
+      projectPath: PROJECT_PATH,
+      projectTrusted: true,
+      readFile: reader.readFile,
+    });
+    assert.deepEqual(out, {
+      config: cfg(50000),
+      warnings: [warnLegacyPercent("project", PROJECT_PATH)],
+    });
+  });
+
   it("trims and accepts numeric-string values through the loader", async () => {
     const reader = readerFor({
       [GLOBAL_PATH]: JSON.stringify({
-        rewindHintAtPercent: " 90 ",
+        rewindHintReserveTokens: " 50000 ",
         anchorStartAfterTurns: " 4 ",
       }),
     });
@@ -530,7 +577,7 @@ describe("loadTreeNavigatorConfig", () => {
       projectTrusted: false,
       readFile: reader.readFile,
     });
-    assert.deepEqual(out, { config: cfg(90, 4), warnings: [] });
+    assert.deepEqual(out, { config: cfg(50000, 4), warnings: [] });
   });
 
   it("warns on a non-ENOENT read error and ignores that layer (EACCES)", async () => {
@@ -551,10 +598,10 @@ describe("loadTreeNavigatorConfig", () => {
       agentDir: AGENT_DIR,
       projectPath: PROJECT_PATH,
       projectTrusted: true,
-      readFile: readerFor({ [PROJECT_PATH]: configJson("63") }).readFile,
+      readFile: readerFor({ [PROJECT_PATH]: configJson("63000") }).readFile,
     });
     // Global read hits the injected ENOENT (silent), project applies.
-    assert.deepEqual(out, { config: cfg(63), warnings: [] });
+    assert.deepEqual(out, { config: cfg(63000), warnings: [] });
 
     const dirReader = throwingReader("EISDIR");
     const dirOut = await loadTreeNavigatorConfig({
@@ -617,7 +664,7 @@ describe("loadTreeNavigatorConfig", () => {
 
   it("an invalid project hint disables despite a valid global (no fallback)", async () => {
     const reader = readerFor({
-      [GLOBAL_PATH]: configJson(90),
+      [GLOBAL_PATH]: configJson(50000),
       [PROJECT_PATH]: configJson({ nope: true }),
     });
     const out = await loadTreeNavigatorConfig({
@@ -634,7 +681,7 @@ describe("loadTreeNavigatorConfig", () => {
 
   it("a project hint disable sentinel overrides a valid global", async () => {
     const reader = readerFor({
-      [GLOBAL_PATH]: configJson(90),
+      [GLOBAL_PATH]: configJson(50000),
       [PROJECT_PATH]: configJson(null),
     });
     const out = await loadTreeNavigatorConfig({
@@ -697,7 +744,7 @@ describe("loadTreeNavigatorConfig", () => {
   it("both fields invalid in one layer emit one scoped warning each", async () => {
     const reader = readerFor({
       [GLOBAL_PATH]: JSON.stringify({
-        rewindHintAtPercent: true,
+        rewindHintReserveTokens: true,
         anchorStartAfterTurns: "lots",
       }),
     });
@@ -730,11 +777,11 @@ describe("loadTreeNavigatorConfig", () => {
   it("orders warnings global-then-project across fields", async () => {
     const reader = readerFor({
       [GLOBAL_PATH]: JSON.stringify({
-        rewindHintAtPercent: "nope",
+        rewindHintReserveTokens: "nope",
         anchorStartAfterTurns: "nope",
       }),
       [PROJECT_PATH]: JSON.stringify({
-        rewindHintAtPercent: { bad: true },
+        rewindHintReserveTokens: { bad: true },
         anchorStartAfterTurns: [],
       }),
     });
@@ -750,7 +797,7 @@ describe("loadTreeNavigatorConfig", () => {
       WARN_INVALID_HINT_PROJECT,
       WARN_INVALID_START_PROJECT,
     ]);
-    assert.equal(out.config.rewindHintAtPercent, null);
+    assert.equal(out.config.rewindHintReserveTokens, null);
     assert.equal(out.config.anchorStartAfterTurns, START_ANCHOR_DEFAULT_TURNS);
   });
 
@@ -758,7 +805,7 @@ describe("loadTreeNavigatorConfig", () => {
     for (const raw of ["{ not json", "[]"]) {
       const reader = readerFor({
         [GLOBAL_PATH]: JSON.stringify({
-          rewindHintAtPercent: 90,
+          rewindHintReserveTokens: 50000,
           anchorStartAfterTurns: 5,
         }),
         [PROJECT_PATH]: raw,
@@ -770,7 +817,7 @@ describe("loadTreeNavigatorConfig", () => {
         readFile: reader.readFile,
       });
       assert.deepEqual(out, {
-        config: cfg(90, 5),
+        config: cfg(50000, 5),
         warnings: [
           raw === "[]" ? WARN_NOT_OBJECT_PROJECT : WARN_INVALID_JSON_PROJECT,
         ],
@@ -780,7 +827,7 @@ describe("loadTreeNavigatorConfig", () => {
 
   it("a malformed project file is silent when the project is untrusted", async () => {
     const reader = readerFor({
-      [GLOBAL_PATH]: configJson(90),
+      [GLOBAL_PATH]: configJson(50000),
       [PROJECT_PATH]: "{ not json",
     });
     const out = await loadTreeNavigatorConfig({
@@ -789,7 +836,7 @@ describe("loadTreeNavigatorConfig", () => {
       projectTrusted: false,
       readFile: reader.readFile,
     });
-    assert.deepEqual(out, { config: cfg(90), warnings: [] });
+    assert.deepEqual(out, { config: cfg(50000), warnings: [] });
     assert.deepEqual(reader.paths, [GLOBAL_PATH]);
   });
 
@@ -808,7 +855,7 @@ describe("loadTreeNavigatorConfig", () => {
       WARN_INVALID_JSON_GLOBAL,
       WARN_INVALID_HINT_PROJECT,
     ]);
-    assert.equal(out.config.rewindHintAtPercent, null);
+    assert.equal(out.config.rewindHintReserveTokens, null);
     assert.equal(out.config.anchorStartAfterTurns, START_ANCHOR_DEFAULT_TURNS);
   });
 
