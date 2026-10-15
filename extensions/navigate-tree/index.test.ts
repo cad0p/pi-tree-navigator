@@ -4788,6 +4788,27 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("an empty-named manual label alone counts as no anchors", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      // `anchor:` is not a valid `rewindTo`, so the model must not be
+      // pointed at it.
+      const t = appendTurn(sm, "u-empty", "a-empty");
+      pi.pi.setLabel(t.assistantId, "anchor:");
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, [
+        [buildNoAnchorText(95, 1_000_000), "warning"],
+      ]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("with no anchors and no UI: silent", async () => {
     const fixture = makeConfigFixture();
     try {

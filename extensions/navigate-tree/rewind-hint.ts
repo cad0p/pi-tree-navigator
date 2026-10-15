@@ -48,7 +48,8 @@ export class RewindHintTracker {
 /** `12.3k` / `1.0M`; negative (an overrun window) clamps to `0.0k`. */
 function formatTokensK(tokens: number): string {
   const t = Math.max(0, tokens);
-  if (t >= 1_000_000) return `${(t / 1_000_000).toFixed(1)}M`;
+  // 999_950+ would round to `1000.0k`.
+  if (t >= 999_950) return `${(t / 1_000_000).toFixed(1)}M`;
   return `${(t / 1000).toFixed(1)}k`;
 }
 

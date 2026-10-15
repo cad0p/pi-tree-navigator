@@ -105,6 +105,15 @@ describe("buildRewindHintText", () => {
       buildRewindHintText(10, 1_350_000, 1_000_000, 1_500_000, "'a' 1.0%"),
       /— 1\.4M tokens left, within the 1\.0M reserve\./,
     );
+    // Values that would round to `1000.0k` switch to M.
+    assert.match(
+      buildRewindHintText(5, 999_960, 999_950, 1_000_000, "'a' 1.0%"),
+      /— 1\.0M tokens left, within the 1\.0M reserve\./,
+    );
+    assert.match(
+      buildRewindHintText(5, 999_949, 999_949, 1_000_000, "'a' 1.0%"),
+      /— 999\.9k tokens left, within the 999\.9k reserve\./,
+    );
   });
 
   it("clamps an overrun window to 0.0k tokens left", () => {
