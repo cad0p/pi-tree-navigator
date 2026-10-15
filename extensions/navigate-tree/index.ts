@@ -1310,7 +1310,7 @@ export default function (pi: ExtensionAPI) {
         hintToolActive = toolActiveBySession.get(sessionId) ?? true;
         hint = hintBySession.get(sessionId);
       } catch {
-        // Stale ctx: keep the shared fallback; no hint state.
+        // Stale ctx: no hint state.
       }
     }
     if (!hintToolActive || !hint || hint.reserve === null) return;
