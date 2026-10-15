@@ -62,6 +62,7 @@ import {
 import { Type } from "typebox";
 import {
   loadTreeNavigatorConfig,
+  resolveRewindHintReserve,
   START_ANCHOR_DEFAULT_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
@@ -1092,9 +1093,13 @@ export default function (pi: ExtensionAPI) {
   // Rewind-hint closure state (#44): fresh per factory invocation and reset
   // on every `session_start`, so `/new` / `/resume` / `/reload` sessions
   // never inherit a spent crossing or another session's config. `toolActive`
-  // fails open until `before_agent_start` says otherwise.
+  // fails open until `before_agent_start` says otherwise. `hintByModel`
+  // (#86) holds the `modelOverrides` reserves; the reserve is resolved
+  // against the live `ctx.model` on every `turn_end`, so a model switch
+  // mid-session takes effect on the next turn.
   let toolActive = true;
   let rewindHintReserveTokens: number | null = null;
+  let hintByModel: ReadonlyMap<string, number | null> = new Map();
   let hintTracker = new RewindHintTracker();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
@@ -1189,9 +1194,11 @@ export default function (pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     pendingRewinds.delete(sessionId);
     rewindHintReserveTokens = null;
+    hintByModel = new Map();
     hintTracker = new RewindHintTracker();
     toolActive = true;
     let reserve: number | null = null;
+    let byModel: ReadonlyMap<string, number | null> = new Map();
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
     let warnings: string[] = [];
     try {
@@ -1201,6 +1208,7 @@ export default function (pi: ExtensionAPI) {
         projectTrusted,
       });
       reserve = loaded.config.rewindHintReserveTokens;
+      byModel = loaded.config.rewindHintModelReserveTokens;
       startTurns = loaded.config.anchorStartAfterTurns;
       warnings = loaded.warnings;
     } catch {
@@ -1209,10 +1217,12 @@ export default function (pi: ExtensionAPI) {
       // failure already carries a user-facing warning, and a new string here
       // would only fire on an unreachable path.
       reserve = null;
+      byModel = new Map();
       startTurns = START_ANCHOR_DEFAULT_TURNS;
       warnings = [];
     }
     rewindHintReserveTokens = reserve;
+    hintByModel = byModel;
     anchorStartTurnsBySession.set(sessionId, startTurns);
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
@@ -1312,7 +1322,30 @@ export default function (pi: ExtensionAPI) {
         // Stale ctx: keep the shared fallback.
       }
     }
-    if (!hintToolActive || rewindHintReserveTokens === null) return;
+    // Hint off everywhere: nothing can fire or re-arm.
+    if (
+      !hintToolActive ||
+      (rewindHintReserveTokens === null && hintByModel.size === 0)
+    ) {
+      return;
+    }
+    let modelKey: string | undefined;
+    if (hintByModel.size > 0) {
+      try {
+        const model = ctx.model;
+        if (model) modelKey = `${model.provider}/${model.id}`;
+      } catch {
+        // Stale ctx: no hint this turn.
+        return;
+      }
+    }
+    const reserve = resolveRewindHintReserve(
+      {
+        rewindHintReserveTokens,
+        rewindHintModelReserveTokens: hintByModel,
+      },
+      modelKey,
+    );
     // A rewind owns this turn (its call, a summary attempt, or the
     // completion): a rewind hint would be stale or push a second
     // rewind. The crossing stays unspent for the next turn.
@@ -1336,9 +1369,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const tokensLeft = usage.contextWindow - usage.tokens;
-    if (tokensLeft > rewindHintReserveTokens) {
-      // Outside the reserve: re-arm only.
-      hintTracker.observe(tokensLeft, rewindHintReserveTokens);
+    if (reserve === null || tokensLeft > reserve) {
+      // Hint off for this model, or outside the reserve: re-arm only.
+      hintTracker.observe(tokensLeft, reserve);
       return;
     }
     // Spent: skip the anchor walk below (it estimates every anchor).
@@ -1359,12 +1392,12 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    if (!hintTracker.observe(tokensLeft, rewindHintReserveTokens)) return;
+    if (!hintTracker.observe(tokensLeft, reserve)) return;
     if (anchors.names.length > 0) {
       const text = buildRewindHintText(
         usage.percent,
         tokensLeft,
-        rewindHintReserveTokens,
+        reserve,
         usage.contextWindow,
         anchors.text,
       );

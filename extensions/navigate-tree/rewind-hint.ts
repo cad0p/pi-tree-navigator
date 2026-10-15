@@ -19,13 +19,14 @@ export const REWIND_HINT_CUSTOM_TYPE = "navigate-tree-rewind-hint";
  * One-shot crossing tracker. `observe` returns true exactly on a fresh
  * crossing (`tokensLeft <= reserve` while unspent); an observation with
  * more than `reserve` tokens left re-arms, and a spent tracker stays silent
- * while still inside the reserve.
+ * while still inside the reserve. A `null` reserve (hint off for the
+ * active model, #86) never fires, and always re-arms.
  */
 export class RewindHintTracker {
   private spent = false;
 
-  observe(tokensLeft: number, reserve: number): boolean {
-    if (tokensLeft > reserve) {
+  observe(tokensLeft: number, reserve: number | null): boolean {
+    if (reserve === null || tokensLeft > reserve) {
       this.spent = false;
       return false;
     }

@@ -45,6 +45,14 @@ describe("RewindHintTracker", () => {
     assert.equal(tracker.observe(18_000, 20_000), false);
   });
 
+  it("a null reserve never fires and re-arms (#86)", () => {
+    const t = new RewindHintTracker();
+    assert.equal(t.observe(1_000, null), false);
+    assert.equal(t.observe(50_000, 50_000), true);
+    assert.equal(t.observe(1_000, null), false);
+    assert.equal(t.isSpent(), false);
+  });
+
   it("isSpent() tracks the crossing", () => {
     const tracker = new RewindHintTracker();
     assert.equal(tracker.isSpent(), false);
