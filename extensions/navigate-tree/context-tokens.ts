@@ -43,6 +43,12 @@
  *   public `estimateTokens` uses plain `JSON.stringify` (0.84.2 and 1.0.0
  *   alike — v1 restricts toolCall arguments to JSON-compatible values).
  *   The guard is deliberately not reproduced.
+ * - **`context_edit` invalidation.** pi's `estimateProjectedContextTokens`
+ *   (behind `ctx.getContextUsage()`) discounts content a `context_edit`
+ *   entry invalidated; this helper estimates the `buildSessionContext`
+ *   messages as-is. On a branch with context edits, an anchor percentage
+ *   (this helper) can exceed what pi reports for the same point. Moving
+ *   live-branch numbers onto pi's estimate is tracked in #64.
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";

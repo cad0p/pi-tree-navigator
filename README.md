@@ -87,19 +87,17 @@ Enable it with `rewindHintReserveTokens` (see [Configuration](#configuration-tre
 { "rewindHintReserveTokens": 50000 }
 ```
 
-- Value: integer **1000–1000000** inclusive — the number of tokens left in the window (`contextWindow − context tokens`) at which the hint fires. A bare number is canonical (`50000`); a numeric string (`"50000"`) is also accepted. Size it like pi's `compaction.reserveTokens`: it is an absolute budget for the persist + summary turns, so it means the same thing on a 100k and a 1M window. A reserve at or above the window fires on the first observed turn.
+- Value: integer **1000–1000000** inclusive — the number of tokens left in the window (`contextWindow − context tokens`) at which the hint fires. A bare number is canonical (`50000`); a digits-only string (`"50000"`, surrounding whitespace allowed) is also accepted. Size it like pi's `compaction.reserveTokens`: it is an absolute budget for the persist + summary turns, so it means the same thing on a 100k and a 1M window. A reserve at or above the window fires on the first observed turn and never re-arms (the tokens left can never climb above it), so it fires once per session.
 - Explicit-disable sentinels: `null`, `false`, `"off"`, `"disabled"` (case-insensitive) — the project layer can switch off a global value.
 - Precedence: a project key, when present, wins (including sentinels). Absent → global. Absent everywhere → disabled.
-- Invalid value (out of range, decimal, non-numeric string, `true`, object): the hint stays off for the session — no fallback to the other layer's reserve — and its field-scoped warning is shown when the session has a UI.
+- Invalid value (out of range, non-integer, a string other than digits — signs, decimals, exponents — `true`, object): the hint stays off for the session — no fallback to the other layer's reserve — and its field-scoped warning is shown when the session has a UI.
 - One hint per crossing: fires when `tokens left <= reserve`, re-arms only after the tokens left climb back above it (a rewind or compaction); no escalation, no re-fire while spent.
 - **Removed in 0.3.0: `rewindHintAtPercent`.** A percentage meant very different budgets on different windows (90% leaves 100k on 1M but 10k on 100k). The key is now ignored with a field-scoped warning pointing at `rewindHintReserveTokens`; migrate by picking the tokens you want left (e.g. `"90"` on a 1M window → `100000`).
 
 When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message naming every active anchor with its cumulative context percentage — so the model knows a rewind target exists (including the automatic `start`) without a `list` call. Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
 
 ```text
-[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within
-the 50.0k reserve. Persist what matters to files now, then rewind to the oldest
-appropriate anchor. Active anchors: 'start' 4.1% · 'context-gathered' 12.0% of 1.0M
+[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 4.1% · 'context-gathered' 12.0% of 1.0M
 ```
 
 With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
@@ -110,7 +108,7 @@ Independent of the hint, the tool ships two static `promptGuidelines` bullets, p
 
 ### Compaction guidance
 
-The hint is an alternative to auto-compaction. Auto-compaction fires at `contextWindow − reserveTokens` (`compaction.reserveTokens`, default 16384); the hint fires at `contextWindow − rewindHintReserveTokens`, so it lands before compaction on every window as long as `rewindHintReserveTokens` is larger than `compaction.reserveTokens` (leave room for the persist and summary turns). Recommended: disable auto-compaction (`"compaction": { "enabled": false }`) so running out mid-persist produces pi's loud context-window error instead of a silent lossy compaction. Keep compaction enabled only as a safety net if you'd rather the model continue and compact mid-write; the hint never overrides it.
+The hint is an alternative to auto-compaction. Auto-compaction fires at `contextWindow − reserveTokens` (`compaction.reserveTokens`, default 16384); the hint fires once `contextWindow − tokens <= rewindHintReserveTokens`, and pi's threshold compaction once `tokens > contextWindow − reserveTokens`, so the hint lands first on every window whenever `rewindHintReserveTokens` is at least the active model's compaction reserve (`compaction.modelOverrides["<provider>/<modelId>"].reserveTokens`, else `compaction.reserveTokens`); size it well above that to leave room for the persist and summary turns. Overflow-triggered compaction (a provider context-length error) is independent of either threshold. Recommended: disable auto-compaction (`"compaction": { "enabled": false }`) so running out mid-persist produces pi's loud context-window error instead of a silent lossy compaction. Keep compaction enabled only as a safety net if you'd rather the model continue and compact mid-write; the hint never overrides it.
 
 ## Automatic start anchor
 

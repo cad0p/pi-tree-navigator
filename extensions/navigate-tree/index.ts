@@ -524,8 +524,10 @@ function buildMinSavingsRejection(
   byId: Map<string, SessionEntry>,
 ): string {
   const anchors = formatActiveAnchors(sm, cw, allEntries, byId);
+  // `find(Boolean)`: an empty-named manual `/tree` label (`anchor:`) never
+  // counts as the oldest anchor.
   const guidance =
-    anchors.names[0] === rewindTo
+    anchors.names.find(Boolean) === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
       : "Rewind further back to actually free context, or keep working.";
   return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.text}`;
@@ -685,7 +687,7 @@ function rewindStaleReason(
  * turns: user messages (steers drained at the rewind turn's boundary) and
  * other extensions' custom messages (subagent results, timers). Oldest
  * first; this extension's own rewind and rewind-hint messages are excluded
- * (a pre-rewind "context is running low" hint is stale once it lands).
+ * (a pre-rewind rewind hint is stale once it lands).
  */
 type LateEntry =
   | {
@@ -795,7 +797,7 @@ export default function (pi: ExtensionAPI) {
 
   // Turns the rewind handler owned (the rewind call's turn, summary
   // attempts, the completing turn): the hint handler skips them, so a stale
-  // "context is running low" hint never lands on a rewind in progress.
+  // rewind hint never lands on a rewind in progress.
   const rewindTurns = new WeakSet<object>();
 
   function cancelRewind(
@@ -1311,7 +1313,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (!hintToolActive || rewindHintReserveTokens === null) return;
     // A rewind owns this turn (its call, a summary attempt, or the
-    // completion): a "running low" nudge would be stale or push a second
+    // completion): a rewind hint would be stale or push a second
     // rewind. The crossing stays unspent for the next turn.
     if (
       event.message &&

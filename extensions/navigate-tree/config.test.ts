@@ -184,6 +184,9 @@ describe("parseTreeNavigatorConfig", () => {
       ["NaN string", "NaN"],
       ["negative string", "-1"],
       ["plus-signed string", "+50000"],
+      ["decimal-zero string", "1000.0"],
+      ["exponent string", "1e3"],
+      ["plus-signed min string", "+1000"],
       ["string below min", "999"],
       ["string above max", "1000001"],
     ];

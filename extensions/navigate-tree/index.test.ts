@@ -3833,6 +3833,11 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.match(text, /Rewind further back to actually free context/);
     assert.match(text, /'kickoff'/);
     assert.match(text, /'impl-start'/);
+    // Byte-exact pin (#84 moved the anchor walk into formatActiveAnchors).
+    assert.equal(
+      text,
+      "Rewinding to 'impl-start' (as 'done') would free only ~0.0k tokens. Rewind further back to actually free context, or keep working. Active anchors: 'kickoff' 0.6% · 'impl-start' 1.2% of 1.0M",
+    );
     // The numeric bar itself is NEVER printed agent-visible.
     assert.ok(
       !text.includes(String(MIN_REWIND_SAVINGS_TOKENS)),
@@ -3877,9 +3882,63 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       /No earlier anchors — keep working and rewind later once more has accumulated above it\./,
     );
     assert.match(text, /'start'/);
+    assert.equal(
+      text,
+      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it. Active anchors: 'start' 0.6% of 1.0M",
+    );
     assert.ok(!text.includes(String(MIN_REWIND_SAVINGS_TOKENS)));
     assert.equal(fireToolCall(pi, ctx), undefined);
     assertLabelAbsent(sm, "anchor:done");
+  });
+
+  it("A-pin variant B at contextWindow 0: k-format percents, no window suffix", async () => {
+    const { sm, pi, tool, ctx } = setup({ contextWindow: 0 });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 6_001);
+    const r = await tool.execute(
+      "tc-floor-b0",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r.details.rejected, "min-savings");
+    assert.equal(
+      r.content[0].text,
+      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it. Active anchors: 'start' 6.0k",
+    );
+  });
+
+  it("an empty-named manual label never counts as the oldest anchor", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t0 = appendTurn(sm, "u0", "a0", 3_000);
+    pi.pi.setLabel(t0.assistantId, "anchor:");
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 6_001);
+    const r = await tool.execute(
+      "tc-floor-empty",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r.details.rejected, "min-savings");
+    assert.match(
+      r.content[0].text,
+      /No earlier anchors — keep working and rewind later once more has accumulated above it\./,
+    );
   });
 
   it("B-pin: healthy stage (≥20k apparent savings) requests the summary", async () => {
@@ -4290,7 +4349,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
         JSON.stringify({ rewindHintReserveTokens: 500_000 }),
       );
 
-      // Trusted: the project's 50 wins over the global 90.
+      // Trusted: the project's 500k reserve wins over the global 100k.
       {
         const { sm, pi, ctx } = setup();
         anchorStart(sm, pi);
@@ -4303,8 +4362,8 @@ describe("rewind hint: session_start config wiring (#44)", () => {
         assert.deepEqual(ctx.notifyCalls, []);
       }
 
-      // Untrusted: the project file is ignored silently; 50 does not fire,
-      // 90 does.
+      // Untrusted: the project file is ignored silently; 50% does not
+      // fire (500k left > 100k), 90% does.
       {
         const { sm, pi, ctx } = setup();
         anchorStart(sm, pi);
@@ -4567,6 +4626,81 @@ describe("rewind hint: turn_end handler (#44)", () => {
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("no-ops on tokens-null usage even when percent is set", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      // A 50k window under the 100k reserve: without the tokens guard,
+      // `contextWindow - null` (50k) would read as inside the reserve.
+      ctx.setContextUsage({
+        tokens: null,
+        contextWindow: 50_000,
+        percent: 99,
+      });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("fires on an overrun window (tokens > contextWindow) with 0.0k left", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      ctx.setContextUsage({
+        tokens: 1_050_000,
+        contextWindow: 1_000_000,
+        percent: 105,
+      });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      assert.equal(
+        (pi.sendMessageCalls[0][0] as { content: string }).content,
+        "[navigate_tree hint] Context is at 105.0% of 1.0M — 0.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 0.0% of 1.0M",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a spent crossing skips the anchor walk entirely", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      const calls = { getEntries: 0, getBranch: 0, getLabel: 0 };
+      const target = sm as unknown as Record<
+        keyof typeof calls,
+        (...args: unknown[]) => unknown
+      >;
+      const originals = { ...calls } as unknown as typeof target;
+      for (const name of Object.keys(calls) as Array<keyof typeof calls>) {
+        const original = target[name].bind(sm);
+        originals[name] = target[name];
+        target[name] = (...args: unknown[]) => {
+          calls[name]++;
+          return original(...args);
+        };
+      }
+      try {
+        fireTurnEnd(pi, ctx);
+        fireTurnEnd(pi, ctx);
+      } finally {
+        Object.assign(target, originals);
+      }
+      assert.equal(pi.sendMessageCalls.length, 1);
+      // The start anchor's existence check may read the branch; the hint's
+      // walk (getEntries + per-anchor estimates) must not run at all.
+      assert.equal(calls.getEntries, 0);
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -4870,6 +5004,26 @@ describe("rewind hint: turn_end handler (#44)", () => {
         1,
         "a successful retry must still fire the crossing",
       );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a throwing getEntries leaves the crossing unspent for a retry", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      const originalGetEntries = sm.getEntries;
+      (sm as unknown as { getEntries: () => never }).getEntries = () => {
+        throw new Error("getEntries exploded");
+      };
+      ctx.setContextUsage(usageAt(95));
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx));
+      assert.equal(pi.sendMessageCalls.length, 0);
+
+      (sm as unknown as { getEntries: typeof originalGetEntries }).getEntries =
+        originalGetEntries;
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
     } finally {
       cleanupConfigFixture(fixture);
     }

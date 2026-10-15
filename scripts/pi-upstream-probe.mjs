@@ -33,6 +33,8 @@
  *   - `AgentSession` constructor assigns `this.sessionManager` (plain
  *     field) — `findOwningSession` compares it to `ctx.sessionManager`.
  *   - `SessionManager.prototype.buildSessionContext()` still exists.
+ *   - `SessionManager.prototype.getEntries` / `getBranch` / `getLabel`
+ *     exist (the rewind hint's anchor walk, #84).
  *   - `AgentSession` + `SessionManager` are still exported from the
  *     package root.
  *
@@ -162,6 +164,16 @@ try {
     !bscThrew && bscResult && Array.isArray(bscResult.messages),
     bscThrew ? `threw: ${bscThrew}` : Array.isArray(bscResult?.messages) ? "returns messages array" : "no messages array",
   );
+
+  // The rewind hint's `turn_end` anchor walk (#84) reads these three on
+  // `ctx.sessionManager` (the ReadonlySessionManager surface).
+  for (const name of ["getEntries", "getBranch", "getLabel"]) {
+    check(
+      `SessionManager.prototype.${name} is a method (hint anchor walk)`,
+      typeof SessionManager?.prototype?.[name] === "function",
+      typeof SessionManager?.prototype?.[name],
+    );
+  }
 
   // --- 4. Agent.state accessor + messages writable ---
   check("Agent exported (pi-agent-core)", typeof Agent === "function", typeof Agent);

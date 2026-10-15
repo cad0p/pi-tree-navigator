@@ -96,6 +96,17 @@ describe("buildRewindHintText", () => {
     );
   });
 
+  it("renders tokens at or above 1M in M (the max reserve)", () => {
+    assert.match(
+      buildRewindHintText(50, 500_000, 1_000_000, 1_000_000, "'a' 1.0%"),
+      /— 500\.0k tokens left, within the 1\.0M reserve\./,
+    );
+    assert.match(
+      buildRewindHintText(10, 1_350_000, 1_000_000, 1_500_000, "'a' 1.0%"),
+      /— 1\.4M tokens left, within the 1\.0M reserve\./,
+    );
+  });
+
   it("clamps an overrun window to 0.0k tokens left", () => {
     assert.match(
       buildRewindHintText(
