@@ -26,6 +26,9 @@
  *     `AgentSession.prototype.prompt` or `agent.state.messages` —
  *     to ES `#` private fields, this breaks fundamentally.
  *   • If pi renames or restructures any of these fields, this breaks.
+ *   • `AgentSession._extensionRunner` (#79) is read only to emit
+ *     `session_tree` after a rewind; losing it degrades silently
+ *     (`historyRewriteNotified: false`, history mirrors stay stale).
  *   • Patches `AgentSession.prototype.prompt` globally on import; not
  *     reversible without a process restart; affects every session in
  *     the pi process, including sessions that never call
@@ -233,6 +236,15 @@ interface PiInternals {
    */
   settingsManager?: {
     getShowCacheMissNotices?: () => boolean;
+  };
+  /**
+   * Plain field on `AgentSession` (#79). Used only to emit `session_tree`
+   * after a rewind, mirroring pi's own `navigateTree`, so extensions that
+   * mirror the conversation (pi-claude-bridge's Claude Code session) rebuild
+   * from the rewound chain instead of continuing on their stale copy.
+   */
+  _extensionRunner?: {
+    emit?: (event: unknown) => Promise<unknown> | unknown;
   };
   sessionManager: SessionManager;
 }
@@ -617,6 +629,48 @@ function refreshAgentMessages(sm: SessionManager): boolean {
   } catch {
     return false;
   }
+}
+
+async function emitSessionTree(
+  sm: SessionManager,
+  oldLeafId: string | null,
+  summaryId: string,
+): Promise<boolean> {
+  // Replicate the `session_tree` emit that pi's own `navigateTree` does after
+  // `branchWithSummary` (#79). A tool-driven rewind skips it, so extensions
+  // that mirror the conversation never learn the history was rewritten:
+  // pi-claude-bridge keeps resuming its Claude Code session with the full
+  // pre-rewind context. Returns false when the runner is unreachable or a
+  // handler throws; the rewind itself is already complete either way.
+  const session = findOwningSession(sm);
+  const runner = session ? asInternals(session)._extensionRunner : undefined;
+  if (typeof runner?.emit !== "function") return false;
+  try {
+    await runner.emit({
+      type: "session_tree",
+      newLeafId: sm.getLeafId(),
+      oldLeafId,
+      summaryEntry: sm.getEntry(summaryId),
+      fromExtension: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Providers whose live turns run through a conversation mirror the cache
+ * replay cannot target (#79). pi-claude-bridge serves each turn from a Claude
+ * Code session; a non-`none` summary request while the rewinding query is
+ * parked would be handled as a reentrant query on that same session. Its
+ * supported summarization route is `cacheRetention: "none"` (an isolated
+ * query), which is exactly the cold path.
+ */
+function isMirroredSessionProvider(
+  model: { api?: string; provider?: string } | undefined,
+): boolean {
+  return model?.api === "claude-bridge" || model?.provider === "claude-bridge";
 }
 
 // =============================================================================
@@ -1592,6 +1646,8 @@ Operations (set \`action\`):
         // Kill switch: an env-var escape hatch to force the pre-#33 cold
         // request without unloading the extension.
         summaryCacheFallbackReason = "disabled";
+      } else if (isMirroredSessionProvider(ctx.model)) {
+        summaryCacheFallbackReason = "bridge-provider";
       } else if (!liveStream) {
         summaryCacheFallbackReason = "no-live-stream";
       } else {
@@ -1909,6 +1965,13 @@ Operations (set \`action\`):
       // the rewound chain. Runs in both paths; `refreshAgentMessages`
       // already swallows internal throws, so it can't re-trigger salvage.
       const refreshed = refreshAgentMessages(sm);
+      // Tell history-mirroring extensions about the rewrite (#79). Runs in
+      // both paths: the tree moved even when a later step threw.
+      const historyRewriteNotified = await emitSessionTree(
+        sm,
+        oldLeaf,
+        summaryId,
+      );
 
       if (originalErr) {
         // Salvage path: synthetic landed (chain is valid), newLabel retry
@@ -1953,6 +2016,7 @@ Operations (set \`action\`):
           contextAfter: afterTokens,
           contextWindow,
           agentMessagesRefreshed: refreshed,
+          historyRewriteNotified,
           summaryCache: {
             mode: summaryCacheMode,
             fallbackReason: summaryCacheFallbackReason ?? null,

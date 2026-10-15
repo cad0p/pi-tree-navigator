@@ -375,6 +375,8 @@ interface FakeAgentSession {
    * in this fake mirrors pi's own default (off).
    */
   settingsManager?: { getShowCacheMissNotices?: () => boolean };
+  /** Plain field on `AgentSession`; the rewind emits `session_tree` on it (#79). */
+  _extensionRunner?: { emit?: (event: unknown) => Promise<unknown> | unknown };
 }
 
 function makeFakeSession(sm: SessionManager): FakeAgentSession {
@@ -1986,6 +1988,94 @@ describe("dispatch: rewind happy path", () => {
       fake.agent.state.messages,
       sm.buildSessionContext().messages,
     );
+  });
+
+  it("emits session_tree after the rewind so history mirrors rebuild (#79)", async () => {
+    // pi-claude-bridge mirrors the conversation in a Claude Code session and
+    // rebuilds it only on `session_tree` / `session_compact`. A tool-driven
+    // rewind must emit the same event pi's own navigateTree emits, AFTER the
+    // synthetic append and the agent-state refresh, so a handler reading the
+    // session sees the rewound chain.
+    const { sm, pi, tool, ctx } = setup();
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 15_000);
+    appendTurn(sm, "u3", "a3", 26_000);
+    const oldLeafId = sm.getLeafId();
+    const fake = makeFakeSession(sm);
+    const events: Array<Record<string, unknown>> = [];
+    let messagesAtEmit: unknown[] | undefined;
+    fake._extensionRunner = {
+      emit: async (event) => {
+        events.push(event as Record<string, unknown>);
+        messagesAtEmit = fake.agent.state.messages;
+      },
+    };
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.historyRewriteNotified, true);
+    assert.equal(events.length, 1);
+    const event = events[0];
+    assert.equal(event.type, "session_tree");
+    assert.equal(event.oldLeafId, oldLeafId);
+    assert.equal(event.newLeafId, result.details.syntheticAssistantId);
+    assert.equal(event.newLeafId, sm.getLeafId());
+    assert.equal(
+      (event.summaryEntry as { id?: string } | undefined)?.id,
+      result.details.summaryId,
+    );
+    assert.equal(event.fromExtension, true);
+    assert.deepEqual(messagesAtEmit, sm.buildSessionContext().messages);
+  });
+
+  it("reports historyRewriteNotified=false without a reachable runner (#79)", async () => {
+    // The fixture's fake session has no `_extensionRunner`: the rewind still
+    // completes; only the notification is skipped.
+    const { result } = await rewindFixture();
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.agentMessagesRefreshed, true);
+    assert.equal(result.details.historyRewriteNotified, false);
+  });
+
+  it("a throwing session_tree handler does not fail the rewind (#79)", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    setupRewindable(sm, pi);
+    const fake = makeFakeSession(sm);
+    fake._extensionRunner = {
+      emit: async () => {
+        throw new Error("handler boom");
+      },
+    };
+    __testHooks.captureSession(fake as unknown as AgentSession);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.historyRewriteNotified, false);
+    assert.match(result.content[0].text, /\[rewind to 'start'/);
   });
 
   it("pins the synthetic-token bias contract: usage.totalTokens === pre-synthetic chain estimate", async () => {
@@ -5651,6 +5741,46 @@ describe("dispatch: rewind cache-preserving summary request (#33)", () => {
     };
     assert.equal(cache.mode, "live-prefix");
     assert.equal(cache.fallbackReason, null);
+  });
+
+  it("falls back with bridge-provider on pi-claude-bridge even with a fresh capture (#79)", async () => {
+    // The bridge serves live turns from a Claude Code session; a non-`none`
+    // summary request while the rewinding query is parked would run as a
+    // reentrant query on that session. The cold path (cacheRetention "none")
+    // is the bridge's isolated summarization route.
+    const { spy } = capturingSummarize();
+    const { sm, pi, tool, ctx } = setup({ summarize: spy });
+    (ctx.model as { api: string; provider: string }).api = "claude-bridge";
+    (ctx.model as { api: string; provider: string }).provider = "claude-bridge";
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 12_000);
+    appendTurn(sm, "u3", "a3", 18_000);
+    appendTurn(sm, "u4", "a4", 24_000);
+
+    await captureLive(sm, pi);
+    appendInFlightAssistant(sm, "tc-rewind");
+    installLiveStream(ctx, capturingProvider().streamSimple);
+
+    const result = await tool.execute(
+      "tc-rewind",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "end",
+        summaryFocus: "Preserve the live evidence and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(result.isError, undefined);
+    const cache = result.details.summaryCache as {
+      mode: string;
+      fallbackReason: string | null;
+    };
+    assert.equal(cache.mode, "fallback");
+    assert.equal(cache.fallbackReason, "bridge-provider");
   });
 
   it("falls back with overflow when the capture cannot fit the window", async () => {

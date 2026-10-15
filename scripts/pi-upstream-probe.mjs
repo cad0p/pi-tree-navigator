@@ -6,7 +6,7 @@
  * dependencies) still exist with the required shape in the installed
  * @earendil-works/pi-coding-agent / @earendil-works/pi-agent-core.
  *
- * Reflection points (after #14, #33, #75):
+ * Reflection points (after #14, #33, #75, #79):
  *   1. `AgentSession.prototype.prompt` — must be a writable plain data
  *      property (not `#`-private, not a getter-only accessor). The
  *      extension stashes the original and replaces it with a wrapper.
@@ -26,6 +26,9 @@
  *      only) so the capture sees the FINAL list after pi's forced-prompt /
  *      hidden-declaration projections. Checked against the constructor
  *      assignment in the installed pi-agent-core dist.
+ *   7. `AgentSession._extensionRunner` + `ExtensionRunner.emit` (#79) — the
+ *      rewind emits `session_tree` through it so history-mirroring
+ *      extensions (pi-claude-bridge) rebuild from the rewound chain.
  *
  * #75 deleted the #33 `state.tools` / `state.systemPrompt` reflection reads
  * (the capture replays the live message list instead of mirroring fields),
@@ -277,6 +280,33 @@ try {
       transformRuntimeWrite.ok &&
       !(transformDesc?.get && transformDesc?.set === undefined),
     `${transformAssign ? "source assignment found" : "constructor assignment MISSING"}; ${transformRuntimeWrite.detail}`,
+  );
+
+  // --- 7d. AgentSession._extensionRunner + ExtensionRunner.emit (#79) ---
+  // After a rewind the extension emits `session_tree` through the captured
+  // session's runner, mirroring pi's own navigateTree, so history-mirroring
+  // extensions (pi-claude-bridge) rebuild. A `#`-private runner or a missing
+  // `emit` makes the notification a silent no-op (`historyRewriteNotified:
+  // false`) and the bridge keeps the pre-rewind context.
+  check(
+    "AgentSession._extensionRunner plain field (#79)",
+    /this\._extensionRunner\s*=/.test(sessionSrc) &&
+      !sessionSrc.includes("this.#extensionRunner"),
+    /this\._extensionRunner\s*=/.test(sessionSrc)
+      ? "plain this._extensionRunner = found"
+      : "_extensionRunner assignment MISSING",
+  );
+  check(
+    "ExtensionRunner.emit is prototype method (#79)",
+    typeof codingAgent.ExtensionRunner?.prototype?.emit === "function",
+    typeof codingAgent.ExtensionRunner?.prototype?.emit,
+  );
+  check(
+    "navigateTree emits session_tree (#79 payload parity)",
+    /type:\s*"session_tree"/.test(sessionSrc),
+    /type:\s*"session_tree"/.test(sessionSrc)
+      ? "session_tree emit found"
+      : "session_tree emit MISSING",
   );
 
   // --- 8. SettingsManager.getShowCacheMissNotices (TUI cache-notice gate) ---
