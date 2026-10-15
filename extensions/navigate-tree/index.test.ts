@@ -3939,6 +3939,11 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       r.content[0].text,
       /No earlier anchors — keep working and rewind later once more has accumulated above it\./,
     );
+    // The rejection lists only names rewindTo accepts (no `''`).
+    assert.match(
+      r.content[0].text,
+      /Active anchors: 'start' [\d.]+% of 1\.0M$/,
+    );
   });
 
   it("B-pin: healthy stage (≥20k apparent savings) requests the summary", async () => {
