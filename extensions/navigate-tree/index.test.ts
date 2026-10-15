@@ -5283,6 +5283,173 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
   });
 });
 
+describe("rewind hint: per-model modelOverrides (#86)", () => {
+  const SONNET = "claude/claude-sonnet-4-5";
+
+  async function overrideSetup(config: unknown): Promise<{
+    fixture: ConfigFixture;
+    pi: FakePi;
+    ctx: FakeCtx;
+  }> {
+    const fixture = makeConfigFixture();
+    writeGlobalConfig(fixture, JSON.stringify(config));
+    const { sm, pi, ctx } = setup();
+    anchorStart(sm, pi);
+    await runSessionStart(pi, ctx, fixture);
+    return { fixture, pi, ctx };
+  }
+
+  it("a matching entry overrides the base reserve", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 20_000,
+      modelOverrides: { [SONNET]: { rewindHintReserveTokens: 100_000 } },
+    });
+    try {
+      // 92% of 1M = 80k left: inside the 100k entry, outside the 20k base.
+      ctx.setContextUsage(usageAt(92));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      assert.match(
+        String((pi.sendMessageCalls[0][0] as { content: unknown }).content),
+        /within the 100\.0k reserve/,
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("an off entry disables the hint for that model only", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 100_000,
+      modelOverrides: { [SONNET]: { rewindHintReserveTokens: "off" } },
+    });
+    try {
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      // Switching to an unmatched model falls back to the base reserve.
+      ctx.model = { api: "openai", provider: "x", id: "other" };
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      assert.match(
+        String((pi.sendMessageCalls[0][0] as { content: unknown }).content),
+        /within the 100\.0k reserve/,
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("an entry enables a model while the base is off", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      modelOverrides: { [SONNET]: { rewindHintReserveTokens: 100_000 } },
+    });
+    try {
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      // An unmatched model gets no hint (base off), and it does not re-arm.
+      ctx.model = { api: "openai", provider: "x", id: "other" };
+      ctx.setContextUsage(usageAt(10));
+      fireTurnEnd(pi, ctx);
+      ctx.model = {
+        api: "anthropic",
+        provider: "claude",
+        id: "claude-sonnet-4-5",
+      };
+      ctx.setContextUsage(usageAt(96));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a model switch re-reads the reserve on the next turn", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 20_000,
+      modelOverrides: { "x/big": { rewindHintReserveTokens: 100_000 } },
+    });
+    try {
+      // 80k left: outside the 20k base for the default model.
+      ctx.setContextUsage(usageAt(92));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      ctx.model = { api: "openai", provider: "x", id: "big" };
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("no model falls back to the base reserve", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 100_000,
+      modelOverrides: { [SONNET]: { rewindHintReserveTokens: "off" } },
+    });
+    try {
+      ctx.model = undefined;
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a throwing ctx.model getter skips the turn without spending the crossing", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 100_000,
+      modelOverrides: { "x/y": { rewindHintReserveTokens: 50_000 } },
+    });
+    try {
+      const live = ctx.model;
+      Object.defineProperty(ctx, "model", {
+        configurable: true,
+        get() {
+          throw new Error("stale ctx");
+        },
+      });
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      Object.defineProperty(ctx, "model", {
+        configurable: true,
+        writable: true,
+        value: live,
+      });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("without modelOverrides, ctx.model is never read", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 100_000,
+    });
+    try {
+      let reads = 0;
+      const live = ctx.model;
+      Object.defineProperty(ctx, "model", {
+        configurable: true,
+        get() {
+          reads++;
+          return live;
+        },
+      });
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      assert.equal(reads, 0);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+});
+
 describe("automatic start anchor (#55)", () => {
   const ENV_KEY = "PI_NAVIGATE_TREE_START_ANCHOR";
   let savedEnv: string | undefined;

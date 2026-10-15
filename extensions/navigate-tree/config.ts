@@ -19,6 +19,14 @@
  *     0.3.0): a present legacy key only warns and is otherwise ignored.
  *   - `anchorStartAfterTurns` (issue #55): turn bound for the automatic
  *     `anchor:start` write. Non-optional — an absent key still fires.
+ *   - `modelOverrides` (issue #86): per-model `rewindHintReserveTokens`,
+ *     keyed by exact `provider/modelId`, mirroring pi's
+ *     `compaction.modelOverrides`. Layers merge per key (project entry over
+ *     global entry), then a matching entry beats the base value — so a
+ *     global model entry beats a project-wide base, as in pi. Entry values
+ *     follow the base field's rules; an invalid entry disables the hint for
+ *     that model. A non-object `modelOverrides` or entry warns and is
+ *     ignored; unknown entry keys are ignored.
  *
  * Failure semantics (issues #44/#55; authoritative):
  *   - File-level problems (non-ENOENT read failure, invalid JSON, non-object
@@ -89,6 +97,17 @@ export type StartAnchorField =
 export interface ParsedLayer {
   hint: HintField;
   startAnchor: StartAnchorField;
+  /**
+   * Per-model hint fields (#86), keyed by exact `provider/modelId`. Only
+   * entries that set `rewindHintReserveTokens` (any non-absent outcome)
+   * are present.
+   */
+  modelHints: Map<string, HintField>;
+  /** Shape problems for the loader to warn about (each is ignored). */
+  modelOverridesProblems: {
+    notObject: boolean;
+    nonObjectEntries: string[];
+  };
 }
 
 /**
@@ -116,6 +135,34 @@ function parseStartTurns(n: number): StartAnchorField {
     n <= START_ANCHOR_MAX_TURNS
     ? { kind: "ok", value: n }
     : { kind: "invalid" };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseModelOverrides(
+  record: Record<string, unknown>,
+): Pick<ParsedLayer, "modelHints" | "modelOverridesProblems"> {
+  const modelHints = new Map<string, HintField>();
+  const problems = { notObject: false, nonObjectEntries: [] as string[] };
+  if (!("modelOverrides" in record)) {
+    return { modelHints, modelOverridesProblems: problems };
+  }
+  const overrides = record.modelOverrides;
+  if (!isPlainObject(overrides)) {
+    problems.notObject = true;
+    return { modelHints, modelOverridesProblems: problems };
+  }
+  for (const [key, entry] of Object.entries(overrides)) {
+    if (!isPlainObject(entry)) {
+      problems.nonObjectEntries.push(key);
+      continue;
+    }
+    const hint = parseHintField(entry);
+    if (hint.kind !== "absent") modelHints.set(key, hint);
+  }
+  return { modelHints, modelOverridesProblems: problems };
 }
 
 function parseHintField(record: Record<string, unknown>): HintField {
@@ -170,6 +217,7 @@ export function parseTreeNavigatorConfig(raw: unknown): ParsedRoot {
     layer: {
       hint: parseHintField(record),
       startAnchor: parseStartAnchorField(record),
+      ...parseModelOverrides(record),
     },
   };
 }
@@ -219,7 +267,37 @@ export function mergeTreeNavigatorConfig(
       globalLayer.startAnchor,
       projectLayer.startAnchor,
     ),
+    // Per key, like the base hint field: a project entry wins.
+    modelHints: new Map([
+      ...globalLayer.modelHints,
+      ...projectLayer.modelHints,
+    ]),
+    modelOverridesProblems: { notObject: false, nonObjectEntries: [] },
   };
+}
+
+/** Effective hint reserve: a number, or `null` (off). */
+function hintReserve(field: HintField): number | null {
+  return field.kind === "ok" ? field.value : null;
+}
+
+/**
+ * The reserve for `modelKey` (`provider/modelId`, #86): a matching
+ * `modelOverrides` entry wins (including `null` from a sentinel or an
+ * invalid entry), else the base `rewindHintReserveTokens`.
+ */
+export function resolveRewindHintReserve(
+  config: {
+    rewindHintReserveTokens: number | null;
+    rewindHintModelReserveTokens: ReadonlyMap<string, number | null>;
+  },
+  modelKey: string | undefined,
+): number | null {
+  if (modelKey !== undefined) {
+    const byModel = config.rewindHintModelReserveTokens;
+    if (byModel.has(modelKey)) return byModel.get(modelKey) ?? null;
+  }
+  return config.rewindHintReserveTokens;
 }
 
 type LayerName = "global" | "project";
@@ -227,6 +305,8 @@ type LayerName = "global" | "project";
 const ABSENT_LAYER: ParsedLayer = {
   hint: { kind: "absent" },
   startAnchor: { kind: "absent" },
+  modelHints: new Map(),
+  modelOverridesProblems: { notObject: false, nonObjectEntries: [] },
 };
 
 interface LayerLoadResult {
@@ -288,6 +368,23 @@ async function loadLayer(
       `navigate_tree: invalid rewindHintReserveTokens in ${layer} config at ${path} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
     );
   }
+  const hintExpectation = `expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled")`;
+  if (parsed.layer.modelOverridesProblems.notObject) {
+    warnings.push(
+      `navigate_tree: modelOverrides in ${layer} config at ${path} must be an object keyed by "provider/modelId" — ignored.`,
+    );
+  }
+  for (const key of parsed.layer.modelOverridesProblems.nonObjectEntries) {
+    warnings.push(
+      `navigate_tree: modelOverrides[${JSON.stringify(key)}] in ${layer} config at ${path} must be an object — ignored.`,
+    );
+  }
+  for (const [key, field] of parsed.layer.modelHints) {
+    if (field.kind !== "invalid") continue;
+    warnings.push(
+      `navigate_tree: invalid modelOverrides[${JSON.stringify(key)}].rewindHintReserveTokens in ${layer} config at ${path} — ${hintExpectation}; rewind hint disabled for that model.`,
+    );
+  }
   if (parsed.layer.startAnchor.kind === "invalid") {
     warnings.push(
       `navigate_tree: invalid anchorStartAfterTurns in ${layer} config at ${path} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`,
@@ -313,6 +410,7 @@ export async function loadTreeNavigatorConfig(opts: {
 }): Promise<{
   config: {
     rewindHintReserveTokens: number | null;
+    rewindHintModelReserveTokens: Map<string, number | null>;
     anchorStartAfterTurns: number;
   };
   warnings: string[];
@@ -342,8 +440,13 @@ export async function loadTreeNavigatorConfig(opts: {
   const effective = mergeTreeNavigatorConfig(globalResult.layer, projectLayer);
   return {
     config: {
-      rewindHintReserveTokens:
-        effective.hint.kind === "ok" ? effective.hint.value : null,
+      rewindHintReserveTokens: hintReserve(effective.hint),
+      rewindHintModelReserveTokens: new Map(
+        [...effective.modelHints].map(([key, field]) => [
+          key,
+          hintReserve(field),
+        ]),
+      ),
       anchorStartAfterTurns:
         effective.startAnchor.kind === "ok"
           ? effective.startAnchor.value

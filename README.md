@@ -103,6 +103,24 @@ When the crossing has at least one `anchor:` label on the active branch, the age
 
 With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
 
+### Per-model reserve (`modelOverrides`)
+
+Different models need different budgets: a model that writes long summaries or grows context fast per turn needs a larger reserve. `modelOverrides` sets `rewindHintReserveTokens` per model, in the same shape as pi's `compaction.modelOverrides`:
+
+```json
+{
+  "rewindHintReserveTokens": 40000,
+  "modelOverrides": {
+    "opencode-go/deepseek-v4.1-flash": { "rewindHintReserveTokens": 50000 }
+  }
+}
+```
+
+- Keys are the exact `provider/modelId` of the active model (as in pi's `/model` list). The reserve is resolved against the live model on every turn, so a mid-session `/model` switch takes effect on the next turn; the crossing state is shared across the switch.
+- A matching entry wins over the base `rewindHintReserveTokens`, including an entry sentinel (`"off"` disables the hint for that model only) and an entry that enables the hint while the base is off. No matching entry, or no active model → the base value.
+- Layers merge per key: a trusted project entry replaces the global entry for the same model, other keys pass through. As in pi, a matching entry from either layer beats the base value from either layer, so a global model entry beats a project-wide base.
+- Entry values follow the base field's rules. An invalid entry value disables the hint for that model (no fallback to the base) with a field-scoped warning; a non-object `modelOverrides` or entry warns and is ignored; other keys in an entry are ignored.
+
 ### Rewind hygiene (always on)
 
 Independent of the hint, the tool ships two static `promptGuidelines` bullets, present whenever `navigate_tree` is active: **when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive**, persisting durable findings to files first; and **don't rewind while a user decision or unresolved question is pending** — ask the user instead. The bullets are not config-gated (`registerTool` fixes the array at registration), cost ~64 tokens per request (257 chars / 4), and change the cached system-prompt prefix once per active session on upgrade (the provider-facing tool schema is unchanged).

@@ -28,6 +28,7 @@ import {
   parseTreeNavigatorConfig,
   REWIND_HINT_MAX_RESERVE,
   REWIND_HINT_MIN_RESERVE,
+  resolveRewindHintReserve,
   START_ANCHOR_DEFAULT_TURNS,
   START_ANCHOR_MAX_TURNS,
   START_ANCHOR_MIN_TURNS,
@@ -97,16 +98,38 @@ function configJsonStart(anchorStartAfterTurns: unknown): string {
 function layer(partial: {
   hint?: HintField;
   startAnchor?: StartAnchorField;
+  modelHints?: Array<[string, HintField]>;
 }): ParsedLayer {
   return {
     hint: partial.hint ?? { kind: "absent" },
     startAnchor: partial.startAnchor ?? { kind: "absent" },
+    modelHints: new Map(partial.modelHints ?? []),
+    modelOverridesProblems: { notObject: false, nonObjectEntries: [] },
   };
 }
 
 /** The loader's expected config object (start defaults unless overridden). */
-function cfg(hint: number | null, start = START_ANCHOR_DEFAULT_TURNS) {
-  return { rewindHintReserveTokens: hint, anchorStartAfterTurns: start };
+function cfg(
+  hint: number | null,
+  start = START_ANCHOR_DEFAULT_TURNS,
+  byModel: Array<[string, number | null]> = [],
+) {
+  return {
+    rewindHintReserveTokens: hint,
+    rewindHintModelReserveTokens: new Map(byModel),
+    anchorStartAfterTurns: start,
+  };
+}
+
+const DEEPSEEK = "opencode-go/deepseek-v4.1-flash";
+const HAIKU = "claude-bridge/claude-haiku-5-5";
+
+function warnInvalidModelHint(
+  which: "global" | "project",
+  path: string,
+  key: string,
+): string {
+  return `navigate_tree: invalid modelOverrides[${JSON.stringify(key)}].rewindHintReserveTokens in ${which} config at ${path} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for that model.`;
 }
 
 /** Parse a root expected to be an object and return its parsed layer. */
@@ -874,6 +897,226 @@ describe("loadTreeNavigatorConfig", () => {
     assert.deepEqual(out, {
       config: cfg(null),
       warnings: [],
+    });
+  });
+});
+
+describe("modelOverrides (#86)", () => {
+  describe("parse", () => {
+    it("parses per-model reserves with the base field's rules", () => {
+      const parsed = parsedLayer({
+        modelOverrides: {
+          [DEEPSEEK]: { rewindHintReserveTokens: 50000 },
+          [HAIKU]: { rewindHintReserveTokens: "off" },
+          "x/bad": { rewindHintReserveTokens: 5 },
+          "x/str": { rewindHintReserveTokens: " 30000 " },
+          // No reserve key: not an override (other pi-style keys ignored).
+          "x/none": { reserveTokens: 1 },
+        },
+      });
+      assert.deepEqual(
+        parsed.modelHints,
+        new Map<string, HintField>([
+          [DEEPSEEK, { kind: "ok", value: 50000 }],
+          [HAIKU, { kind: "disabled" }],
+          ["x/bad", { kind: "invalid" }],
+          ["x/str", { kind: "ok", value: 30000 }],
+        ]),
+      );
+      assert.deepEqual(parsed.modelOverridesProblems, {
+        notObject: false,
+        nonObjectEntries: [],
+      });
+    });
+
+    it("records a non-object modelOverrides and non-object entries", () => {
+      for (const raw of [null, 5, "x", [], true]) {
+        const parsed = parsedLayer({ modelOverrides: raw });
+        assert.equal(parsed.modelHints.size, 0);
+        assert.equal(parsed.modelOverridesProblems.notObject, true);
+      }
+      const parsed = parsedLayer({
+        modelOverrides: { a: 1, b: null, c: [], [DEEPSEEK]: {} },
+      });
+      assert.equal(parsed.modelHints.size, 0);
+      assert.deepEqual(parsed.modelOverridesProblems, {
+        notObject: false,
+        nonObjectEntries: ["a", "b", "c"],
+      });
+    });
+
+    it("leaves an absent modelOverrides problem-free", () => {
+      const parsed = parsedLayer({ rewindHintReserveTokens: 40000 });
+      assert.equal(parsed.modelHints.size, 0);
+      assert.deepEqual(parsed.modelOverridesProblems, {
+        notObject: false,
+        nonObjectEntries: [],
+      });
+    });
+  });
+
+  describe("merge", () => {
+    it("merges per key: a project entry wins, others pass through", () => {
+      const merged = mergeTreeNavigatorConfig(
+        layer({
+          modelHints: [
+            [DEEPSEEK, { kind: "ok", value: 50000 }],
+            [HAIKU, { kind: "ok", value: 20000 }],
+          ],
+        }),
+        layer({ modelHints: [[HAIKU, { kind: "disabled" }]] }),
+      );
+      assert.deepEqual(
+        merged.modelHints,
+        new Map<string, HintField>([
+          [DEEPSEEK, { kind: "ok", value: 50000 }],
+          [HAIKU, { kind: "disabled" }],
+        ]),
+      );
+    });
+  });
+
+  describe("resolveRewindHintReserve", () => {
+    const config = {
+      rewindHintReserveTokens: 40000,
+      rewindHintModelReserveTokens: new Map<string, number | null>([
+        [DEEPSEEK, 50000],
+        [HAIKU, null],
+      ]),
+    };
+
+    it("prefers a matching entry, including an off entry", () => {
+      assert.equal(resolveRewindHintReserve(config, DEEPSEEK), 50000);
+      assert.equal(resolveRewindHintReserve(config, HAIKU), null);
+    });
+
+    it("falls back to the base for an unmatched or unknown model", () => {
+      assert.equal(resolveRewindHintReserve(config, "x/other"), 40000);
+      assert.equal(resolveRewindHintReserve(config, undefined), 40000);
+    });
+
+    it("an entry enables a model while the base is off", () => {
+      assert.equal(
+        resolveRewindHintReserve(
+          { ...config, rewindHintReserveTokens: null },
+          DEEPSEEK,
+        ),
+        50000,
+      );
+    });
+
+    it("matches keys exactly", () => {
+      assert.equal(
+        resolveRewindHintReserve(config, DEEPSEEK.toUpperCase()),
+        40000,
+      );
+    });
+  });
+
+  describe("loader", () => {
+    it("loads the approved snippet", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({
+          rewindHintReserveTokens: 40000,
+          modelOverrides: {
+            [DEEPSEEK]: { rewindHintReserveTokens: 50000 },
+          },
+        }),
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: false,
+        readFile: reader.readFile,
+      });
+      assert.deepEqual(out, {
+        config: cfg(40000, START_ANCHOR_DEFAULT_TURNS, [[DEEPSEEK, 50000]]),
+        warnings: [],
+      });
+    });
+
+    it("a global model entry beats a project base (pi precedent)", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({
+          modelOverrides: { [DEEPSEEK]: { rewindHintReserveTokens: 50000 } },
+        }),
+        [PROJECT_PATH]: JSON.stringify({
+          rewindHintReserveTokens: 30000,
+          modelOverrides: { [HAIKU]: { rewindHintReserveTokens: false } },
+        }),
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: true,
+        readFile: reader.readFile,
+      });
+      assert.deepEqual(out.warnings, []);
+      assert.equal(resolveRewindHintReserve(out.config, DEEPSEEK), 50000);
+      assert.equal(resolveRewindHintReserve(out.config, HAIKU), null);
+      assert.equal(resolveRewindHintReserve(out.config, "x/y"), 30000);
+    });
+
+    it("ignores the untrusted project's entries", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({ rewindHintReserveTokens: 40000 }),
+        [PROJECT_PATH]: JSON.stringify({
+          modelOverrides: { [DEEPSEEK]: { rewindHintReserveTokens: 50000 } },
+        }),
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: false,
+        readFile: reader.readFile,
+      });
+      assert.deepEqual(out, { config: cfg(40000), warnings: [] });
+    });
+
+    it("warns on shape problems and invalid entries; an invalid entry turns that model off", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({
+          rewindHintReserveTokens: 40000,
+          modelOverrides: {
+            [DEEPSEEK]: { rewindHintReserveTokens: 999 },
+            "x/num": 5,
+          },
+        }),
+        [PROJECT_PATH]: JSON.stringify({ modelOverrides: [] }),
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: true,
+        readFile: reader.readFile,
+      });
+      assert.deepEqual(out, {
+        config: cfg(40000, START_ANCHOR_DEFAULT_TURNS, [[DEEPSEEK, null]]),
+        warnings: [
+          `navigate_tree: modelOverrides["x/num"] in global config at ${GLOBAL_PATH} must be an object — ignored.`,
+          warnInvalidModelHint("global", GLOBAL_PATH, DEEPSEEK),
+          `navigate_tree: modelOverrides in project config at ${PROJECT_PATH} must be an object keyed by "provider/modelId" — ignored.`,
+        ],
+      });
+    });
+
+    it("a file-level problem drops that layer's entries too", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({
+          modelOverrides: { [DEEPSEEK]: { rewindHintReserveTokens: 50000 } },
+        }),
+        [PROJECT_PATH]: "{not json",
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: true,
+        readFile: reader.readFile,
+      });
+      assert.deepEqual(out, {
+        config: cfg(null, START_ANCHOR_DEFAULT_TURNS, [[DEEPSEEK, 50000]]),
+        warnings: [WARN_INVALID_JSON_PROJECT],
+      });
     });
   });
 });

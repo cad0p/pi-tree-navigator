@@ -62,6 +62,7 @@ import {
 import { Type } from "typebox";
 import {
   loadTreeNavigatorConfig,
+  resolveRewindHintReserve,
   START_ANCHOR_DEFAULT_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
@@ -765,6 +766,13 @@ export function buildRewindCancelledText(
   return `[${TOOL_NAME}] Rewind to '${rewindTo}' cancelled: ${reason}. Nothing was collapsed — continue the work and rewind again later.`;
 }
 
+/** One session's rewind-hint config and crossing (#44, #85, #86). */
+interface HintState {
+  rewindHintReserveTokens: number | null;
+  rewindHintModelReserveTokens: ReadonlyMap<string, number | null>;
+  tracker: RewindHintTracker;
+}
+
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
@@ -1095,10 +1103,10 @@ export default function (pi: ExtensionAPI) {
   // session with no entry (no `session_start` seen) gets no hint.
   // `toolActive` fails open until `before_agent_start` says otherwise.
   let toolActive = true;
-  const hintBySession = new Map<
-    string,
-    { reserve: number | null; tracker: RewindHintTracker }
-  >();
+  // `byModel` (#86) holds the `modelOverrides` reserves; the reserve is
+  // resolved against the live `ctx.model` on every `turn_end`, so a model
+  // switch mid-session takes effect on the next turn.
+  const hintBySession = new Map<string, HintState>();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
   // and NEVER cleared in-process: once a session has settled (write or
@@ -1193,6 +1201,7 @@ export default function (pi: ExtensionAPI) {
     pendingRewinds.delete(sessionId);
     toolActive = true;
     let reserve: number | null = null;
+    let byModel: ReadonlyMap<string, number | null> = new Map();
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
     let warnings: string[] = [];
     try {
@@ -1202,6 +1211,7 @@ export default function (pi: ExtensionAPI) {
         projectTrusted,
       });
       reserve = loaded.config.rewindHintReserveTokens;
+      byModel = loaded.config.rewindHintModelReserveTokens;
       startTurns = loaded.config.anchorStartAfterTurns;
       warnings = loaded.warnings;
     } catch {
@@ -1210,10 +1220,15 @@ export default function (pi: ExtensionAPI) {
       // failure already carries a user-facing warning, and a new string here
       // would only fire on an unreachable path.
       reserve = null;
+      byModel = new Map();
       startTurns = START_ANCHOR_DEFAULT_TURNS;
       warnings = [];
     }
-    hintBySession.set(sessionId, { reserve, tracker: new RewindHintTracker() });
+    hintBySession.set(sessionId, {
+      rewindHintReserveTokens: reserve,
+      rewindHintModelReserveTokens: byModel,
+      tracker: new RewindHintTracker(),
+    });
     anchorStartTurnsBySession.set(sessionId, startTurns);
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
@@ -1305,9 +1320,7 @@ export default function (pi: ExtensionAPI) {
     // start-anchor's per-session gate; the shared `toolActive` remains the
     // fallback for sessions with no recorded gate (fail-open).
     let hintToolActive = toolActive;
-    let hint:
-      | { reserve: number | null; tracker: RewindHintTracker }
-      | undefined;
+    let hint: HintState | undefined;
     if (sm) {
       try {
         const sessionId = sm.getSessionId();
@@ -1318,8 +1331,20 @@ export default function (pi: ExtensionAPI) {
         // Stale ctx: keep the shared fallback; no hint state.
       }
     }
-    if (!hintToolActive || !hint || hint.reserve === null) return;
-    const { reserve: rewindHintReserveTokens, tracker: hintTracker } = hint;
+    if (!hintToolActive || !hint) return;
+    let modelKey: string | undefined;
+    if (hint.rewindHintModelReserveTokens.size > 0) {
+      try {
+        const model = ctx.model;
+        if (model) modelKey = `${model.provider}/${model.id}`;
+      } catch {
+        // Stale ctx: no hint this turn.
+        return;
+      }
+    }
+    const rewindHintReserveTokens = resolveRewindHintReserve(hint, modelKey);
+    if (rewindHintReserveTokens === null) return;
+    const hintTracker = hint.tracker;
     // A rewind owns this turn (its call, a summary attempt, or the
     // completion): a rewind hint would be stale or push a second
     // rewind. The crossing stays unspent for the next turn.
