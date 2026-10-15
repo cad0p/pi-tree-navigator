@@ -5472,6 +5472,21 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
     }
   });
 
+  it("a model without a string provider and id uses the base reserve", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 100_000,
+      modelOverrides: { "undefined/x": { rewindHintReserveTokens: "off" } },
+    });
+    try {
+      ctx.model = { api: "openai", id: "x" } as unknown as FakeCtx["model"];
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("no model falls back to the base reserve", async () => {
     const { fixture, pi, ctx } = await overrideSetup({
       rewindHintReserveTokens: 100_000,

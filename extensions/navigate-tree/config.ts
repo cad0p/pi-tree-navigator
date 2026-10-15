@@ -143,7 +143,7 @@ function parseStartTurns(n: number): StartAnchorField {
 export interface ModelOverridesProblems {
   notObject: boolean;
   nonObjectEntries: string[];
-  /** Keys with surrounding whitespace: they can never match a model. */
+  /** Empty keys and keys with surrounding whitespace: never match a model. */
   paddedKeys: string[];
   /** Entries without `rewindHintReserveTokens` (e.g. pi's `reserveTokens`). */
   entriesWithoutReserve: string[];
@@ -176,7 +176,7 @@ function parseModelOverrides(
     return { modelHints, modelOverridesProblems: problems };
   }
   for (const [key, entry] of Object.entries(overrides)) {
-    if (key.trim() !== key) {
+    if (key === "" || key.trim() !== key) {
       problems.paddedKeys.push(key);
       continue;
     }
@@ -328,12 +328,15 @@ export function resolveRewindHintReserve(
 
 type LayerName = "global" | "project";
 
-const ABSENT_LAYER: ParsedLayer = {
-  hint: { kind: "absent" },
-  startAnchor: { kind: "absent" },
-  modelHints: new Map(),
-  modelOverridesProblems: noModelOverridesProblems(),
-};
+/** A fresh empty layer per use: `modelHints` is a mutable Map. */
+function absentLayer(): ParsedLayer {
+  return {
+    hint: { kind: "absent" },
+    startAnchor: { kind: "absent" },
+    modelHints: new Map(),
+    modelOverridesProblems: noModelOverridesProblems(),
+  };
+}
 
 interface LayerLoadResult {
   layer: ParsedLayer;
@@ -354,14 +357,14 @@ async function loadLayer(
   readFile: (path: string) => Promise<string>,
 ): Promise<LayerLoadResult> {
   const fileWarning = (message: string): LayerLoadResult => ({
-    layer: ABSENT_LAYER,
+    layer: absentLayer(),
     warnings: [message],
   });
   let text: string;
   try {
     text = await readFile(path);
   } catch (err) {
-    if (isEnoent(err)) return { layer: ABSENT_LAYER, warnings: [] };
+    if (isEnoent(err)) return { layer: absentLayer(), warnings: [] };
     return fileWarning(
       `navigate_tree: could not read ${layer} config at ${path} — that layer was ignored.`,
     );
@@ -377,7 +380,7 @@ async function loadLayer(
   const parsed = parseTreeNavigatorConfig(root);
   if (parsed.kind === "unusable") {
     return {
-      layer: ABSENT_LAYER,
+      layer: absentLayer(),
       warnings: [
         `navigate_tree: ${layer} config at ${path} must be a JSON object — that layer was ignored.`,
       ],
@@ -402,7 +405,7 @@ async function loadLayer(
   }
   for (const key of parsed.layer.modelOverridesProblems.paddedKeys) {
     warnings.push(
-      `navigate_tree: modelOverrides key ${JSON.stringify(key)} in ${layer} config at ${path} has surrounding whitespace and can never match a model — ignored.`,
+      `navigate_tree: modelOverrides key ${JSON.stringify(key)} in ${layer} config at ${path} is empty or has surrounding whitespace and can never match a model — ignored.`,
     );
   }
   for (const key of parsed.layer.modelOverridesProblems.nonObjectEntries) {
@@ -462,7 +465,7 @@ export async function loadTreeNavigatorConfig(opts: {
   );
   warnings.push(...globalResult.warnings);
 
-  let projectLayer: ParsedLayer = ABSENT_LAYER;
+  let projectLayer: ParsedLayer = absentLayer();
   if (opts.projectTrusted) {
     const projectResult = await loadLayer(
       "project",

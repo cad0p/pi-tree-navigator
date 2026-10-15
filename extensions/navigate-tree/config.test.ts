@@ -919,6 +919,7 @@ describe("modelOverrides (#86)", () => {
           // override.
           "x/none": { reserveTokens: 1 },
           " x/padded ": { rewindHintReserveTokens: 30000 },
+          "": { rewindHintReserveTokens: 30000 },
         },
       });
       assert.deepEqual(
@@ -933,7 +934,7 @@ describe("modelOverrides (#86)", () => {
       assert.deepEqual(parsed.modelOverridesProblems, {
         notObject: false,
         nonObjectEntries: [],
-        paddedKeys: [" x/padded "],
+        paddedKeys: [" x/padded ", ""],
         entriesWithoutReserve: ["x/none"],
       });
     });
@@ -1070,6 +1071,31 @@ describe("modelOverrides (#86)", () => {
       assert.equal(resolveRewindHintReserve(out.config, "x/y"), 30000);
     });
 
+    it("keeps key case as written (no normalization)", async () => {
+      const reader = readerFor({
+        [GLOBAL_PATH]: JSON.stringify({
+          rewindHintReserveTokens: 40000,
+          modelOverrides: {
+            "OpenCode-Go/DeepSeek": { rewindHintReserveTokens: 50000 },
+          },
+        }),
+      });
+      const out = await loadTreeNavigatorConfig({
+        agentDir: AGENT_DIR,
+        projectPath: PROJECT_PATH,
+        projectTrusted: false,
+        readFile: reader.readFile,
+      });
+      assert.equal(
+        resolveRewindHintReserve(out.config, "OpenCode-Go/DeepSeek"),
+        50000,
+      );
+      assert.equal(
+        resolveRewindHintReserve(out.config, "opencode-go/deepseek"),
+        40000,
+      );
+    });
+
     it("ignores the untrusted project's entries", async () => {
       const reader = readerFor({
         [GLOBAL_PATH]: JSON.stringify({ rewindHintReserveTokens: 40000 }),
@@ -1132,7 +1158,7 @@ describe("modelOverrides (#86)", () => {
       assert.deepEqual(out, {
         config: cfg(40000),
         warnings: [
-          `navigate_tree: modelOverrides key " ${DEEPSEEK}" in global config at ${GLOBAL_PATH} has surrounding whitespace and can never match a model — ignored.`,
+          `navigate_tree: modelOverrides key " ${DEEPSEEK}" in global config at ${GLOBAL_PATH} is empty or has surrounding whitespace and can never match a model — ignored.`,
           `navigate_tree: modelOverrides["${HAIKU}"] in global config at ${GLOBAL_PATH} sets no rewindHintReserveTokens — ignored.`,
         ],
       });

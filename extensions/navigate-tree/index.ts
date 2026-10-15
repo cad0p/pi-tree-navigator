@@ -1339,7 +1339,12 @@ export default function (pi: ExtensionAPI) {
     if (hint.rewindHintModelReserveTokens.size > 0) {
       try {
         const model = ctx.model;
-        if (model) modelKey = `${model.provider}/${model.id}`;
+        if (
+          typeof model?.provider === "string" &&
+          typeof model.id === "string"
+        ) {
+          modelKey = `${model.provider}/${model.id}`;
+        }
       } catch {
         // Stale ctx: no hint this turn.
         return;
