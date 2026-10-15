@@ -5372,8 +5372,12 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
-      // An unmatched model gets no hint (base off), and it does not re-arm.
+      // An unmatched model gets no hint (base off), but its turns still
+      // observe the climb back out, so the next crossing fires again.
       ctx.model = { api: "openai", provider: "x", id: "other" };
+      ctx.setContextUsage(usageAt(96));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
       ctx.setContextUsage(usageAt(10));
       fireTurnEnd(pi, ctx);
       ctx.model = {
@@ -5383,7 +5387,7 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
       };
       ctx.setContextUsage(usageAt(96));
       fireTurnEnd(pi, ctx);
-      assert.equal(pi.sendMessageCalls.length, 1);
+      assert.equal(pi.sendMessageCalls.length, 2);
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -5402,6 +5406,44 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
       ctx.model = { api: "openai", provider: "x", id: "big" };
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("switching between reserves inside one crossing never fires twice", async () => {
+    const { fixture, pi, ctx } = await overrideSetup({
+      rewindHintReserveTokens: 40_000,
+      modelOverrides: { [SONNET]: { rewindHintReserveTokens: 50_000 } },
+    });
+    const other = { api: "openai", provider: "x", id: "other" };
+    const sonnet = ctx.model;
+    try {
+      // Fires on the 50k entry at 50k left.
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      // 45k left on the 40k-base model: above its reserve, but still inside
+      // the 50k crossing that fired, so no re-arm.
+      ctx.model = other;
+      ctx.setContextUsage(usageAt(95.5));
+      fireTurnEnd(pi, ctx);
+      ctx.model = sonnet;
+      ctx.setContextUsage(usageAt(96));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      // A crossing spent under 40k does not re-fire when the 50k entry
+      // becomes active with 45k left.
+      ctx.setContextUsage(usageAt(10));
+      fireTurnEnd(pi, ctx);
+      ctx.model = other;
+      ctx.setContextUsage(usageAt(96));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 2);
+      ctx.model = sonnet;
+      ctx.setContextUsage(usageAt(95.5));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 2);
     } finally {
       cleanupConfigFixture(fixture);
     }

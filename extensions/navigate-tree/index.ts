@@ -1327,6 +1327,13 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (!hintToolActive || !hint) return;
+    // Hint off everywhere: nothing can fire or re-arm.
+    if (
+      hint.rewindHintReserveTokens === null &&
+      hint.rewindHintModelReserveTokens.size === 0
+    ) {
+      return;
+    }
     let modelKey: string | undefined;
     if (hint.rewindHintModelReserveTokens.size > 0) {
       try {
@@ -1338,7 +1345,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
     const rewindHintReserveTokens = resolveRewindHintReserve(hint, modelKey);
-    if (rewindHintReserveTokens === null) return;
     const hintTracker = hint.tracker;
     // A rewind owns this turn (its call, a summary attempt, or the
     // completion): a rewind hint would be stale or push a second
@@ -1363,8 +1369,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const tokensLeft = usage.contextWindow - usage.tokens;
-    if (tokensLeft > rewindHintReserveTokens) {
-      // Outside the reserve: re-arm only.
+    if (
+      rewindHintReserveTokens === null ||
+      tokensLeft > rewindHintReserveTokens
+    ) {
+      // Hint off for this model, or outside the reserve: re-arm only.
       hintTracker.observe(tokensLeft, rewindHintReserveTokens);
       return;
     }
