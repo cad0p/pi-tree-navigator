@@ -4683,6 +4683,30 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("a session with no recorded gate fails open, whatever a sibling's gate says (#85)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+
+      // B has started but has no `before_agent_start` yet: no gate of its own.
+      const smB = SessionManager.inMemory("/tmp");
+      const tB = appendTurn(smB, "u-anchor-b", "a-anchor-b");
+      smB.appendLabelChange(tB.assistantId, "anchor:start");
+      const ctxB = makeCtx(smB);
+      await runSessionStart(pi, ctxB, fixture);
+      // A then records a false gate, after B's `session_start`.
+      await fireBeforeAgentStart(pi, ctx, ["read"]);
+      ctxB.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctxB);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("no-ops on missing/percent-null/zero-window usage without spending the crossing", async () => {
     const { fixture, pi, ctx } = await enabledSetup();
     try {
