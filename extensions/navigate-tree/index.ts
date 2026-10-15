@@ -81,7 +81,6 @@ import {
 import {
   buildNoAnchorText,
   buildRewindHintText,
-  collectAnchorNames,
   REWIND_HINT_CUSTOM_TYPE,
   RewindHintTracker,
 } from "./rewind-hint.ts";
@@ -476,14 +475,44 @@ function estimateAtEntry(
 }
 
 /**
+ * Every active anchor — chronological root→leaf, same walk order as `list`
+ * — with its cumulative context percentage, rendered as
+ * `'a' 4.1% · 'b' 22.0% of 1.0M`. Shared by the min-savings rejection and
+ * the rewind hint so both name the same targets the same way. A manual
+ * `/tree` label `anchor:x` CAN put the same name on two entries —
+ * duplicates print twice, exactly as `list` prints them. Names `rewindTo`
+ * would reject (e.g. an empty `anchor:` label) are skipped: both callers
+ * point the model at rewind targets.
+ */
+function formatActiveAnchors(
+  sm: Pick<SessionManager, "getBranch" | "getLabel">,
+  cw: number,
+  allEntries: SessionEntry[],
+  byId: Map<string, SessionEntry>,
+): { names: string[]; text: string } {
+  const names: string[] = [];
+  const parts: string[] = [];
+  for (const e of sm.getBranch()) {
+    const lbl = sm.getLabel(e.id);
+    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
+    const name = lbl.slice(LABEL_PREFIX.length);
+    if (!isValidName(name)) continue;
+    names.push(name);
+    parts.push(
+      `'${name}' ${formatPct1(estimateAtEntry(allEntries, e.id, byId), cw)}`,
+    );
+  }
+  // cw=0 → percents fall back to formatPct1's k-format and the window
+  // suffix is omitted, mirroring `list`'s header behavior.
+  const suffix = cw > 0 ? ` of ${formatWindow(cw)}` : "";
+  return { names, text: `${parts.join(" · ")}${suffix}` };
+}
+
+/**
  * Rejection copy for the rewind min-savings floor (#21). Reports the
- * apparent savings plus every active anchor — chronological root→leaf,
- * same walk order as `list`, including rewindTo itself — with its
- * cumulative context percentage, so the agent can pick a genuinely earlier
- * anchor or keep working. Move-on-collision means the tool itself never
- * creates duplicate anchor names; a manual `/tree` label `anchor:x` CAN
- * put the same name on two entries — duplicates print twice here, exactly as
- * `list` prints them today.
+ * apparent savings plus every active anchor (including rewindTo itself)
+ * with its cumulative context percentage, so the agent can pick a
+ * genuinely earlier anchor or keep working.
  *
  * Deliberately does NOT print the floor value anywhere: an agent-visible
  * numeric bar invites grinding up to it instead of doing real work.
@@ -497,25 +526,12 @@ function buildMinSavingsRejection(
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
 ): string {
-  const anchors: string[] = [];
-  let oldestAnchorName: string | null = null;
-  for (const e of sm.getBranch()) {
-    const lbl = sm.getLabel(e.id);
-    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
-    const name = lbl.slice(LABEL_PREFIX.length);
-    if (!oldestAnchorName) oldestAnchorName = name;
-    anchors.push(
-      `'${name}' ${formatPct1(estimateAtEntry(allEntries, e.id, byId), cw)}`,
-    );
-  }
-  // cw=0 → percents fall back to formatPct1's k-format and the window
-  // suffix is omitted, mirroring `list`'s header behavior.
-  const suffix = cw > 0 ? ` of ${formatWindow(cw)}` : "";
+  const anchors = formatActiveAnchors(sm, cw, allEntries, byId);
   const guidance =
-    oldestAnchorName === rewindTo
+    anchors.names[0] === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
       : "Rewind further back to actually free context, or keep working.";
-  return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.join(" · ")}${suffix}`;
+  return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.text}`;
 }
 
 /**
@@ -672,7 +688,7 @@ function rewindStaleReason(
  * turns: user messages (steers drained at the rewind turn's boundary) and
  * other extensions' custom messages (subagent results, timers). Oldest
  * first; this extension's own rewind and rewind-hint messages are excluded
- * (a pre-rewind "context is running low" hint is stale once it lands).
+ * (a pre-rewind rewind hint is stale once it lands).
  */
 type LateEntry =
   | {
@@ -782,7 +798,7 @@ export default function (pi: ExtensionAPI) {
 
   // Turns the rewind handler owned (the rewind call's turn, summary
   // attempts, the completing turn): the hint handler skips them, so a stale
-  // "context is running low" hint never lands on a rewind in progress.
+  // rewind hint never lands on a rewind in progress.
   const rewindTurns = new WeakSet<object>();
 
   function cancelRewind(
@@ -1078,7 +1094,7 @@ export default function (pi: ExtensionAPI) {
   // never inherit a spent crossing or another session's config. `toolActive`
   // fails open until `before_agent_start` says otherwise.
   let toolActive = true;
-  let rewindHintAtPercent: number | null = null;
+  let rewindHintReserveTokens: number | null = null;
   let hintTracker = new RewindHintTracker();
 
   // Auto start-anchor closure state (#55). All of it is keyed by session id
@@ -1172,10 +1188,10 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui;
     const sessionId = ctx.sessionManager.getSessionId();
     pendingRewinds.delete(sessionId);
-    rewindHintAtPercent = null;
+    rewindHintReserveTokens = null;
     hintTracker = new RewindHintTracker();
     toolActive = true;
-    let threshold: number | null = null;
+    let reserve: number | null = null;
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
     let warnings: string[] = [];
     try {
@@ -1184,7 +1200,7 @@ export default function (pi: ExtensionAPI) {
         projectPath: join(cwd, CONFIG_DIR_NAME, TREE_NAVIGATOR_CONFIG_FILENAME),
         projectTrusted,
       });
-      threshold = loaded.config.rewindHintAtPercent;
+      reserve = loaded.config.rewindHintReserveTokens;
       startTurns = loaded.config.anchorStartAfterTurns;
       warnings = loaded.warnings;
     } catch {
@@ -1192,11 +1208,11 @@ export default function (pi: ExtensionAPI) {
       // so a loader bug can never break session start. Silent: every loader
       // failure already carries a user-facing warning, and a new string here
       // would only fire on an unreachable path.
-      threshold = null;
+      reserve = null;
       startTurns = START_ANCHOR_DEFAULT_TURNS;
       warnings = [];
     }
-    rewindHintAtPercent = threshold;
+    rewindHintReserveTokens = reserve;
     anchorStartTurnsBySession.set(sessionId, startTurns);
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
@@ -1261,7 +1277,7 @@ export default function (pi: ExtensionAPI) {
   // Rewind hint (#44): one check per turn, after the turn's tool results and
   // before the agent loop's steering drain — so a `pi.sendMessage` from this
   // handler is delivered in the same run. Synchronous by design: no await
-  // before any ctx use. Fires once per threshold crossing; see
+  // before any ctx use. Fires once per reserve crossing; see
   // `RewindHintTracker` for the re-arm semantics.
   pi.on("turn_end", (event, ctx) => {
     // Single `sessionManager` capture shared by the auto start-anchor and
@@ -1296,9 +1312,9 @@ export default function (pi: ExtensionAPI) {
         // Stale ctx: keep the shared fallback.
       }
     }
-    if (!hintToolActive || rewindHintAtPercent === null) return;
+    if (!hintToolActive || rewindHintReserveTokens === null) return;
     // A rewind owns this turn (its call, a summary attempt, or the
-    // completion): a "running low" nudge would be stale or push a second
+    // completion): a rewind hint would be stale or push a second
     // rewind. The crossing stays unspent for the next turn.
     if (
       event.message &&
@@ -1308,30 +1324,50 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const usage = ctx.getContextUsage();
-    // `percent == null` is pi's post-compaction state (unknown tokens), and
-    // `contextWindow <= 0` has no meaningful bar to compare against. Both
-    // are no-ops that leave the crossing unspent.
-    if (!usage || usage.percent == null || usage.contextWindow <= 0) return;
-    if (usage.percent < rewindHintAtPercent) {
-      // Below the bar: re-arm only.
-      hintTracker.observe(usage.percent, rewindHintAtPercent);
+    // `tokens == null` / `percent == null` is pi's post-compaction state
+    // (unknown tokens), and `contextWindow <= 0` has no meaningful bar to
+    // compare against. All are no-ops that leave the crossing unspent.
+    if (
+      !usage ||
+      usage.tokens == null ||
+      usage.percent == null ||
+      usage.contextWindow <= 0
+    ) {
       return;
     }
+    const tokensLeft = usage.contextWindow - usage.tokens;
+    if (tokensLeft > rewindHintReserveTokens) {
+      // Outside the reserve: re-arm only.
+      hintTracker.observe(tokensLeft, rewindHintReserveTokens);
+      return;
+    }
+    // Spent: skip the anchor walk below (it estimates every anchor).
+    if (hintTracker.isSpent()) return;
     // Collect anchors BEFORE marking the crossing spent: a throwing
-    // `getBranch` / `getLabel` must leave the crossing unspent so the next
-    // turn can retry — never burn the one shot on a failed state read. The
-    // shared `sm` was captured before any throw-capable call, so the
-    // fallback append never re-reads a lazy ctx getter after a throw.
+    // `getBranch` / `getLabel` / `getEntries` must leave the crossing
+    // unspent so the next turn can retry — never burn the one shot on a
+    // failed state read. The shared `sm` was captured before any
+    // throw-capable call, so the fallback append never re-reads a lazy ctx
+    // getter after a throw.
     if (!sm) return;
-    let anchorNames: string[];
+    let anchors: { names: string[]; text: string };
     try {
-      anchorNames = collectAnchorNames(sm);
+      const allEntries = sm.getEntries();
+      const byId = new Map<string, SessionEntry>();
+      for (const e of allEntries) byId.set(e.id, e);
+      anchors = formatActiveAnchors(sm, usage.contextWindow, allEntries, byId);
     } catch {
       return;
     }
-    if (!hintTracker.observe(usage.percent, rewindHintAtPercent)) return;
-    if (anchorNames.length > 0) {
-      const text = buildRewindHintText(usage.percent, usage.contextWindow);
+    if (!hintTracker.observe(tokensLeft, rewindHintReserveTokens)) return;
+    if (anchors.names.length > 0) {
+      const text = buildRewindHintText(
+        usage.percent,
+        tokensLeft,
+        rewindHintReserveTokens,
+        usage.contextWindow,
+        anchors.text,
+      );
       try {
         // Pinned delivery semantics — do not "improve": NO options bag
         // (never `triggerTurn`, never `sendUserMessage`). Streaming → the

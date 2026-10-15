@@ -33,16 +33,28 @@
  * - **System messages.** pi 1.0.0's `estimateTokens` adds a `system` case
  *   (counts `content`, `sections`, and `toolsAdded`) where 0.84.2 returned
  *   `0`. `buildSessionContext(...).messages` carries `system` entries on
- *   1.0.0, so an estimate is self-consistent per host and matches pi's own
- *   `estimateProjectedContextTokens` there — but a chain containing system
- *   entries does not produce the same number on both versions. No
- *   cross-version parity is claimed.
+ *   1.0.0, so an estimate is self-consistent per host — but a chain
+ *   containing system entries does not produce the same number on both
+ *   versions. No cross-version parity is claimed. Nor is parity with pi's
+ *   `estimateProjectedContextTokens` on the no-usage path: pi folds the
+ *   system entries into the current system state (`getCurrentSystemMessage`)
+ *   while this helper sums every entry, so replaced or removed sections and
+ *   tool changes count here but not in pi.
  * - **`JSON.stringify` vs `safeJsonStringify`.** The removed pi-agent-core
  *   helper wrapped toolCall `arguments` serialization in a
  *   `safeJsonStringify` guard (falling back to `"[unserializable]"`); the
  *   public `estimateTokens` uses plain `JSON.stringify` (0.84.2 and 1.0.0
  *   alike — v1 restricts toolCall arguments to JSON-compatible values).
  *   The guard is deliberately not reproduced.
+ * - **Stale usage baseline after `context_edit` / compaction.** Both this
+ *   helper and pi's `estimateProjectedContextTokens` (behind
+ *   `ctx.getContextUsage()`) estimate the projected messages, but pi drops
+ *   the last assistant usage as a baseline when it sits at or before the
+ *   latest `context_edit` or `compaction` entry; this helper keeps it. On
+ *   such a branch an anchor percentage (this helper) can exceed what pi
+ *   reports for the same point (after compaction pi reports `tokens: null`
+ *   until the next assistant usage). Moving live-branch numbers onto pi's
+ *   estimate is tracked in #64.
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";

@@ -3115,7 +3115,7 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     await requestRewind(f);
     f.sm.appendCustomMessageEntry(
       REWIND_HINT_CUSTOM_TYPE,
-      buildRewindHintText(91, 1_000_000),
+      expectedHint(91),
       true,
       undefined,
     );
@@ -3833,6 +3833,11 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.match(text, /Rewind further back to actually free context/);
     assert.match(text, /'kickoff'/);
     assert.match(text, /'impl-start'/);
+    // Byte-exact pin (#84 moved the anchor walk into formatActiveAnchors).
+    assert.equal(
+      text,
+      "Rewinding to 'impl-start' (as 'done') would free only ~0.0k tokens. Rewind further back to actually free context, or keep working. Active anchors: 'kickoff' 0.6% · 'impl-start' 1.2% of 1.0M",
+    );
     // The numeric bar itself is NEVER printed agent-visible.
     assert.ok(
       !text.includes(String(MIN_REWIND_SAVINGS_TOKENS)),
@@ -3877,9 +3882,68 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
       /No earlier anchors — keep working and rewind later once more has accumulated above it\./,
     );
     assert.match(text, /'start'/);
+    assert.equal(
+      text,
+      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it. Active anchors: 'start' 0.6% of 1.0M",
+    );
     assert.ok(!text.includes(String(MIN_REWIND_SAVINGS_TOKENS)));
     assert.equal(fireToolCall(pi, ctx), undefined);
     assertLabelAbsent(sm, "anchor:done");
+  });
+
+  it("A-pin variant B at contextWindow 0: k-format percents, no window suffix", async () => {
+    const { sm, pi, tool, ctx } = setup({ contextWindow: 0 });
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 6_001);
+    const r = await tool.execute(
+      "tc-floor-b0",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r.details.rejected, "min-savings");
+    assert.equal(
+      r.content[0].text,
+      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it. Active anchors: 'start' 6.0k",
+    );
+  });
+
+  it("an empty-named manual label never counts as the oldest anchor", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const t0 = appendTurn(sm, "u0", "a0", 3_000);
+    pi.pi.setLabel(t0.assistantId, "anchor:");
+    const t1 = appendTurn(sm, "u1", "a1", 6_000);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    appendTurn(sm, "u2", "a2", 6_001);
+    const r = await tool.execute(
+      "tc-floor-empty",
+      {
+        action: "rewind",
+        rewindTo: "start",
+        newLabel: "done",
+        summaryFocus: "Preserve user instructions and continue.",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(r.details.rejected, "min-savings");
+    assert.match(
+      r.content[0].text,
+      /No earlier anchors — keep working and rewind later once more has accumulated above it\./,
+    );
+    // The rejection lists only names rewindTo accepts (no `''`).
+    assert.match(
+      r.content[0].text,
+      /Active anchors: 'start' [\d.]+% of 1\.0M$/,
+    );
   });
 
   it("B-pin: healthy stage (≥20k apparent savings) requests the summary", async () => {
@@ -4143,6 +4207,27 @@ function usageAt(percent: number, contextWindow = 1_000_000): ContextUsage {
 }
 
 /**
+ * The hint text at `percent` of `contextWindow` (via `usageAt`), with the
+ * reserve the test config sets and the active-anchor list the handler must
+ * render (default: the lone `anchorStart` label at 0.0% of 1.0M).
+ */
+function expectedHint(
+  percent: number,
+  anchors = "'start' 0.0% of 1.0M",
+  reserve = 100_000,
+  contextWindow = 1_000_000,
+): string {
+  const usage = usageAt(percent, contextWindow);
+  return buildRewindHintText(
+    percent,
+    contextWindow - (usage.tokens ?? 0),
+    reserve,
+    contextWindow,
+    anchors,
+  );
+}
+
+/**
  * Drive the captured `session_start` handler with `PI_CODING_AGENT_DIR`
  * pointed at the fixture's agent dir (the loader reads the real fs). The env
  * var is always restored, so the suite never touches the user's real config.
@@ -4220,7 +4305,10 @@ describe("rewind hint: session_start config wiring (#44)", () => {
     try {
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       await runSessionStart(pi, ctx, fixture);
       assert.deepEqual(ctx.notifyCalls, [], "valid config must not warn");
 
@@ -4240,10 +4328,15 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       assert.deepEqual(pi.sendMessageCalls[0], [
         {
           customType: REWIND_HINT_CUSTOM_TYPE,
-          content: buildRewindHintText(90, 1_000_000),
+          content: expectedHint(90),
           display: true,
         },
       ]);
+      // Byte-exact pin: the anchors are named, so no `list` call is needed.
+      assert.equal(
+        pi.sendMessageCalls[0][0].content,
+        "[navigate_tree hint] Context is at 90.0% of 1.0M — 100.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 0.0% of 1.0M",
+      );
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -4252,10 +4345,16 @@ describe("rewind hint: session_start config wiring (#44)", () => {
   it("project layer overrides global when trusted; untrusted ignores the file", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
-      writeProjectConfig(fixture, JSON.stringify({ rewindHintAtPercent: 50 }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
+      writeProjectConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 500_000 }),
+      );
 
-      // Trusted: the project's 50 wins over the global 90.
+      // Trusted: the project's 500k reserve wins over the global 100k.
       {
         const { sm, pi, ctx } = setup();
         anchorStart(sm, pi);
@@ -4268,8 +4367,8 @@ describe("rewind hint: session_start config wiring (#44)", () => {
         assert.deepEqual(ctx.notifyCalls, []);
       }
 
-      // Untrusted: the project file is ignored silently; 50 does not fire,
-      // 90 does.
+      // Untrusted: the project file is ignored silently; 50% does not
+      // fire (500k left > 100k), 90% does.
       {
         const { sm, pi, ctx } = setup();
         anchorStart(sm, pi);
@@ -4294,7 +4393,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       writeGlobalConfig(fixture, "{ not json");
       writeProjectConfig(
         fixture,
-        JSON.stringify({ rewindHintAtPercent: true }),
+        JSON.stringify({ rewindHintReserveTokens: true }),
       );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
@@ -4307,7 +4406,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
           "warning",
         ],
         [
-          `navigate_tree: invalid rewindHintAtPercent in project config at ${projectConfigPath(fixture)} — expected integer 20-95 or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
+          `navigate_tree: invalid rewindHintReserveTokens in project config at ${projectConfigPath(fixture)} — expected integer 1000-1000000 or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`,
           "warning",
         ],
       ]);
@@ -4319,6 +4418,27 @@ describe("rewind hint: session_start config wiring (#44)", () => {
         2,
         "the turn must not add config warnings",
       );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("the removed rewindHintAtPercent warns and leaves the hint off", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      const { sm, pi, ctx } = setup();
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [
+        [
+          `navigate_tree: rewindHintAtPercent in global config at ${globalConfigPath(fixture)} was removed in 0.3.0 and is ignored — use rewindHintReserveTokens (tokens left in the window when the hint fires, e.g. 50000).`,
+          "warning",
+        ],
+      ]);
+      ctx.setContextUsage(usageAt(99));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -4355,7 +4475,10 @@ describe("rewind hint: session_start config wiring (#44)", () => {
   it("reload resets the tracker and the toolActive gate", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
       await runSessionStart(pi, ctx, fixture);
@@ -4393,7 +4516,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
 });
 
 describe("rewind hint: turn_end handler (#44)", () => {
-  const ENABLED_CONFIG = JSON.stringify({ rewindHintAtPercent: "90" });
+  const ENABLED_CONFIG = JSON.stringify({ rewindHintReserveTokens: 100_000 });
 
   async function enabledSetup(): Promise<{
     fixture: ConfigFixture;
@@ -4412,7 +4535,10 @@ describe("rewind hint: turn_end handler (#44)", () => {
   it("does not fire when disabled by a sentinel", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: null }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: null }),
+      );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
       await runSessionStart(pi, ctx, fixture);
@@ -4510,10 +4636,88 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("no-ops on tokens-null usage even when percent is set", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      // A 50k window under the 100k reserve: without the tokens guard,
+      // `contextWindow - null` (50k) would read as inside the reserve.
+      ctx.setContextUsage({
+        tokens: null,
+        contextWindow: 50_000,
+        percent: 99,
+      });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("fires on an overrun window (tokens > contextWindow) with 0.0k left", async () => {
+    const { fixture, pi, ctx } = await enabledSetup();
+    try {
+      ctx.setContextUsage({
+        tokens: 1_050_000,
+        contextWindow: 1_000_000,
+        percent: 105,
+      });
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      assert.equal(
+        (pi.sendMessageCalls[0][0] as { content: string }).content,
+        "[navigate_tree hint] Context is at 105.0% of 1.0M — 0.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 0.0% of 1.0M",
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a spent crossing skips the anchor walk entirely", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+
+      const calls = { getEntries: 0, getBranch: 0, getLabel: 0 };
+      const target = sm as unknown as Record<
+        keyof typeof calls,
+        (...args: unknown[]) => unknown
+      >;
+      const originals = { ...calls } as unknown as typeof target;
+      for (const name of Object.keys(calls) as Array<keyof typeof calls>) {
+        const original = target[name].bind(sm);
+        originals[name] = target[name];
+        target[name] = (...args: unknown[]) => {
+          calls[name]++;
+          return original(...args);
+        };
+      }
+      try {
+        fireTurnEnd(pi, ctx);
+        fireTurnEnd(pi, ctx);
+      } finally {
+        Object.assign(target, originals);
+      }
+      assert.equal(pi.sendMessageCalls.length, 1);
+      // The start anchor's existence check may read the branch; the hint's
+      // walk (getEntries + per-anchor estimates) must not run at all.
+      assert.equal(calls.getEntries, 0);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("fires once per crossing and re-arms only after a drop below the bar", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "20" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 800_000 }),
+      );
       const { sm, pi, ctx } = setup();
       anchorStart(sm, pi);
       await runSessionStart(pi, ctx, fixture);
@@ -4547,7 +4751,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.deepEqual(pi.sendMessageCalls[1], [
         {
           customType: REWIND_HINT_CUSTOM_TYPE,
-          content: buildRewindHintText(21, 1_000_000),
+          content: expectedHint(21, undefined, 800_000),
           display: true,
         },
       ]);
@@ -4583,6 +4787,50 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.deepEqual(ctx.notifyCalls[1], [
         buildNoAnchorText(96, 1_000_000),
         "warning",
+      ]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("lists only names rewindTo accepts", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      const t0 = appendTurn(sm, "u-empty", "a-empty");
+      pi.pi.setLabel(t0.assistantId, "anchor:");
+      const t1 = appendTurn(sm, "u-upper", "a-upper");
+      pi.pi.setLabel(t1.assistantId, "anchor:Foo");
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      const text = String(
+        (pi.sendMessageCalls[0][0] as { content: unknown }).content,
+      );
+      assert.match(text, /Active anchors: 'start' [\d.]+% of 1\.0M$/);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("an empty-named manual label alone counts as no anchors", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      // `anchor:` is not a valid `rewindTo`, so the model must not be
+      // pointed at it.
+      const t = appendTurn(sm, "u-empty", "a-empty");
+      pi.pi.setLabel(t.assistantId, "anchor:");
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, [
+        [buildNoAnchorText(95, 1_000_000), "warning"],
       ]);
     } finally {
       cleanupConfigFixture(fixture);
@@ -4627,7 +4875,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       ctx.setContextUsage(usageAt(95));
       fireTurnEnd(pi, ctx);
       assert.deepEqual(appendCalls, [
-        [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
+        [REWIND_HINT_CUSTOM_TYPE, expectedHint(95), true],
       ]);
       assert.deepEqual(
         ctx.notifyCalls,
@@ -4778,7 +5026,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       fireTurnEnd(pi, proxyCtx);
       assert.equal(reads, 1, "sessionManager must be read exactly once");
       assert.deepEqual(appendCalls, [
-        [REWIND_HINT_CUSTOM_TYPE, buildRewindHintText(95, 1_000_000), true],
+        [REWIND_HINT_CUSTOM_TYPE, expectedHint(95), true],
       ]);
     } finally {
       cleanupConfigFixture(fixture);
@@ -4810,6 +5058,26 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("a throwing getEntries leaves the crossing unspent for a retry", async () => {
+    const { fixture, sm, pi, ctx } = await enabledSetup();
+    try {
+      const originalGetEntries = sm.getEntries;
+      (sm as unknown as { getEntries: () => never }).getEntries = () => {
+        throw new Error("getEntries exploded");
+      };
+      ctx.setContextUsage(usageAt(95));
+      assert.doesNotThrow(() => fireTurnEnd(pi, ctx));
+      assert.equal(pi.sendMessageCalls.length, 0);
+
+      (sm as unknown as { getEntries: typeof originalGetEntries }).getEntries =
+        originalGetEntries;
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("the fired custom message is projected by the existing context handler", async () => {
     const { fixture, sm, pi, ctx } = await enabledSetup();
     try {
@@ -4821,7 +5089,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       // entry via `appendCustomMessageEntry`; emulate that write, then run
       // the extension's own `context` projection and assert the hint text
       // survives (no customType filtering in `buildContextMessages`).
-      const text = buildRewindHintText(95, 1_000_000);
+      const text = expectedHint(95);
       sm.appendCustomMessageEntry(REWIND_HINT_CUSTOM_TYPE, text, true);
       const contextHandlers = pi.onCalls.get("context");
       assert.ok(contextHandlers, "factory must register a context handler");
@@ -4891,7 +5159,10 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
   it("skips the rewind call, a failed attempt and the completing turn; the crossing fires on the next normal turn", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       const f = setup();
       setupRewindable(f.sm, f.pi, { capture: true });
       await runSessionStart(f.pi, f.ctx, fixture);
@@ -4918,7 +5189,7 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
         [
           {
             customType: REWIND_HINT_CUSTOM_TYPE,
-            content: buildRewindHintText(95, 1_000_000),
+            content: expectedHint(95, "'start' 0.6% · 'end' 0.6% of 1.0M"),
             display: true,
           },
         ],
@@ -4931,7 +5202,10 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
   it("skips a tool-call failure turn too, and the start anchor still runs on it", async () => {
     const fixture = makeConfigFixture();
     try {
-      writeGlobalConfig(fixture, JSON.stringify({ rewindHintAtPercent: "90" }));
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
       const f = setup();
       // Anchor `a`, not `start`: the auto start anchor must be the writer.
       setupRewindable(f.sm, f.pi, { capture: true, rewindToName: "a" });
