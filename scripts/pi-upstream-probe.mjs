@@ -6,7 +6,7 @@
  * dependencies) still exist with the required shape in the installed
  * @earendil-works/pi-coding-agent / @earendil-works/pi-agent-core.
  *
- * Reflection points (after #14, #33, #75):
+ * Reflection points (after #14, #79, #80):
  *   1. `AgentSession.prototype.prompt` — must be a writable plain data
  *      property (not `#`-private, not a getter-only accessor). The
  *      extension stashes the original and replaces it with a wrapper.
@@ -14,22 +14,20 @@
  *      (exposed as a plain field on AgentSession), `agent.state` must be
  *      readable and `agent.state.messages` writable (plain fields, not
  *      `#`-private). The extension assigns `agent.state.messages = ...`.
- *   3. `session.agent.thinkingBudgets` (#33) — plain field on the Agent;
- *      forwarded on the capture path when present.
- *   4. `SessionManager.prototype.getSessionId` (#33/#75) — the capture map
- *      is keyed by it and the summary reuses it for routing + cache.
- *   5. `ModelRegistry.prototype.streamSimple` (#75, floor 0.87.0) — the
- *      summarization transport is `modelRegistry.streamSimple`; its absence
- *      forces upstream's cold dispatch.
- *   6. `Agent.transformContext` plain writable field (#75) — the live-request
- *      capture seam; the extension wraps it once per session (observation
- *      only) so the capture sees the FINAL list after pi's forced-prompt /
- *      hidden-declaration projections. Checked against the constructor
- *      assignment in the installed pi-agent-core dist.
+ *   3. `AgentSession._extensionRunner` + `ExtensionRunner.emit` (#79) — the
+ *      rewind emits `session_tree` through it so history-mirroring
+ *      extensions (pi-claude-bridge) rebuild from the rewound chain.
  *
- * #75 deleted the #33 `state.tools` / `state.systemPrompt` reflection reads
- * (the capture replays the live message list instead of mirroring fields),
- * so those checks are gone.
+ * Load-bearing host ordering (#80): the in-band rewind completes in a
+ * `turn_end` handler and returns its continuation as a boundary entry with
+ * `continue: true`, so pi must await the extension `turn_end` dispatch in
+ * `finishTurn`, commit the returned entries, and honour `continue`, all
+ * before the loop drains steering messages.
+ *
+ * #80 deleted the #33/#75 cache-preserving summary request (live-request
+ * capture via `Agent.transformContext`, `ModelRegistry.streamSimple`
+ * transport, `thinkingBudgets`, `getShowCacheMissNotices`), so those checks
+ * are gone.
  *
  * Transitive dependencies:
  *   - `AgentSession` constructor assigns `this.sessionManager` (plain
@@ -196,17 +194,6 @@ try {
         : "set messages accessor MISSING",
   );
 
-  // --- 5. Agent.thinkingBudgets (plain field, #33) ---
-  check(
-    "agent.thinkingBudgets plain field",
-    /this\.thinkingBudgets\s*=\s*runtimeOptions\.thinkingBudgets/.test(
-      agentSrc,
-    ),
-    /this\.thinkingBudgets\s*=\s*runtimeOptions\.thinkingBudgets/.test(agentSrc)
-      ? "plain this.thinkingBudgets = found"
-      : "thinkingBudgets assignment MISSING",
-  );
-
   // --- 7. SessionManager.getSessionId (#33/#75) ---
   check(
     "getSessionId is prototype method",
@@ -214,89 +201,72 @@ try {
     typeof SessionManager?.prototype?.getSessionId,
   );
 
-  // --- 7b. ModelRegistry.prototype.streamSimple (#75, floor 0.87.0) ---
-  // The summarization transport is `modelRegistry.streamSimple`; without it
-  // the extension deliberately falls back to upstream's cold dispatch. The
-  // path is only correct when the runtime exposes the method.
-  const ModelRegistry = codingAgent.ModelRegistry;
+  // --- 7d. AgentSession._extensionRunner + ExtensionRunner.emit (#79) ---
+  // After a rewind the extension emits `session_tree` through the captured
+  // session's runner, mirroring pi's own navigateTree, so history-mirroring
+  // extensions (pi-claude-bridge) rebuild. A `#`-private runner or a missing
+  // `emit` makes the notification a silent no-op (`historyRewriteNotified:
+  // false`) and the bridge keeps the pre-rewind context.
   check(
-    "ModelRegistry exported",
-    typeof ModelRegistry === "function",
-    typeof ModelRegistry,
+    "AgentSession._extensionRunner plain field (#79)",
+    /this\._extensionRunner\s*=/.test(sessionSrc) &&
+      !sessionSrc.includes("this.#extensionRunner"),
+    /this\._extensionRunner\s*=/.test(sessionSrc)
+      ? "plain this._extensionRunner = found"
+      : "_extensionRunner assignment MISSING",
   );
   check(
-    "ModelRegistry.streamSimple is prototype method (#75)",
-    typeof ModelRegistry?.prototype?.streamSimple === "function",
-    typeof ModelRegistry?.prototype?.streamSimple,
+    "ExtensionRunner.emit is prototype method (#79)",
+    typeof codingAgent.ExtensionRunner?.prototype?.emit === "function",
+    typeof codingAgent.ExtensionRunner?.prototype?.emit,
+  );
+  check(
+    "navigateTree emits session_tree (#79 payload parity)",
+    /type:\s*"session_tree"/.test(sessionSrc),
+    /type:\s*"session_tree"/.test(sessionSrc)
+      ? "session_tree emit found"
+      : "session_tree emit MISSING",
   );
 
-  // --- 7c. Agent.transformContext capture seam (#75) ---
-  // The live-request capture wraps `agent.transformContext` once per
-  // session. It must be a plain writable instance field: a `#`-private field
-  // or a getter-only prototype accessor would make the wrapper assignment a
-  // silent no-op / throw, every capture would be missing, and every rewind
-  // would fall back with `no-capture`. Check both the constructor source and
-  // a real instance write (the assignment the extension performs).
-  const transformAssign =
-    /this\.transformContext\s*=\s*runtimeOptions\.transformContext/.test(
-      agentSrc,
-    );
-  const transformDesc = Object.getOwnPropertyDescriptor(
-    Agent?.prototype ?? {},
-    "transformContext",
-  );
-  let transformRuntimeWrite = { ok: false, detail: "not run" };
+  // --- 8. turn_end handlers settle before the steering drain (#80) ---
+  // The in-band rewind completes in a `turn_end` handler and returns its
+  // continuation as a boundary entry with `continue: true`: a text-only
+  // summary turn would otherwise end the loop, and the rewound context would
+  // only reach a real turn on the next user prompt. That needs (a) the loop
+  // to await `finishTurn` before reading steering messages, (b)
+  // AgentSession's `finishTurn` to await the extension `turn_end` dispatch,
+  // and (c) that dispatch to commit the returned entries and return
+  // `continue`.
+  let loopSrc = "";
   try {
-    const agent = new Agent({
-      initialState: {
-        systemPrompt: "",
-        model: undefined,
-        thinkingLevel: "off",
-        tools: [],
-        messages: [],
-      },
-      streamFn: () => ({}),
-    });
-    agent.transformContext = async (messages) => messages;
-    transformRuntimeWrite = {
-      ok: typeof agent.transformContext === "function",
-      detail:
-        typeof agent.transformContext === "function"
-          ? "instance write accepted"
-          : "instance write did not stick",
-    };
-  } catch (e) {
-    transformRuntimeWrite = {
-      ok: false,
-      detail: `instance write threw: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
+    loopSrc = readFileSync(path.join(path.dirname(coreDist), "agent-loop.js"), "utf8");
+  } catch {}
+  const loopOrder =
+    /await config\.finishTurn\?\.\([\s\S]{0,400}?config\.getSteeringMessages/.test(loopSrc);
   check(
-    "Agent.transformContext plain writable field (#75 capture seam)",
-    transformAssign &&
-      transformRuntimeWrite.ok &&
-      !(transformDesc?.get && transformDesc?.set === undefined),
-    `${transformAssign ? "source assignment found" : "constructor assignment MISSING"}; ${transformRuntimeWrite.detail}`,
+    "agent loop awaits finishTurn before the steering drain (#80)",
+    loopOrder,
+    loopOrder ? "finishTurn → getSteeringMessages order found" : "order MISSING",
+  );
+  const finishDispatch =
+    /this\.agent\.finishTurn = async[\s\S]{0,300}?await this\._dispatchTurnEndBoundary\(/.test(sessionSrc);
+  check(
+    "AgentSession.finishTurn awaits the turn_end dispatch (#80)",
+    finishDispatch,
+    finishDispatch ? "await _dispatchTurnEndBoundary found" : "dispatch MISSING",
+  );
+  const boundaryCommit =
+    /_dispatchTurnEndBoundary\([\s\S]{0,1500}?this\._commitBoundaryDrafts\(boundary\.entries\)[\s\S]{0,400}?return boundary\.continue;/.test(sessionSrc);
+  check(
+    "turn_end dispatch commits boundary entries and returns continue (#80)",
+    boundaryCommit,
+    boundaryCommit ? "_commitBoundaryDrafts(boundary.entries) … return boundary.continue found" : "commit/continue MISSING",
   );
 
-  // --- 8. SettingsManager.getShowCacheMissNotices (TUI cache-notice gate) ---
-  // The extension reads this reflectively off the captured AgentSession to
-  // gate the TUI cache-miss warning. pi defaults it to false; absence would
-  // silently disable the notice (or, on a non-optional read, throw).
-  check(
-    "SettingsManager exported",
-    typeof SettingsManager === "function",
-    typeof SettingsManager,
-  );
-  check(
-    "getShowCacheMissNotices is prototype method",
-    typeof SettingsManager?.prototype?.getShowCacheMissNotices === "function",
-    typeof SettingsManager?.prototype?.getShowCacheMissNotices,
-  );
-
-  // --- 9. Assistant persisted before tool execution (#37 solo-batch guard) ---
-  // The #37 guard reads the active branch to find the in-flight assistant
-  // (the one declaring the rewind tool call) BEFORE any mutation. That read
+  // --- 9. Assistant persisted before tool execution (#37, #80) ---
+  // The rewind reads the active branch with the in-flight assistant (the one
+  // declaring the rewind tool call) as the leaf: `contextBefore` is measured
+  // at its parent and the summary turn is told apart by its tool-call id. That read
   // is only sound because pi:
   //   (a) emits the assistant `message_end` — and AgentSession persists it
   //       via `sessionManager.appendMessage` — before the loop calls
