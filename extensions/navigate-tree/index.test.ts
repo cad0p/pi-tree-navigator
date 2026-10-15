@@ -43,6 +43,7 @@ import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTree, {
   __testHooks,
   ANCHOR_MANDATE,
+  buildLateEntriesNote,
   buildRewindCancelledText,
   buildRewindDoneText,
   buildSummaryRetryText,
@@ -2106,9 +2107,8 @@ describe("rewind phase 2: completion", () => {
       historyRewriteNotified: false,
       readFiles: [],
       modifiedFiles: [],
-      redeliveredUserMessages: 0,
+      reappendedLateMessages: 0,
     });
-    assert.equal(f.pi.sendUserMessageCalls.length, 0);
     // Collapsed: the anchor's label-change entry, u2..a4 (6), the rewind
     // call, its result, and the summary turn — all left on the abandoned
     // branch.
@@ -2752,7 +2752,7 @@ describe("extractSummaryText", () => {
 // rewind phase 2: multi-block summary turns and steer re-delivery (#80)
 // =============================================================================
 
-describe("rewind phase 2: multi-block text and late user messages", () => {
+describe("rewind phase 2: multi-block text and late entries", () => {
   async function summaryBlocksTurn(
     f: { sm: SessionManager; pi: FakePi; ctx: FakeCtx },
     texts: string[],
@@ -2794,74 +2794,229 @@ describe("rewind phase 2: multi-block text and late user messages", () => {
     );
   });
 
-  it("re-delivers user messages that landed after the rewind call as steers, oldest first", async () => {
+  const NOTE_ONE =
+    "The message between the branch_summary and this one arrived while the rewind was pending — it is new and still unanswered; handle it now.";
+  const NOTE_TWO =
+    "The 2 messages between the branch_summary and this one arrived while the rewind was pending — they are new and still unanswered; handle them now.";
+
+  function appendLateUser(sm: SessionManager, text: string): string {
+    return sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text }],
+      timestamp: 1,
+    } as never);
+  }
+
+  /** Active-branch entries after the new branch_summary, as compact tags. */
+  function tailAfterSummary(sm: SessionManager): string[] {
+    const branch = sm.getBranch();
+    const at = branch.findIndex((e) => e.type === "branch_summary");
+    assert.ok(at >= 0, "a branch_summary must be on the active branch");
+    return branch.slice(at).map((e) => {
+      if (e.type === "message") {
+        return `${e.message.role}:${JSON.stringify(
+          (e.message as { content?: unknown }).content,
+        )}`;
+      }
+      if (e.type === "custom_message") {
+        return `custom:${e.customType}:${JSON.stringify(e.content)}`;
+      }
+      return e.type;
+    });
+  }
+
+  it("re-appends a late user steer and another extension's message, in order, onto the new branch", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
     await requestRewind(f);
-    // Steers pi drained at the rewind turn's boundary, before the summary.
-    const steerOne = [{ type: "text", text: "steer one: also fix the docs" }];
-    const steerTwo = [
-      { type: "text", text: "steer two: and bump the version" },
-    ];
-    const ids = [
-      f.sm.appendMessage({
-        role: "user",
-        content: steerOne,
-        timestamp: 1,
-      } as never),
-      f.sm.appendMessage({
-        role: "user",
-        content: steerTwo,
-        timestamp: 2,
-      } as never),
-    ];
+    const userId = appendLateUser(f.sm, "steer: also fix the docs");
+    const customId = f.sm.appendCustomMessageEntry(
+      "subagent-result",
+      "subagent finished: 3 files changed",
+      true,
+      { job: 7 },
+    );
     await summaryTurn(f);
 
     const done = rewindMessages(f.pi)[0].message;
     assert.equal(done.details.status, "done");
-    assert.equal(done.details.redeliveredUserMessages, 2);
-    assert.deepEqual(f.pi.sendUserMessageCalls, [
-      [steerOne, { deliverAs: "steer", expandPromptTemplates: false }],
-      [steerTwo, { deliverAs: "steer", expandPromptTemplates: false }],
+    assert.equal(done.details.reappendedLateMessages, 2);
+    assert.deepEqual(tailAfterSummary(f.sm), [
+      "branch_summary",
+      "label",
+      'user:[{"type":"text","text":"steer: also fix the docs"}]',
+      'custom:subagent-result:"subagent finished: 3 files changed"',
     ]);
-    assert.deepEqual(
-      f.pi.sendLog,
-      ["sendMessage", "sendUserMessage", "sendUserMessage"],
-      "continuation first, then the steers",
-    );
-    // The originals sit on the abandoned segment, not the active branch.
+    const leaf = f.sm.getEntry(f.sm.getLeafId() as string);
+    assert.ok(leaf && leaf.type === "custom_message");
+    assert.equal(leaf.display, true);
+    assert.deepEqual(leaf.details, { job: 7 });
+    // Re-appended copies, not the originals (those stay on the abandoned
+    // segment).
     const branchIds = new Set(f.sm.getBranch().map((e) => e.id));
-    for (const id of ids) {
+    for (const id of [userId, customId]) {
       assert.ok(f.sm.getEntry(id), "the original stays on disk");
       assert.ok(!branchIds.has(id), "but off the active branch");
     }
-    assert.ok(!JSON.stringify(f.sm.getBranch()).includes("steer one"));
-  });
-
-  it("user messages before the rewind call are not re-delivered", async () => {
-    const f = await rewindFixture();
-    assert.equal(f.done.message.details.redeliveredUserMessages, 0);
+    // No steer queue: re-appends never go back through input handlers.
     assert.deepEqual(f.pi.sendUserMessageCalls, []);
+    assert.ok(done.content.endsWith(`\n\n${NOTE_TWO}`));
   });
 
-  it("a throwing sendUserMessage does not fail the rewind", async () => {
+  it("the continuation follows the re-appended entries once delivered", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
-    (
-      f.pi.pi as unknown as { sendUserMessage: (...a: unknown[]) => void }
-    ).sendUserMessage = () => {
-      throw new Error("stale session runtime");
-    };
     await requestRewind(f);
-    f.sm.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: "late steer" }],
-      timestamp: 1,
-    } as never);
-    await assert.doesNotReject(summaryTurn(f));
+    appendLateUser(f.sm, "steer");
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    // pi persists the triggerTurn custom message; replicate it.
+    f.sm.appendCustomMessageEntry(
+      REWIND_CUSTOM_TYPE,
+      done.content,
+      true,
+      done.details,
+    );
+    assert.deepEqual(tailAfterSummary(f.sm), [
+      "branch_summary",
+      "label",
+      'user:[{"type":"text","text":"steer"}]',
+      `custom:${REWIND_CUSTOM_TYPE}:${JSON.stringify(done.content)}`,
+    ]);
+  });
+
+  it("the late note is byte-exact for one message", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    appendLateUser(f.sm, "steer");
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.reappendedLateMessages, 1);
+    assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}`));
+    assert.equal(buildLateEntriesNote(1), NOTE_ONE);
+    assert.equal(buildLateEntriesNote(2), NOTE_TWO);
+  });
+
+  it("does not re-append this extension's own rewind messages (e.g. a summary-retry)", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryTurn(f, "Okay, summarizing now.");
+    const retry = rewindMessages(f.pi)[0].message;
+    assert.equal(retry.details.status, "summary-retry");
+    // pi persists the delivered retry message; replicate it.
+    f.sm.appendCustomMessageEntry(
+      REWIND_CUSTOM_TYPE,
+      retry.content,
+      true,
+      retry.details,
+    );
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[1].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.reappendedLateMessages, 0);
+    assert.deepEqual(tailAfterSummary(f.sm), ["branch_summary", "label"]);
+    assert.ok(!done.content.includes("arrived while the rewind was pending"));
+  });
+
+  it("entries before the rewind call are not re-appended", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    f.sm.appendCustomMessageEntry("subagent-result", "early", true, {});
+    appendLateUser(f.sm, "early user");
+    appendTurn(f.sm, "u9", "a9", 34_000);
+    await requestRewind(f);
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.reappendedLateMessages, 0);
+    assert.deepEqual(tailAfterSummary(f.sm), ["branch_summary", "label"]);
+  });
+
+  it("a throwing re-append does not fail the rewind and is not counted", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    appendLateUser(f.sm, "lost steer");
+    f.sm.appendCustomMessageEntry("subagent-result", "kept", true, {});
+    // Arm the appendMessage throw only once the branch has been written.
+    const sm = f.sm as unknown as {
+      branchWithSummary: (...a: unknown[]) => string;
+      appendMessage: (...a: unknown[]) => string;
+    };
+    const origBranch = sm.branchWithSummary.bind(f.sm);
+    sm.branchWithSummary = (...a: unknown[]) => {
+      const id = origBranch(...a);
+      sm.appendMessage = () => {
+        throw new Error("append boom");
+      };
+      return id;
+    };
+    await summaryTurn(f);
     const done = rewindMessages(f.pi)[0].message;
     assert.equal(done.details.status, "done");
-    assert.equal(done.details.redeliveredUserMessages, 1);
+    assert.equal(done.details.reappendedLateMessages, 1);
+    assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}`));
+    assert.deepEqual(tailAfterSummary(f.sm), [
+      "branch_summary",
+      "label",
+      'custom:subagent-result:"kept"',
+    ]);
+  });
+
+  it("an estimator throw after the branch still sends the continuation with contextAfter 0", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    const sm = f.sm as unknown as {
+      branchWithSummary: (...a: unknown[]) => string;
+      buildSessionContext: () => unknown;
+    };
+    const origBranch = sm.branchWithSummary.bind(f.sm);
+    sm.branchWithSummary = (...a: unknown[]) => {
+      const id = origBranch(...a);
+      sm.buildSessionContext = () => {
+        throw new Error("estimate boom");
+      };
+      return id;
+    };
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.contextAfter, 0);
+    assert.equal(done.details.agentMessagesRefreshed, false);
+    assert.match(done.content, / → 0\.0% of 1\.0M\n\n/);
+    assert.ok(
+      f.sm.getBranch().some((e) => e.type === "branch_summary"),
+      "the branch landed",
+    );
+  });
+
+  it("a throwing getBranch before the write cancels with the completion reason", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    const sm = f.sm as unknown as { getBranch: () => unknown };
+    const origGetBranch = sm.getBranch;
+    sm.getBranch = () => {
+      throw new Error("branch boom");
+    };
+    try {
+      await assert.doesNotReject(summaryTurn(f));
+    } finally {
+      sm.getBranch = origGetBranch;
+    }
+    const calls = rewindMessages(f.pi);
+    assert.equal(calls.length, 1);
+    const reason = "the rewind could not be completed (branch boom)";
+    assert.equal(
+      calls[0].message.content,
+      buildRewindCancelledText("start", reason),
+    );
+    assert.equal(calls[0].message.details.status, "cancelled");
+    assert.equal(calls[0].message.details.reason, reason);
+    assert.ok(!f.sm.getEntries().some((e) => e.type === "branch_summary"));
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
   });
 });
 

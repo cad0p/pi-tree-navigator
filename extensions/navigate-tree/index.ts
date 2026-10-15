@@ -622,13 +622,29 @@ function rewindStaleReason(
 }
 
 /**
- * Contents of the user messages on the active branch after `afterEntryId`
- * (the assistant that issued the rewind), oldest first.
+ * Entries that arrived on the active branch after `afterEntryId` (the
+ * assistant that issued the rewind) from outside the conversation's own
+ * turns: user messages (steers drained at the rewind turn's boundary) and
+ * other extensions' custom messages (subagent results, timers). Oldest
+ * first; this extension's own rewind messages are excluded.
  */
-function collectLateUserMessages(
+type LateEntry =
+  | {
+      kind: "user";
+      message: Extract<SessionEntry, { type: "message" }>["message"];
+    }
+  | {
+      kind: "custom";
+      customType: string;
+      content: unknown;
+      display: boolean;
+      details: unknown;
+    };
+
+function collectLateEntries(
   sm: SessionManager,
   afterEntryId: string,
-): unknown[] {
+): LateEntry[] {
   let branch: SessionEntry[];
   try {
     branch = sm.getBranch();
@@ -637,13 +653,24 @@ function collectLateUserMessages(
   }
   const start = branch.findIndex((e) => e.id === afterEntryId);
   if (start < 0) return [];
-  const contents: unknown[] = [];
+  const late: LateEntry[] = [];
   for (const entry of branch.slice(start + 1)) {
     if (entry.type === "message" && entry.message.role === "user") {
-      contents.push(entry.message.content);
+      late.push({ kind: "user", message: entry.message });
+    } else if (
+      entry.type === "custom_message" &&
+      entry.customType !== REWIND_CUSTOM_TYPE
+    ) {
+      late.push({
+        kind: "custom",
+        customType: entry.customType,
+        content: entry.content,
+        display: entry.display,
+        details: entry.details,
+      });
     }
   }
-  return contents;
+  return late;
 }
 
 export function buildRewindDoneText(
@@ -657,6 +684,12 @@ export function buildRewindDoneText(
     `[rewind to '${pending.rewindTo}' · collapsed as '${pending.newLabel}'] · ${formatContextDelta(pending.beforeTokens, afterTokens, pending.contextWindow)}\n\n` +
     `A branch_summary of the collapsed work has been appended to your context. It is the newest branch_summary, the current state; earlier branch_summary messages, if present, are older collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work. User messages retained above predate this rewind — do not re-answer them.`
   );
+}
+
+export function buildLateEntriesNote(count: number): string {
+  return count === 1
+    ? "The message between the branch_summary and this one arrived while the rewind was pending — it is new and still unanswered; handle it now."
+    : `The ${count} messages between the branch_summary and this one arrived while the rewind was pending — they are new and still unanswered; handle them now.`;
 }
 
 export function buildSummaryRetryText(rewindTo: string): string {
@@ -785,11 +818,12 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const oldLeafId = sm.getLeafId();
-    // User messages that arrived after the rewind call (steers drained at the
-    // rewind turn's boundary, before the summary turn) sit on the segment
-    // about to be abandoned. They are new input, not collapsed work:
-    // re-deliver them after the continuation.
-    const lateUserMessages = collectLateUserMessages(sm, pending.rewindEntryId);
+    // Input that arrived after the rewind call (user steers drained at the
+    // rewind turn's boundary, other extensions' messages) sits on the segment
+    // about to be abandoned. It is new input, not collapsed work: it is
+    // re-appended onto the new branch below, in order, ahead of the
+    // continuation (which flags it as unanswered).
+    const lateEntries = collectLateEntries(sm, pending.rewindEntryId);
     let entries: SessionEntry[];
     let readFiles: string[];
     let modifiedFiles: string[];
@@ -837,7 +871,39 @@ export default function (pi: ExtensionAPI) {
         // The summary landed unlabeled; `list` simply won't show it.
       }
     }
-    const afterTokens = estimateActiveBranchTokens(sm);
+    // Direct appends, not the steer queue: no second pass through other
+    // extensions' input handlers, and anything still queued is delivered
+    // after these, keeping the original order.
+    let reappended = 0;
+    for (const late of lateEntries) {
+      try {
+        if (late.kind === "user") {
+          sm.appendMessage(
+            late.message as Parameters<SessionManager["appendMessage"]>[0],
+          );
+        } else {
+          sm.appendCustomMessageEntry(
+            late.customType,
+            late.content as Parameters<
+              SessionManager["appendCustomMessageEntry"]
+            >[1],
+            late.display,
+            late.details,
+          );
+        }
+        reappended++;
+      } catch {
+        // Fail-open: the original stays on disk on the abandoned branch.
+      }
+    }
+    // The branch has landed: every step below is guarded so the
+    // continuation always reaches the model.
+    let afterTokens = 0;
+    try {
+      afterTokens = estimateActiveBranchTokens(sm);
+    } catch {
+      afterTokens = 0;
+    }
     const refreshed = refreshAgentMessages(sm);
     const historyRewriteNotified = await emitSessionTree(
       sm,
@@ -847,6 +913,7 @@ export default function (pi: ExtensionAPI) {
     sendRewindMessage(
       sm,
       buildRewindDoneText(pending, afterTokens) +
+        (reappended > 0 ? `\n\n${buildLateEntriesNote(reappended)}` : "") +
         (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
       {
         status: "done",
@@ -863,22 +930,9 @@ export default function (pi: ExtensionAPI) {
         historyRewriteNotified,
         readFiles,
         modifiedFiles,
-        redeliveredUserMessages: lateUserMessages.length,
+        reappendedLateMessages: reappended,
       },
     );
-    for (const content of lateUserMessages) {
-      try {
-        pi.sendUserMessage(
-          content as Parameters<typeof pi.sendUserMessage>[0],
-          {
-            deliverAs: "steer",
-            expandPromptTemplates: false,
-          },
-        );
-      } catch {
-        // Fail-open: the original stays on disk on the abandoned branch.
-      }
-    }
   }
 
   // While a rewind waits for its summary, every tool call is blocked: the
@@ -969,7 +1023,20 @@ export default function (pi: ExtensionAPI) {
       }
       return;
     }
-    await completeRewind(sm, sessionId, pending, summary);
+    try {
+      await completeRewind(sm, sessionId, pending, summary);
+    } catch (err) {
+      // A throw before the branch write (the stale checks read the session)
+      // leaves the rewind pending: cancel it so the model hears about it.
+      if (pendingRewinds.get(sessionId) === pending) {
+        cancelRewind(
+          sm,
+          sessionId,
+          pending,
+          `the rewind could not be completed (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+    }
   });
 
   // Rewind-hint closure state (#44): fresh per factory invocation and reset
