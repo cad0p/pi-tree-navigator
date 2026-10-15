@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.3.0] - 2026-10-15
 
 <!-- USER-EDITABLE SECTION START -->
 - **In-band rewind summaries** ([#80](https://github.com/cad0p/pi-tree-navigator/issues/80)): the live model writes the summary as its next turn, so it comes from the prompt cache on every provider, pi-claude-bridge included. This replaces 0.2.0's separate summary request, and the tree moves once the summary turn ends. After a rewind, `session_tree` is emitted so history-mirroring providers rebuild from the rewound chain ([#79](https://github.com/cad0p/pi-tree-navigator/issues/79)).
