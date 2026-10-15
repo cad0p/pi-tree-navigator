@@ -481,7 +481,9 @@ function estimateAtEntry(
  * `'a' 4.1% · 'b' 22.0% of 1.0M`. Shared by the min-savings rejection and
  * the rewind hint so both name the same targets the same way. A manual
  * `/tree` label `anchor:x` CAN put the same name on two entries —
- * duplicates print twice, exactly as `list` prints them.
+ * duplicates print twice, exactly as `list` prints them. Names `rewindTo`
+ * would reject (e.g. an empty `anchor:` label) are skipped: both callers
+ * point the model at rewind targets.
  */
 function formatActiveAnchors(
   sm: Pick<SessionManager, "getBranch" | "getLabel">,
@@ -495,6 +497,7 @@ function formatActiveAnchors(
     const lbl = sm.getLabel(e.id);
     if (!lbl?.startsWith(LABEL_PREFIX)) continue;
     const name = lbl.slice(LABEL_PREFIX.length);
+    if (!isValidName(name)) continue;
     names.push(name);
     parts.push(
       `'${name}' ${formatPct1(estimateAtEntry(allEntries, e.id, byId), cw)}`,
@@ -525,10 +528,8 @@ function buildMinSavingsRejection(
   byId: Map<string, SessionEntry>,
 ): string {
   const anchors = formatActiveAnchors(sm, cw, allEntries, byId);
-  // `find(Boolean)`: an empty-named manual `/tree` label (`anchor:`) never
-  // counts as the oldest anchor.
   const guidance =
-    anchors.names.find(Boolean) === rewindTo
+    anchors.names[0] === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
       : "Rewind further back to actually free context, or keep working.";
   return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.text}`;
@@ -1396,9 +1397,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!hintTracker.observe(tokensLeft, rewindHintReserveTokens)) return;
-    // `some(Boolean)`: an empty-named manual `/tree` label (`anchor:`) is not
-    // a rewind target (`rewindTo` rejects an empty name).
-    if (anchors.names.some(Boolean)) {
+    if (anchors.names.length > 0) {
       const text = buildRewindHintText(
         usage.percent,
         tokensLeft,

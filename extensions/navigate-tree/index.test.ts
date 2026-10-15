@@ -4889,6 +4889,29 @@ describe("rewind hint: turn_end handler (#44)", () => {
     }
   });
 
+  it("lists only names rewindTo accepts", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, ENABLED_CONFIG);
+      const { sm, pi, ctx } = setup();
+      const t0 = appendTurn(sm, "u-empty", "a-empty");
+      pi.pi.setLabel(t0.assistantId, "anchor:");
+      const t1 = appendTurn(sm, "u-upper", "a-upper");
+      pi.pi.setLabel(t1.assistantId, "anchor:Foo");
+      anchorStart(sm, pi);
+      await runSessionStart(pi, ctx, fixture);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      const text = String(
+        (pi.sendMessageCalls[0][0] as { content: unknown }).content,
+      );
+      assert.match(text, /Active anchors: 'start' [\d.]+% of 1\.0M$/);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("an empty-named manual label alone counts as no anchors", async () => {
     const fixture = makeConfigFixture();
     try {
