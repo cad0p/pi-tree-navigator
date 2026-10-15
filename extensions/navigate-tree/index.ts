@@ -561,10 +561,12 @@ function findLabelHint(
 
 /**
  * Earlier handlers' boundary drafts that still apply after a rewind moved the
- * branch. A `context_edit` / `compaction` draft can target an entry the
- * rewind just abandoned; pi validates the whole list in a preview and drops
- * ALL of it (ours included) when one draft fails, so such drafts are dropped
- * here instead. Drafts without an entry target pass through.
+ * branch. A `context_edit` draft can target an entry the rewind just
+ * abandoned; pi validates the whole list in a preview (`appendContextEdit`
+ * throws for a target off the active branch) and drops ALL of it, ours
+ * included, when one draft fails — so such drafts are dropped here instead.
+ * Every other draft passes through: pi never validates a compaction's
+ * `firstKeptEntryId` (`null` is a valid self-retaining compaction).
  */
 function keepValidDrafts<T>(sm: SessionManager, drafts: readonly T[]): T[] {
   let onBranch: Set<string>;
@@ -574,13 +576,8 @@ function keepValidDrafts<T>(sm: SessionManager, drafts: readonly T[]): T[] {
     return [...drafts];
   }
   return drafts.filter((draft) => {
-    const d = draft as {
-      type?: string;
-      targetId?: string;
-      firstKeptEntryId?: string;
-    };
+    const d = draft as { type?: string; targetId?: string };
     if (d?.type === "context_edit") return onBranch.has(d.targetId ?? "");
-    if (d?.type === "compaction") return onBranch.has(d.firstKeptEntryId ?? "");
     return true;
   });
 }

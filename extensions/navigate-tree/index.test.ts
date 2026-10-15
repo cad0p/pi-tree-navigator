@@ -2456,7 +2456,7 @@ describe("rewind phase 2: completion", () => {
     assert.equal(boundary.entries[1].details.status, "done");
   });
 
-  it("drops earlier context_edit / compaction drafts the rewind made stale, keeps the rest", async () => {
+  it("drops earlier context_edit drafts the rewind made stale, keeps the rest (compactions included)", async () => {
     // pi validates the whole boundary list in a preview and drops ALL of it
     // when one draft fails; a draft targeting an entry the rewind abandoned
     // would take the continuation down with it.
@@ -2478,10 +2478,17 @@ describe("rewind phase 2: completion", () => {
       targetId: summaryTurnId,
       replacement: { content: "x" },
     };
+    // pi never validates a compaction's firstKeptEntryId, so compaction
+    // drafts pass through untouched — null (self-retaining) and stale ids.
     const staleCompaction = {
       type: "compaction",
       summary: "s",
       firstKeptEntryId: summaryTurnId,
+    };
+    const selfCompaction = {
+      type: "compaction",
+      summary: "s",
+      firstKeptEntryId: null,
     };
     const liveEdit = {
       type: "context_edit",
@@ -2496,13 +2503,19 @@ describe("rewind phase 2: completion", () => {
       details: {},
     };
     const boundary = await fireTurnEndAll(f.pi, f.ctx, message, {
-      entries: [staleEdit, staleCompaction, liveEdit, foreign] as never,
+      entries: [
+        staleEdit,
+        staleCompaction,
+        selfCompaction,
+        liveEdit,
+        foreign,
+      ] as never,
     });
     assert.equal(boundary.continue, true);
     assert.deepEqual(
       boundary.entries.slice(0, -1),
-      [liveEdit, foreign],
-      "stale drafts dropped, valid ones kept in order",
+      [staleCompaction, selfCompaction, liveEdit, foreign],
+      "only the stale context_edit dropped, the rest kept in order",
     );
     assert.equal(boundary.entries.at(-1)?.customType, REWIND_CUSTOM_TYPE);
   });

@@ -205,7 +205,7 @@ Cache behavior on the bridge:
 
 - **The summary costs one live turn.** The summary turn reads the whole live context (from cache) and its output tokens are billed like any turn. A model that keeps calling tools instead of summarizing exhausts `MAX_SUMMARY_ATTEMPTS` and the rewind is cancelled.
 
-- **Other extensions' `turn_end` drafts on the summary turn.** The rewind moves the branch inside its `turn_end` handler. Earlier handlers' `context_edit` / `compaction` drafts that target an entry the rewind abandoned are dropped (pi would otherwise reject the whole boundary list, the continuation included); a handler registered AFTER this extension that returns such a draft still makes pi discard the list, and the run ends on the summary turn with the rewind landed but unannounced.
+- **Other extensions' `turn_end` drafts on the summary turn.** The rewind moves the branch inside its `turn_end` handler. Earlier handlers' `context_edit` drafts that target an entry the rewind abandoned are dropped (pi would otherwise reject the whole boundary list, the continuation included); a handler registered AFTER this extension that returns such a draft still makes pi discard the list, and the run ends on the summary turn with the rewind landed but unannounced.
 
 - **Loading the extension monkey-patches `AgentSession.prototype.prompt` globally.** Every session in the host pi process picks up the patch on import, including sessions that never call `navigate_tree`. The patch is install-on-import and not reversible within a running pi process; restart pi to fully unload it.
 
