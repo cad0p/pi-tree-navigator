@@ -444,6 +444,7 @@ const EXTENSION_SOURCE_DIR = path.join(
 const IMPORT_SURFACE_PACKAGES = [
   "@earendil-works/pi-coding-agent",
   "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-ai",
   "@earendil-works/pi-tui",
   "typebox",
 ];

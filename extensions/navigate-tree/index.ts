@@ -38,7 +38,7 @@
  *     the pi process, including sessions that never call
  *     `navigate_tree`.
  *
- * Verified against pi 1.2.0 via `scripts/pi-upstream-probe.mjs`.
+ * Verified against pi 1.3.0 via `scripts/pi-upstream-probe.mjs`.
  * In-loop context refresh runs through the public `context` extension
  * event (see `buildContextMessages`), not `agent.prepareNextTurn*`
  * reflection. The rewind summary is written in-band by the live model
