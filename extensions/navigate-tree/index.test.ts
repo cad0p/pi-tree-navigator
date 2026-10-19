@@ -3465,6 +3465,49 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
     assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
   });
 
+  it("a branch_summary disk write that throws after pi moved the leaf restores the leaf before failing", async () => {
+    const f = await pending();
+    // pi's branchWithSummary moves the leaf and appends in memory, THEN the
+    // file append throws (session-manager `_appendEntry` \u2192 `_persist`).
+    const internals = f.sm as unknown as { _persist: (e: unknown) => void };
+    const origPersist = internals._persist.bind(f.sm);
+    internals._persist = (entry: unknown) => {
+      if ((entry as { type?: string }).type === "branch_summary") {
+        throw new Error("ENOSPC");
+      }
+      origPersist(entry);
+    };
+    const { entryId, boundary } = await attempt(f, SUMMARY_TEXT);
+    assert.equal(boundary.continue, true);
+    const branch = f.sm.getBranch();
+    assert.ok(
+      !branch.some((e) => e.type === "branch_summary"),
+      "the active branch is not collapsed",
+    );
+    assert.ok(
+      branch.some((e) => e.id === entryId),
+      "the leaf is back on the summary turn's branch",
+    );
+    assert.ok(
+      branch.some(
+        (e) =>
+          e.type === "label" &&
+          e.targetId === entryId &&
+          e.label === "branch:end",
+      ),
+      "restored to the leaf right before the branch call (label entry kept)",
+    );
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(
+      outcome[0].text,
+      "Summarization failed: the branch could not be written (ENOSPC). Nothing was collapsed. Try again.",
+    );
+    assert.ok(hiddenIds(f.sm).has(entryId), "the summary turn is hidden");
+    assert.ok(hiddenIds(f.sm).has(instructionEntryId(f.sm)));
+    assert.equal(f.sm.getLabel(entryId), undefined, "branch: label cleared");
+  });
+
   it("ends when the anchor no longer resolves to the same entry", async () => {
     const f = await pending();
     f.pi.pi.setLabel(f.anchorId, undefined);

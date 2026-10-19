@@ -1534,6 +1534,9 @@ export default function (pi: ExtensionAPI) {
     let readFiles: string[];
     let modifiedFiles: string[];
     let summaryId: string;
+    // The leaf right before the branch call (the label write above appended
+    // an entry, so it is not `oldLeafId`).
+    let leafBeforeBranch: string | null | undefined;
     try {
       ({ entries } = collectEntriesForBranchSummary(
         sm,
@@ -1551,6 +1554,7 @@ export default function (pi: ExtensionAPI) {
       // `fromHook: true` pairs with the `session_tree` payload's
       // `fromExtension: true`, as pi's own navigateTree does for an
       // extension-provided summary.
+      leafBeforeBranch = sm.getLeafId();
       summaryId = sm.branchWithSummary(
         pending.target,
         buildStoredSummary(summaryText, readFiles, modifiedFiles),
@@ -1558,6 +1562,16 @@ export default function (pi: ExtensionAPI) {
         true,
       );
     } catch (err) {
+      // pi's branchWithSummary moves the leaf and appends in memory before
+      // the file append that may throw: put the leaf back, or the session
+      // stays collapsed while the model is told nothing was.
+      try {
+        if (leafBeforeBranch && sm.getLeafId() !== leafBeforeBranch) {
+          sm.branch(leafBeforeBranch);
+        }
+      } catch {
+        // Fail-open: the ending below still reaches the model.
+      }
       // Nothing branched: undo the completion marker, then tell the model,
       // or a text-only summary turn would end the run with no word of it.
       if (branchLabelWritten && summaryEntryId) {
