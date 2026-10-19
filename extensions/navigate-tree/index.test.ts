@@ -117,15 +117,30 @@ interface FakePi {
   sendLog: Array<"sendMessage" | "sendUserMessage">;
   /** Folded `turn_end` boundary results, one per `fireTurnEndAll`. */
   boundaryResults: BoundaryResult[];
+  /** `appendEntry(customType, data)` calls (routed to `sm.appendCustomEntry`). */
+  appendEntryCalls: Array<[string, unknown]>;
+  /** `registerMessageRenderer` registrations, keyed by customType. */
+  messageRenderers: Map<string, (...args: never[]) => unknown>;
+  /** `registerEntryRenderer` registrations, keyed by customType. */
+  entryRenderers: Map<string, (...args: never[]) => unknown>;
 }
 
-/** A `turn_end` boundary entry draft (pi's custom_message shape). */
+/**
+ * A boundary entry draft (pi's `SessionBoundaryDraft` union, loosely typed):
+ * `custom_message` (customType/content/display/details), `custom`
+ * (customType/data), `context_edit` (targetId/replacement) or `compaction`.
+ */
 interface BoundaryDraft {
   type: string;
   customType: string;
   content: string;
   display: boolean;
   details: Record<string, unknown>;
+  data?: Record<string, unknown>;
+  targetId?: string;
+  replacement?: { content: unknown } | null;
+  summary?: string;
+  firstKeptEntryId?: string | null;
 }
 
 /** The folded `turn_end` boundary result, as `emitBoundary` returns it. */
@@ -149,7 +164,26 @@ function makeFakePi(sm: SessionManager): FakePi {
   const sendUserMessageCalls: unknown[][] = [];
   const sendLog: FakePi["sendLog"] = [];
   const boundaryResults: BoundaryResult[] = [];
+  const appendEntryCalls: Array<[string, unknown]> = [];
+  const messageRenderers = new Map<string, (...args: never[]) => unknown>();
+  const entryRenderers = new Map<string, (...args: never[]) => unknown>();
   const pi = {
+    appendEntry(customType: string, data?: unknown) {
+      appendEntryCalls.push([customType, data]);
+      sm.appendCustomEntry(customType, data);
+    },
+    registerMessageRenderer(
+      customType: string,
+      renderer: (...args: never[]) => unknown,
+    ) {
+      messageRenderers.set(customType, renderer);
+    },
+    registerEntryRenderer(
+      customType: string,
+      renderer: (...args: never[]) => unknown,
+    ) {
+      entryRenderers.set(customType, renderer);
+    },
     registerTool(tool: CapturedTool) {
       registered.push(tool);
     },
@@ -183,6 +217,9 @@ function makeFakePi(sm: SessionManager): FakePi {
     sendUserMessageCalls,
     sendLog,
     boundaryResults,
+    appendEntryCalls,
+    messageRenderers,
+    entryRenderers,
   };
 }
 
@@ -211,6 +248,8 @@ interface FakeCtx {
   getContextUsage(): ContextUsage | undefined;
   /** Test-only setter driving `getContextUsage`. */
   setContextUsage(usage: ContextUsage | undefined): void;
+  /** The current abort signal (pi: undefined when not streaming). */
+  signal: AbortSignal | undefined;
 }
 
 function makeCtx(
@@ -251,6 +290,7 @@ function makeCtx(
     setContextUsage(next: ContextUsage | undefined) {
       usage = next;
     },
+    signal: undefined,
   };
 }
 
@@ -462,15 +502,139 @@ function setupRewindable(
 // -----------------------------------------------------------------------------
 
 /**
- * Fire every registered `turn_end` handler in registration order, awaiting
- * each, and fold their results exactly as pi's `ExtensionRunner.emitBoundary`
+ * Commit boundary drafts the way pi's `_commitBoundaryDrafts` does: all or
+ * nothing. pi previews the whole list (`runner.emitBoundary` →
+ * `buildContext`), and a `context_edit` whose target is off the active
+ * branch invalidates it, dropping every draft. Returns false when dropped.
+ */
+function commitBoundaryDrafts(
+  sm: SessionManager,
+  drafts: readonly BoundaryDraft[],
+): boolean {
+  let onBranch: Set<string>;
+  try {
+    onBranch = new Set(sm.getBranch().map((e) => e.id));
+  } catch {
+    return false;
+  }
+  if (
+    drafts.some(
+      (d) => d.type === "context_edit" && !onBranch.has(d.targetId ?? ""),
+    )
+  ) {
+    return false;
+  }
+  for (const draft of drafts) {
+    switch (draft.type) {
+      case "custom_message":
+        sm.appendCustomMessageEntry(
+          draft.customType,
+          draft.content,
+          draft.display,
+          draft.details,
+        );
+        break;
+      case "custom":
+        sm.appendCustomEntry(draft.customType, draft.data);
+        break;
+      case "context_edit":
+        sm.appendContextEdit(
+          draft.targetId as string,
+          (draft.replacement ?? null) as never,
+        );
+        break;
+      case "compaction":
+        sm.appendCompaction(
+          draft.summary ?? "",
+          (draft.firstKeptEntryId ?? null) as never,
+          0,
+          draft.details,
+          true,
+        );
+        break;
+    }
+  }
+  return true;
+}
+
+/**
+ * The turn's persisted entry ids, as pi resolves them for `turn_end`: the
+ * assistant's entry (`messageEntryId`) and the tool results that follow it
+ * on the branch (`toolResults` / `toolResultEntryIds`).
+ */
+function resolveTurnEntries(
+  sm: SessionManager,
+  message: unknown,
+): {
+  messageEntryId: string | undefined;
+  toolResults: unknown[];
+  toolResultEntryIds: string[];
+} {
+  let branch: ReturnType<SessionManager["getBranch"]>;
+  try {
+    branch = sm.getBranch();
+  } catch {
+    // A test that stubs getBranch to throw drives the handlers anyway.
+    branch = [];
+  }
+  const index = branch.findIndex(
+    (e) => e.type === "message" && (e.message as unknown) === message,
+  );
+  if (index < 0) {
+    return {
+      messageEntryId: undefined,
+      toolResults: [],
+      toolResultEntryIds: [],
+    };
+  }
+  const toolResults: unknown[] = [];
+  const toolResultEntryIds: string[] = [];
+  for (const entry of branch.slice(index + 1)) {
+    if (entry.type !== "message" || entry.message.role !== "toolResult") break;
+    toolResults.push(entry.message);
+    toolResultEntryIds.push(entry.id);
+  }
+  return { messageEntryId: branch[index].id, toolResults, toolResultEntryIds };
+}
+
+/**
+ * Fold boundary handlers exactly as pi's `ExtensionRunner.emitBoundary`
  * does: every handler sees the running `{ entries, continue }`, and a result
- * carrying `entries` / `continue` replaces it. The folded result is returned
- * and recorded on `pi.boundaryResults`. `entries` seeds the list (another
- * extension's drafts earlier in the chain). `commit` replicates pi's commit
- * of the drafts onto the session right after the handlers, for tests that
- * assert branch order. `turnIndex` defaults to 0 so the auto start-anchor
- * (default X=2) stays out of the way.
+ * carrying `entries` / `continue` replaces it. Then commit the drafts
+ * all-or-nothing (pi's `_commitBoundaryDrafts`); an invalid list folds to
+ * `{ entries: [], continue: false }` like pi's preview failure.
+ */
+async function foldBoundary(
+  handlers: Array<(e: never, c: never) => unknown>,
+  ctx: FakeCtx,
+  base: Record<string, unknown>,
+  opts: { entries?: BoundaryDraft[]; continue?: boolean; commit?: boolean },
+): Promise<BoundaryResult> {
+  let entries = opts.entries ?? [];
+  let shouldContinue = opts.continue ?? false;
+  for (const handler of handlers) {
+    const result = (await handler(
+      { ...base, entries, continue: shouldContinue } as never,
+      ctx as never,
+    )) as { entries?: BoundaryDraft[]; continue?: boolean } | undefined;
+    if (result?.entries !== undefined) entries = result.entries;
+    if (result?.continue !== undefined) shouldContinue = result.continue;
+  }
+  if (opts.commit === false) return { entries, continue: shouldContinue };
+  if (!commitBoundaryDrafts(ctx.sessionManager, entries)) {
+    return { entries: [], continue: false };
+  }
+  return { entries, continue: shouldContinue };
+}
+
+/**
+ * Fire every registered `turn_end` handler in registration order, awaiting
+ * each, with the event fields pi passes (`messageEntryId`, `toolResults`,
+ * `toolResultEntryIds`, `outcome`), and fold + commit their results (see
+ * `foldBoundary`). The folded result is returned and recorded on
+ * `pi.boundaryResults`. `entries` seeds the list (another extension's drafts
+ * earlier in the chain). `commit: false` skips pi's commit. `turnIndex`
+ * defaults to 0 so the auto start-anchor (default X=2) stays out of the way.
  */
 async function fireTurnEndAll(
   pi: FakePi,
@@ -480,40 +644,103 @@ async function fireTurnEndAll(
     turnIndex?: number;
     entries?: BoundaryDraft[];
     commit?: boolean;
+    messageEntryId?: string;
   } = {},
 ): Promise<BoundaryResult> {
   const handlers = pi.onCalls.get("turn_end");
   assert.ok(handlers, "factory must register turn_end handlers");
-  let entries = opts.entries ?? [];
-  let shouldContinue = false;
-  for (const handler of handlers) {
-    const result = (await handler(
+  const resolved = resolveTurnEntries(ctx.sessionManager, message);
+  const stopReason = (message as { stopReason?: string } | undefined)
+    ?.stopReason;
+  const folded = await foldBoundary(
+    handlers,
+    ctx,
+    {
+      type: "turn_end",
+      turnIndex: opts.turnIndex ?? 0,
+      message,
+      toolResults: resolved.toolResults,
+      messageEntryId: opts.messageEntryId ?? resolved.messageEntryId,
+      toolResultEntryIds: resolved.toolResultEntryIds,
+      outcome:
+        stopReason === "aborted"
+          ? "aborted"
+          : stopReason === "error"
+            ? "error"
+            : "completed",
+    },
+    { ...opts, commit: opts.commit ?? false },
+  );
+  pi.boundaryResults.push(folded);
+  return folded;
+}
+
+/** Fire every `agent_before_settle` handler (a boundary, folded + committed). */
+async function fireAgentBeforeSettle(
+  pi: FakePi,
+  ctx: FakeCtx,
+  opts: {
+    outcome?: "completed" | "aborted" | "error";
+    continue?: boolean;
+    entries?: BoundaryDraft[];
+  } = {},
+): Promise<BoundaryResult> {
+  const handlers = pi.onCalls.get("agent_before_settle") ?? [];
+  const folded = await foldBoundary(
+    handlers,
+    ctx,
+    { type: "agent_before_settle", outcome: opts.outcome ?? "completed" },
+    opts,
+  );
+  pi.boundaryResults.push(folded);
+  return folded;
+}
+
+/** Fire every `agent_settled` handler. */
+async function fireAgentSettled(
+  pi: FakePi,
+  ctx: FakeCtx,
+  aborted = false,
+): Promise<void> {
+  for (const handler of pi.onCalls.get("agent_settled") ?? []) {
+    await handler({ type: "agent_settled", aborted } as never, ctx as never);
+  }
+}
+
+/** Append a compaction (as pi does) and fire every `session_compact` handler. */
+async function fireSessionCompact(
+  pi: FakePi,
+  ctx: FakeCtx,
+  firstKeptEntryId: string,
+  reason: "manual" | "threshold" | "overflow" = "threshold",
+): Promise<string> {
+  const sm = ctx.sessionManager;
+  const id = sm.appendCompaction("compacted", firstKeptEntryId, 1000);
+  for (const handler of pi.onCalls.get("session_compact") ?? []) {
+    await handler(
       {
-        type: "turn_end",
-        turnIndex: opts.turnIndex ?? 0,
-        message,
-        toolResults: [],
-        entries,
-        continue: shouldContinue,
+        type: "session_compact",
+        compactionEntry: sm.getEntry(id),
+        fromExtension: false,
+        reason,
+        willRetry: reason === "overflow",
       } as never,
       ctx as never,
-    )) as { entries?: BoundaryDraft[]; continue?: boolean } | undefined;
-    if (result?.entries !== undefined) entries = result.entries;
-    if (result?.continue !== undefined) shouldContinue = result.continue;
+    );
   }
-  const folded = { entries, continue: shouldContinue };
-  pi.boundaryResults.push(folded);
-  if (opts.commit) {
-    for (const draft of entries) {
-      ctx.sessionManager.appendCustomMessageEntry(
-        draft.customType,
-        draft.content,
-        draft.display,
-        draft.details,
-      );
-    }
-  }
-  return folded;
+  return id;
+}
+
+/** Fire the `context` handler and return the messages it would send. */
+function fireContext(pi: FakePi, ctx: FakeCtx): Array<Record<string, unknown>> {
+  const handlers = pi.onCalls.get("context");
+  assert.ok(handlers, "factory must register a context handler");
+  assert.equal(handlers.length, 1);
+  const result = handlers[0](
+    { type: "context", messages: [] } as never,
+    ctx as never,
+  ) as { messages: Array<Record<string, unknown>> };
+  return result.messages;
 }
 
 /** Fire the `tool_call` gate for a tool call in `ctx`'s session. */
