@@ -928,8 +928,10 @@ export const SUMMARY_PENDING_BLOCK_REASON = `${TOOL_NAME}: blocked: the model tr
 export const SOLO_REWIND_REFUSAL =
   "rewind must be the only tool call in its message — re-issue only the rewind, alone. The other calls in this message ran normally.";
 
-/** Refusal of a rewind issued by another tool (e.g. a codemode script). */
-export const NESTED_REWIND_REFUSAL = `rewind cannot be called from inside another tool — call ${TOOL_NAME} directly.`;
+/** pi-codemode's tool name: its scripts issue nested calls (#103). */
+const CODEMODE_TOOL_NAME = "codemode";
+/** Refusal of a codemode script's rewind that is not its first nested call (#103). */
+export const NESTED_REWIND_REFUSAL = `rewind from a codemode script must be the script's first nested call — call ${TOOL_NAME} directly, or start the script with it.`;
 
 /** The rewind's tool result (#90): it only reports that the rewind was accepted. */
 export function buildRewindAcceptedText(
@@ -1486,6 +1488,10 @@ export default function (pi: ExtensionAPI) {
   // Pending in-band rewinds (#80), keyed by session id: set by the rewind
   // tool call, completed or ended by a later boundary / event (#90).
   const pendingRewinds = new Map<string, PendingRewind>();
+  // pi-codemode nested calls (#103): nested calls seen so far per codemode
+  // call, and the codemode call each accepted nested rewind lands on.
+  const nestedCallCounts = new Map<string, number>();
+  const nestedRewindCallers = new Map<string, string>();
 
   // Turns the rewind handler owned (the rewind call's turn, summary
   // attempts, the completing turn): the hint and the auto start anchor skip
@@ -2186,18 +2192,35 @@ export default function (pi: ExtensionAPI) {
     ];
   }
 
-  // A rewind issued by another tool (pi-codemode `<parent>/<n>` calls never
-  // appear in the transcript) is refused. While a rewind waits for its
-  // summary, every tool call is blocked: the next turn must be the summary
-  // itself. The blocked attempt is hidden from the model (#90).
+  // While a rewind waits for its summary, every tool call is blocked: the
+  // next turn must be the summary itself. The blocked attempt is hidden from
+  // the model (#90).
+  //
+  // pi-codemode (#103): a script's nested calls reach this gate as tool calls
+  // whose `parentToolCallId` is the codemode call's id. A nested rewind is
+  // accepted only as the script's first nested call; `execute` lands it on
+  // the codemode call, so it behaves like a direct rewind. Under a forced
+  // rewind (#101) the top-level `codemode` call passes so its script can
+  // rewind, and every other nested call is blocked: the gate still means
+  // "rewind only".
   pi.on("tool_call", (event, ctx) => {
-    if (
+    const isRewind =
       event.toolName === TOOL_NAME &&
+      (event.input as { action?: unknown } | undefined)?.action === "rewind";
+    const parentId =
       typeof event.parentToolCallId === "string" &&
-      event.parentToolCallId.length > 0 &&
-      (event.input as { action?: unknown } | undefined)?.action === "rewind"
-    ) {
-      return { block: true, reason: NESTED_REWIND_REFUSAL };
+      event.parentToolCallId.length > 0
+        ? event.parentToolCallId
+        : undefined;
+    if (parentId !== undefined) {
+      const priorNested = nestedCallCounts.get(parentId) ?? 0;
+      nestedCallCounts.set(parentId, priorNested + 1);
+      if (isRewind) {
+        if (priorNested > 0) {
+          return { block: true, reason: NESTED_REWIND_REFUSAL };
+        }
+        nestedRewindCallers.set(event.toolCallId, parentId);
+      }
     }
     let sessionId: string;
     try {
@@ -2210,19 +2233,18 @@ export default function (pi: ExtensionAPI) {
     // must hold).
     const forced = forcedActive(sessionId);
     if (livePending(ctx.sessionManager as SessionManager, sessionId)) {
+      // A blocked call gets no tool_result, so its nested-rewind entry (#103)
+      // is retired here.
+      nestedRewindCallers.delete(event.toolCallId);
       return {
         block: true,
         reason: SUMMARY_PENDING_BLOCK_REASON,
         ...(forced ? { terminate: true } : {}),
       };
     }
-    if (
-      forced &&
-      !(
-        event.toolName === TOOL_NAME &&
-        (event.input as { action?: unknown } | undefined)?.action === "rewind"
-      )
-    ) {
+    const topLevelCodemode =
+      event.toolName === CODEMODE_TOOL_NAME && parentId === undefined;
+    if (forced && !isRewind && !topLevelCodemode) {
       return {
         block: true,
         reason: FORCED_REWIND_BLOCK_REASON,
@@ -3113,6 +3135,9 @@ export default function (pi: ExtensionAPI) {
   // extension's `tool_result` view. Content is left untouched, so the model
   // still reads the refusal copy.
   pi.on("tool_result", (event) => {
+    // Retire the pi-codemode bookkeeping of this call (#103).
+    nestedRewindCallers.delete(event.toolCallId);
+    nestedCallCounts.delete(event.toolCallId);
     if (event.toolName !== TOOL_NAME) return undefined;
     const details = event.details as { refusal?: boolean } | undefined;
     return details?.refusal === true ? { isError: true } : undefined;
@@ -3501,7 +3526,10 @@ Operations (set \`action\`):
       // recorded. pi runs the batch in order (`executionMode: sequential`):
       // calls before it already ran, calls after it run normally since
       // nothing is pending. Detection fails open (`null`).
-      const batch = findInFlightAssistantToolCalls(sm, toolCallId);
+      // A rewind from a codemode script is keyed on the codemode call (#103):
+      // that call is the one in the assistant message and the transcript.
+      const callerId = nestedRewindCallers.get(toolCallId) ?? toolCallId;
+      const batch = findInFlightAssistantToolCalls(sm, callerId);
       if (batch && batch.length > 1) {
         return toolError(SOLO_REWIND_REFUSAL, {
           rejected: "batched-rewind",
@@ -3644,7 +3672,7 @@ Operations (set \`action\`):
       // served from the prompt cache. Until it lands every tool call is
       // blocked.
       pendingRewinds.set(sessionId, {
-        toolCallId,
+        toolCallId: callerId,
         rewindEntryId: oldLeaf,
         target,
         rewindTo: p.rewindTo,

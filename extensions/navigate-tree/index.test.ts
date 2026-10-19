@@ -4090,39 +4090,51 @@ describe("rewind: solo-call guard (#37, restored by #90 S6)", () => {
     assert.equal(__testHooks.findInFlightAssistantToolCalls(sm, "nope"), null);
   });
 
-  it("blocks a nested rewind (issued by another tool)", () => {
+  it("accepts a codemode script's rewind only as its first nested call (#103)", () => {
     const { pi, ctx } = setup();
     const handlers = pi.onCalls.get("tool_call");
     assert.ok(handlers);
-    const result = handlers[0](
-      {
-        type: "tool_call",
-        toolCallId: "tc-code/1",
-        parentToolCallId: "tc-code",
-        toolName: TOOL_NAME,
-        input: { action: "rewind" },
-      } as never,
-      ctx as never,
-    );
-    assert.deepEqual(result, { block: true, reason: NESTED_REWIND_REFUSAL });
-    assert.equal(
-      NESTED_REWIND_REFUSAL,
-      "rewind cannot be called from inside another tool — call navigate_tree directly.",
-    );
-    // A nested list is fine.
-    assert.equal(
+    const nested = (id: string, action: string) =>
       handlers[0](
         {
           type: "tool_call",
-          toolCallId: "tc-code/2",
+          toolCallId: id,
           parentToolCallId: "tc-code",
           toolName: TOOL_NAME,
-          input: { action: "list" },
+          input: { action },
         } as never,
         ctx as never,
-      ),
-      undefined,
-    );
+      );
+    // The first nested call may be the rewind: it lands on tc-code.
+    assert.equal(nested("tc-code/1", "rewind"), undefined);
+    // A second nested rewind is refused.
+    assert.deepEqual(nested("tc-code/2", "rewind"), {
+      block: true,
+      reason: NESTED_REWIND_REFUSAL,
+    });
+  });
+
+  it("refuses a codemode script's rewind after another nested call (#103)", () => {
+    const { pi, ctx } = setup();
+    const handlers = pi.onCalls.get("tool_call");
+    assert.ok(handlers);
+    const nested = (id: string, action: string) =>
+      handlers[0](
+        {
+          type: "tool_call",
+          toolCallId: id,
+          parentToolCallId: "tc-code",
+          toolName: TOOL_NAME,
+          input: { action },
+        } as never,
+        ctx as never,
+      );
+    // A nested list is fine, but then the script's rewind is not its first call.
+    assert.equal(nested("tc-code/1", "list"), undefined);
+    assert.deepEqual(nested("tc-code/2", "rewind"), {
+      block: true,
+      reason: NESTED_REWIND_REFUSAL,
+    });
   });
 });
 
@@ -8017,6 +8029,180 @@ Active anchors (root → leaf, % of 100k):
       assert.equal(summary.boundary.continue, true);
       assert.equal(forcedDrafts(summary.boundary)[0].details.status, "done");
       assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  /** A pi-codemode nested call: the gate sees its `parentToolCallId` (#103). */
+  function fireNested(
+    f: Forced,
+    toolCallId: string,
+    parentId: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): unknown {
+    const handlers = f.pi.onCalls.get("tool_call");
+    assert.ok(handlers, "factory must register a tool_call handler");
+    return handlers[0](
+      {
+        type: "tool_call",
+        toolCallId,
+        parentToolCallId: parentId,
+        toolName,
+        input,
+      } as never,
+      f.ctx as never,
+    );
+  }
+
+  const CODE = 'await navigate_tree({ action: "rewind" })';
+
+  /** requestRewind through a codemode script whose first nested call rewinds (#103). */
+  async function codemodeRewind(f: Forced, codeId = "tc-code") {
+    const call = appendToolCallAssistant(f.sm, [
+      { id: codeId, name: "codemode", arguments: { code: CODE } },
+    ]);
+    assert.equal(
+      fireToolCall(f.pi, f.ctx, "codemode", { code: CODE }),
+      undefined,
+    );
+    const nestedId = `${codeId}/1`;
+    assert.equal(
+      fireNested(f, nestedId, codeId, TOOL_NAME, REWIND_ARGS),
+      undefined,
+    );
+    const result = await f.tool.execute(
+      nestedId,
+      REWIND_ARGS,
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    appendToolResult(f.sm, codeId, "codemode", result.content[0].text);
+    const turn = await fireTurnEndAll(f.pi, f.ctx, call.message);
+    return { result, turn };
+  }
+
+  it("codemode (#103): under a forced rewind the top-level codemode call passes; nested non-rewind calls are blocked", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      assert.equal(
+        fireToolCall(f.pi, f.ctx, "codemode", { code: CODE }),
+        undefined,
+      );
+      const blocked = {
+        block: true,
+        reason: FORCED_REWIND_BLOCK_REASON,
+        terminate: true,
+      };
+      assert.deepEqual(
+        fireNested(f, "tc-code/1", "tc-code", "read", { path: "x" }),
+        blocked,
+      );
+      assert.deepEqual(
+        fireNested(f, "tc-code/2", "tc-code", TOOL_NAME, { action: "list" }),
+        blocked,
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("codemode (#103): a forced rewind issued by a script's first nested call lands like a direct one", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const { result, turn } = await codemodeRewind(f);
+      assert.notEqual(result.content[0].text, SOLO_REWIND_REFUSAL);
+      assert.equal(
+        summaryRequestDraftOf(f.pi).customType,
+        SUMMARY_REQUEST_CUSTOM_TYPE,
+      );
+      assert.equal(turn.continue, true);
+      const summary = await summaryTurn(f, SUMMARY_TEXT, "stop", {
+        commit: true,
+      });
+      assert.equal(summary.boundary.continue, true);
+      assert.equal(forcedDrafts(summary.boundary)[0].details.status, "done");
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate lifted");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("codemode (#103): a voluntary rewind through a script lands as done, like a direct one", async () => {
+    const f = await forcedSetup();
+    try {
+      await codemodeRewind(f);
+      const summary = await summaryTurn(f, SUMMARY_TEXT, "stop", {
+        commit: true,
+      });
+      assert.equal(summary.boundary.continue, true);
+      assert.equal(forcedDrafts(summary.boundary)[0].details.status, "done");
+      // A clean landing writes no outcome entry (only failed / aborted endings do).
+      assert.equal(outcomeEntries(f.sm).length, 0);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("codemode (#103): a script's rewind in a message with other calls is refused by the solo rule", async () => {
+    const f = await forcedSetup();
+    try {
+      appendToolCallAssistant(f.sm, [
+        { id: "tc-code", name: "codemode", arguments: { code: CODE } },
+        { id: "tc-read", name: "read", arguments: { path: "x" } },
+      ]);
+      assert.equal(
+        fireNested(f, "tc-code/1", "tc-code", TOOL_NAME, REWIND_ARGS),
+        undefined,
+      );
+      const result = await f.tool.execute(
+        "tc-code/1",
+        REWIND_ARGS,
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      assert.equal(result.content[0].text, SOLO_REWIND_REFUSAL);
+      assert.equal(outcomeEntries(f.sm).length, 0);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("codemode (#103): a script with no rewind is a failed forced attempt; the third ends with D8", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const attempt = async (id: string) => {
+        const call = appendToolCallAssistant(f.sm, [
+          { id, name: "codemode", arguments: { code: CODE } },
+        ]);
+        assert.equal(
+          fireToolCall(f.pi, f.ctx, "codemode", { code: CODE }),
+          undefined,
+        );
+        assert.deepEqual(fireNested(f, `${id}/1`, id, "read", { path: "x" }), {
+          block: true,
+          reason: FORCED_REWIND_BLOCK_REASON,
+          terminate: true,
+        });
+        appendToolResult(f.sm, id, "codemode", "blocked");
+        return fireTurnEndAll(f.pi, f.ctx, call.message);
+      };
+      const a1 = await attempt("c1");
+      assert.equal(a1.continue, true);
+      assert.deepEqual(forcedDrafts(a1), []);
+      assert.equal((await attempt("c2")).continue, true);
+      const a3 = await attempt("c3");
+      assert.equal(a3.continue, false);
+      assert.deepEqual(forcedDrafts(a3)[0].details, {
+        status: "failed",
+        reason: COMPACTION_FAILED_NO_REWIND,
+      });
     } finally {
       cleanupConfigFixture(f.fixture);
     }
