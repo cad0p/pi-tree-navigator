@@ -974,6 +974,23 @@ async function rewindFixture(
 // shape, and the post-rewind invariant (the README's headline feature).
 // =============================================================================
 
+/**
+ * pi-ai's own `estimateContextTokens` (#101). The package root does not export
+ * it and the exports map blocks subpaths, so resolve the file beside the entry.
+ */
+async function piAiEstimateContextTokens(messages: unknown[]) {
+  const entry = import.meta.resolve("@earendil-works/pi-ai");
+  const { estimateContextTokens } = await import(
+    new URL("./utils/estimate.js", entry).href
+  );
+  return estimateContextTokens(messages) as {
+    tokens: number;
+    usageTokens: number;
+    trailingTokens: number;
+    lastUsageIndex: number | null;
+  };
+}
+
 describe("context event handler", () => {
   it("registers exactly one context handler via pi.on", () => {
     const { pi } = setup();
@@ -1038,6 +1055,110 @@ describe("context event handler", () => {
       "the raw entry walk still contains the omitted entry",
     );
     assert.equal(projected.length, sm.buildSessionContext().messages.length);
+  });
+
+  it("withheld results zero the usage of the assistants after them (#101)", async () => {
+    // pi's output clamp sizes max_tokens from the last assistant usage. That
+    // usage still counts the withheld result, so the clamp saw no room and
+    // capped the reply at 1 token (a false overflow). The assistant before
+    // the result counted only earlier content, so its usage stays exact.
+    const { sm } = setup();
+    const at = Date.now();
+    const model = {
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+    };
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "read it" }],
+      timestamp: at,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
+      ...model,
+      stopReason: "toolUse",
+      timestamp: at,
+      usage: usageOf(10),
+    } as never);
+    const resultId = sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "c1",
+      toolName: "read",
+      content: [{ type: "text", text: "x".repeat(40_000) }],
+      isError: false,
+      timestamp: at,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "next" }],
+      ...model,
+      stopReason: "endTurn",
+      timestamp: at,
+      usage: usageOf(90_000),
+    } as never);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "go on" }],
+      timestamp: at,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      ...model,
+      stopReason: "endTurn",
+      timestamp: at,
+      usage: usageOf(95_000),
+    } as never);
+    sm.appendContextEdit(resultId, {
+      content: [{ type: "text", text: "[navigate_tree] Output withheld" }],
+    } as never);
+
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.deepEqual(
+      projected.flatMap((m) =>
+        m.role === "assistant" ? [m.usage.totalTokens] : [],
+      ),
+      [10, 0, 0],
+    );
+    // pi-ai falls back to the exact usage before the edit, and the rest is
+    // chars/4: the notice and two short messages, not the stale 95k.
+    const estimate = await piAiEstimateContextTokens(projected);
+    assert.equal(estimate.lastUsageIndex, 1);
+    assert.equal(estimate.usageTokens, 10);
+    assert.ok(
+      estimate.trailingTokens < 1_000,
+      `trailing estimate should be chars/4, got ${estimate.trailingTokens}`,
+    );
+    // The session's own objects are untouched (the clone is per request).
+    assert.deepEqual(
+      sm
+        .buildSessionContext()
+        .messages.flatMap((m) =>
+          m.role === "assistant" ? [m.usage.totalTokens] : [],
+        ),
+      [10, 90_000, 95_000],
+    );
+  });
+
+  it("without context_edits the projection keeps every assistant's usage (#101)", () => {
+    const { sm } = setup();
+    appendTurn(sm, "u1", "a1", 100);
+    appendTurn(sm, "u2", "a2", 90_000);
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.deepEqual(
+      projected,
+      sm
+        .buildSessionContext()
+        .messages.filter((message) => message.role !== "system"),
+    );
+    assert.deepEqual(
+      projected.flatMap((m) =>
+        m.role === "assistant" ? [m.usage.totalTokens] : [],
+      ),
+      [100, 90_000],
+    );
   });
 
   it("handler returns messages = tree projection on every call (no leaf-gating)", () => {

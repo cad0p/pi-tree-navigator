@@ -384,20 +384,70 @@ export function buildContextMessages(
   // mutate the session's own message objects). Keyed by the tool-result
   // entry id the outcome recorded.
   const outcomes = collectRewindOutcomes(sm);
-  const messages = entries.flatMap((e) => {
+  // Stale usage (#101): an assistant's `usage` measures the whole context it
+  // was sent with. A `context_edit` that replaces or omits an EARLIER entry
+  // (a withheld result, a hidden attempt) makes that usage overstate what is
+  // sent now, and pi's output clamp sizes max_tokens from it (window -
+  // estimate - 4096, floored at 1). From the first edited entry on, zero the
+  // usage: pi-ai then falls back to an older exact usage or chars/4. Earlier
+  // assistants counted only unedited content, so they keep theirs.
+  const staleFrom = firstEditedIndex(entries);
+  const messages = entries.flatMap((e, i) => {
     const text = e.sourceEntry ? outcomes.get(e.sourceEntry.id) : undefined;
-    if (text === undefined) return e.messages;
-    return e.messages.map((message) =>
-      message.role === "toolResult"
-        ? {
-            ...message,
-            content: [{ type: "text" as const, text }],
-            isError: true,
-          }
-        : message,
-    );
+    const withOutcome =
+      text === undefined
+        ? e.messages
+        : e.messages.map((message) =>
+            message.role === "toolResult"
+              ? {
+                  ...message,
+                  content: [{ type: "text" as const, text }],
+                  isError: true,
+                }
+              : message,
+          );
+    return i < staleFrom ? withOutcome : withOutcome.map(dropStaleUsage);
   });
   return messages.filter((message) => message.role !== "system");
+}
+
+/**
+ * Index of the first entry a `context_edit` targets (#101), or Infinity when
+ * none is in `entries`. Targets outside the projection are ignored.
+ */
+function firstEditedIndex(
+  entries: Array<{ sourceEntry: SessionEntry | null }>,
+): number {
+  const targets = new Set(
+    entries.flatMap((e) =>
+      e.sourceEntry?.type === "context_edit" ? [e.sourceEntry.targetId] : [],
+    ),
+  );
+  const at = entries.findIndex(
+    (e) => e.sourceEntry !== null && targets.has(e.sourceEntry.id),
+  );
+  return at < 0 ? Number.POSITIVE_INFINITY : at;
+}
+
+/**
+ * `message` with a zeroed usage when it is an assistant (#101). Zeroed, not
+ * deleted: pi-ai reads `usage.totalTokens` unguarded and would throw. Zero
+ * totals are skipped, and every field is zeroed because `calculateContextTokens`
+ * falls back to the four parts when `totalTokens` is 0.
+ */
+function dropStaleUsage(message: AgentMessage): AgentMessage {
+  if (message.role !== "assistant") return message;
+  return {
+    ...message,
+    usage: {
+      ...message.usage,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+    },
+  };
 }
 
 /** True for the summary instruction entry of the rewind `toolCallId` (#90). */
