@@ -38,6 +38,7 @@ import {
   type ContextUsage,
   type ExtensionAPI,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -8278,6 +8279,34 @@ Active anchors (root → leaf, % of 100k):
         assert.equal(f.ctx.notifyCalls.length, trusted ? 1 : 0);
       } finally {
         cleanupConfigFixture(fixture);
+      }
+    }
+  });
+
+  it("D9 (S3): the live session's compaction setting decides, not the disk (#101)", async () => {
+    for (const live of [true, false]) {
+      // The disk says the opposite of the session's in-memory settings.
+      const f = await forcedSetup({
+        piSettings: { compaction: { enabled: !live } },
+      });
+      try {
+        const session = {
+          sessionManager: f.sm,
+          settingsManager: SettingsManager.inMemory({
+            compaction: { enabled: live },
+          }),
+        };
+        __testHooks.captureSession(session as unknown as AgentSession);
+        f.ctx.setContextUsage(usageAt(90, WINDOW));
+        fireTurnEnd(f.pi, f.ctx);
+        assert.equal(
+          f.pi.sendMessageCalls.length,
+          live ? 0 : 1,
+          `live=${live}`,
+        );
+        assert.equal(f.ctx.notifyCalls.length, live ? 1 : 0, `live=${live}`);
+      } finally {
+        cleanupConfigFixture(f.fixture);
       }
     }
   });

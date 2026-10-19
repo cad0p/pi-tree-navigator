@@ -229,6 +229,11 @@ interface PiInternals {
     emit?: (event: unknown) => Promise<unknown> | unknown;
   };
   sessionManager: SessionManager;
+  /**
+   * Plain field on `AgentSession` in pi 1.3.0 (#101, S3): the live settings
+   * pi decides compaction from. Optional: older pi versions may lack it.
+   */
+  settingsManager?: SettingsManager;
 }
 
 function asInternals(session: AgentSession): PiInternals {
@@ -1509,17 +1514,30 @@ export default function (pi: ExtensionAPI) {
     projectTrusted: boolean;
   } | null = null;
 
-  /** pi's compaction settings for `model` (#101, S3/S4), or `null`. */
+  /**
+   * pi's compaction settings for `model` (#101, S3/S4/D9), or `null`. Read
+   * from the captured session's live settings manager, the one pi decides
+   * from; the disk (with the session's project trust) only when no session
+   * is captured.
+   */
   function piCompaction(
+    sm: SessionManager,
     model: OverflowModel | undefined,
   ): { enabled: boolean; reserveTokens: number } | null {
-    if (!piSettingsSource) return null;
     try {
-      const settings = SettingsManager.create(
-        piSettingsSource.cwd,
-        piSettingsSource.agentDir,
-        { projectTrusted: piSettingsSource.projectTrusted },
-      ).getCompactionSettings(model);
+      const session = findOwningSession(sm);
+      let settingsManager = session
+        ? asInternals(session).settingsManager
+        : undefined;
+      if (!settingsManager) {
+        if (!piSettingsSource) return null;
+        settingsManager = SettingsManager.create(
+          piSettingsSource.cwd,
+          piSettingsSource.agentDir,
+          { projectTrusted: piSettingsSource.projectTrusted },
+        );
+      }
+      const settings = settingsManager.getCompactionSettings(model);
       return {
         enabled: settings.enabled,
         reserveTokens: settings.reserveTokens,
@@ -1537,6 +1555,7 @@ export default function (pi: ExtensionAPI) {
    * off.
    */
   function rewindCompactionTarget(
+    sm: SessionManager,
     sessionId: string,
     model: OverflowModel | undefined,
   ): { contextWindow: number; target: number } | null {
@@ -1554,7 +1573,7 @@ export default function (pi: ExtensionAPI) {
       `${model.provider}/${model.id}`,
     );
     if (reserve === null) return null;
-    const pc = piCompaction(model);
+    const pc = piCompaction(sm, model);
     if (!pc || pc.enabled) return null;
     return {
       contextWindow: model.contextWindow,
@@ -2263,7 +2282,7 @@ export default function (pi: ExtensionAPI) {
     // Another extension's `continue` owns the turn.
     if (!event.continue && messageEntryId && overflowed(message, ctx.model)) {
       overflowedTurns.add(message);
-      const at = rewindCompactionTarget(sessionId, ctx.model);
+      const at = rewindCompactionTarget(sm, sessionId, ctx.model);
       if (at) {
         rewindTurns.add(message);
         if (message.stopReason === "error") return;
@@ -2531,7 +2550,7 @@ export default function (pi: ExtensionAPI) {
           "error" &&
         overflowed(failed, ctx.model)
       ) {
-        const at = rewindCompactionTarget(sessionId, ctx.model);
+        const at = rewindCompactionTarget(sm, sessionId, ctx.model);
         const result = at
           ? startRewindCompaction(sm, sessionId, at, last.id, [last.id], {
               stepAsideWhenNothingWithheld: false,
@@ -3129,7 +3148,7 @@ export default function (pi: ExtensionAPI) {
     // the hint and rewind-driven compaction are off, and the crossing shows
     // why (TUI only; headless stays silent). The crossing is spent.
     // (`compaction.enabled` has no per-model override: no `ctx.model` read.)
-    if (piCompaction(undefined)?.enabled) {
+    if (piCompaction(sm as SessionManager, undefined)?.enabled) {
       if (ctx.hasUI) ctx.ui.notify(REWIND_COMPACTION_OFF_TEXT, "error");
       return;
     }
