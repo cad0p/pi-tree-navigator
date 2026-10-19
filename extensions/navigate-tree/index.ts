@@ -76,8 +76,10 @@ import {
 } from "./config.ts";
 import { estimateContextTokens } from "./context-tokens.ts";
 import {
+  type AnchorTableRow,
   BRANCH_LABEL_PREFIX,
   extractTextContent,
+  formatAnchorTable,
   formatContextDelta,
   formatPct1,
   formatWindow,
@@ -172,14 +174,6 @@ const LIST_HINT_MAX_LENGTH = 50;
 // response is a single block of prose (not a column-aligned table) so it
 // can afford a longer hint than `list`'s per-row preview.
 const ANCHOR_HINT_MAX_LENGTH = 60;
-// padStart width for the percentage column in `list` output. The longest
-// percent label is "100.0%" = 6 chars; "99.9%" = 5 chars covers the
-// realistic worst case and keeps the column tight.
-const LIST_PCT_COL_WIDTH = 5;
-// padEnd width for the anchor-name column in `list` output. MAX_NAME_LENGTH
-// is 40, but the typical kebab-case name is 8–20 chars; 28 keeps the
-// hint column visible without truncating common names.
-const LIST_LABEL_COL_WIDTH = 28;
 const ORIG_PROMPT_KEY = Symbol.for("navigate-tree.orig-prompt");
 
 // Two warnings: list-site (read-only path; warns about the next turn's
@@ -584,9 +578,9 @@ function estimateAtEntry(
 
 /**
  * Every active anchor — chronological root→leaf, same walk order as `list`
- * — with its cumulative context percentage, rendered as
- * `'a' 4.1% · 'b' 22.0% of 1.0M`. Shared by the min-savings rejection and
- * the rewind hint so both name the same targets the same way. A manual
+ * — with its cumulative context percentage, rendered as the shared anchor
+ * table (#101, D19). Shared by the min-savings rejection, the rewind hint
+ * and the forced-rewind message so all name the same targets the same way. A manual
  * `/tree` label `anchor:x` CAN put the same name on two entries —
  * duplicates print twice, exactly as `list` prints them. Names `rewindTo`
  * would reject (e.g. an empty `anchor:` label) are skipped: both callers
@@ -599,21 +593,21 @@ function formatActiveAnchors(
   byId: Map<string, SessionEntry>,
 ): { names: string[]; text: string } {
   const names: string[] = [];
-  const parts: string[] = [];
+  const rows: AnchorTableRow[] = [];
   for (const e of sm.getBranch()) {
     const lbl = sm.getLabel(e.id);
     if (!lbl?.startsWith(LABEL_PREFIX)) continue;
     const name = lbl.slice(LABEL_PREFIX.length);
     if (!isValidName(name)) continue;
     names.push(name);
-    parts.push(
-      `'${name}' ${formatPct1(estimateAtEntry(allEntries, e.id, byId), cw)}`,
-    );
+    rows.push({
+      pct: formatPct1(estimateAtEntry(allEntries, e.id, byId), cw),
+      name,
+    });
   }
-  // cw=0 → percents fall back to formatPct1's k-format and the window
-  // suffix is omitted, mirroring `list`'s header behavior.
-  const suffix = cw > 0 ? ` of ${formatWindow(cw)}` : "";
-  return { names, text: `${parts.join(" · ")}${suffix}` };
+  // cw=0 → percents fall back to formatPct1's k-format and the header
+  // drops the window, mirroring `list`.
+  return { names, text: formatAnchorTable(rows, cw) };
 }
 
 /**
@@ -639,7 +633,7 @@ function buildMinSavingsRejection(
     anchors.names[0] === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
       : "Rewind further back to actually free context, or keep working.";
-  return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance} Active anchors: ${anchors.text}`;
+  return `Rewinding to '${rewindTo}' (as '${newLabel}') would free only ~${formatPct1(apparentSavings, 0)} tokens. ${guidance}\n${anchors.text}`;
 }
 
 /**
@@ -2686,32 +2680,32 @@ Operations (set \`action\`):
         const totalTokens = estimateActiveBranchTokens(sm);
         const reflectionOk = !!findOwningSession(sm);
 
-        const lines: string[] = [];
+        const rows: AnchorTableRow[] = [];
         for (const e of path) {
           const lbl = sm.getLabel(e.id);
           if (lbl?.startsWith(LABEL_PREFIX)) {
             const name = lbl.slice(LABEL_PREFIX.length);
             const tokensAt = estimateAtEntry(allEntries, e.id, byId);
-            const pct = formatPct1(tokensAt, cw).padStart(LIST_PCT_COL_WIDTH);
             const hint = findLabelHint(sm, e.id, LIST_HINT_MAX_LENGTH);
-            const hintPart = hint ? `  (after: “${hint}”)` : "";
-            lines.push(
-              `  ${pct}  ${name.padEnd(LIST_LABEL_COL_WIDTH)}${hintPart}`,
-            );
+            rows.push({
+              pct: formatPct1(tokensAt, cw),
+              name,
+              ...(hint ? { after: hint } : {}),
+            });
           }
         }
 
         const reflectionWarning = reflectionOk
           ? ""
           : ` · ${REFLECTION_BOOTSTRAP_WARNING_LIST}`;
-        const header = `[list] · ${lines.length} label${lines.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
-        const body = lines.length
-          ? `Active labels (root → leaf):\n${lines.join("\n")}`
+        const header = `[list] · ${rows.length} label${rows.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
+        const body = rows.length
+          ? formatAnchorTable(rows, cw)
           : "No labels on the active branch.";
         return {
           content: [{ type: "text", text: `${header}\n\n${body}` }],
           details: {
-            count: lines.length,
+            count: rows.length,
             contextTokens: totalTokens,
             contextWindow: cw,
             reflectionOk,

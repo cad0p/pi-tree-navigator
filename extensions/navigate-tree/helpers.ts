@@ -151,3 +151,49 @@ export function extractTextContent(content: unknown): string {
     .map((c) => c.text)
     .join(" ");
 }
+
+/** One row of the active-anchor table (#101, D19). */
+export interface AnchorTableRow {
+  /** Cumulative context at the anchor, as `formatPct1` renders it. */
+  pct: string;
+  name: string;
+  /** `list` only: a preview of the entry the anchor sits on. */
+  after?: string;
+}
+
+/**
+ * The active-anchor table shared by `list`, the rewind hint, the min-savings
+ * refusal and the forced-rewind message (#101, D19):
+ *
+ * ```
+ * Active anchors (root → leaf, % of 100k):
+ *    4.1%  start
+ *   12.0%  context-gathered
+ * ```
+ *
+ * The percent column is as wide as its widest cell (at least 5, so
+ * `100.0%` keeps the names aligned). Only when a row has `after` are names
+ * padded (to the longest name, capped at `MAX_NAME_LENGTH`), so rows never
+ * end in spaces.
+ */
+export function formatAnchorTable(
+  rows: readonly AnchorTableRow[],
+  contextWindow: number,
+): string {
+  const header =
+    contextWindow > 0
+      ? `Active anchors (root → leaf, % of ${formatWindow(contextWindow)}):`
+      : "Active anchors (root → leaf):";
+  const pctWidth = Math.max(5, ...rows.map((r) => r.pct.length));
+  const withAfter = rows.some((r) => r.after !== undefined);
+  const nameWidth = withAfter
+    ? Math.min(MAX_NAME_LENGTH, Math.max(0, ...rows.map((r) => r.name.length)))
+    : 0;
+  const lines = rows.map((r) => {
+    const cells = `  ${r.pct.padStart(pctWidth)}  `;
+    return r.after !== undefined
+      ? `${cells}${r.name.padEnd(nameWidth)}  (after: “${r.after}”)`
+      : `${cells}${r.name}`;
+  });
+  return [header, ...lines].join("\n");
+}

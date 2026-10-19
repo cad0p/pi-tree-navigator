@@ -12,6 +12,7 @@ import { describe, it } from "node:test";
 import {
   BRANCH_LABEL_PREFIX,
   extractTextContent,
+  formatAnchorTable,
   formatContextDelta,
   formatPct1,
   formatWindow,
@@ -274,5 +275,65 @@ describe("extractTextContent", () => {
 describe("reserved label prefixes", () => {
   it("branch: marks a completed rewind's summary turn (#90)", () => {
     assert.equal(BRANCH_LABEL_PREFIX, "branch:");
+  });
+});
+
+describe("formatAnchorTable (#101 D19)", () => {
+  it("renders the header with the window, then pct and name rows", () => {
+    assert.equal(
+      formatAnchorTable(
+        [
+          { pct: "4.1%", name: "start" },
+          { pct: "12.0%", name: "context-gathered" },
+        ],
+        100_000,
+      ),
+      "Active anchors (root → leaf, % of 100k):\n   4.1%  start\n  12.0%  context-gathered",
+    );
+  });
+
+  it("drops the window from the header when it is unknown", () => {
+    assert.equal(
+      formatAnchorTable([{ pct: "6.0k", name: "start" }], 0),
+      "Active anchors (root → leaf):\n   6.0k  start",
+    );
+  });
+
+  it("widens the pct column for 100.0% so names stay aligned", () => {
+    assert.equal(
+      formatAnchorTable(
+        [
+          { pct: "4.1%", name: "a" },
+          { pct: "100.4%", name: "b" },
+        ],
+        100_000,
+      ),
+      "Active anchors (root → leaf, % of 100k):\n    4.1%  a\n  100.4%  b",
+    );
+  });
+
+  it("pads names only with the after column, capped at MAX_NAME_LENGTH; no trailing spaces", () => {
+    const rows = [
+      { pct: "1.0%", name: "x", after: "one" },
+      { pct: "2.0%", name: "yy" },
+    ];
+    const text = formatAnchorTable(rows, 100_000);
+    assert.equal(
+      text,
+      "Active anchors (root → leaf, % of 100k):\n   1.0%  x   (after: “one”)\n   2.0%  yy",
+    );
+    for (const line of text.split("\n")) assert.ok(!line.endsWith(" "));
+    const long = "n".repeat(MAX_NAME_LENGTH + 5);
+    const capped = formatAnchorTable(
+      [
+        { pct: "1.0%", name: long, after: "a" },
+        { pct: "2.0%", name: "s", after: "b" },
+      ],
+      100_000,
+    );
+    assert.equal(
+      capped.split("\n")[2],
+      `   2.0%  ${"s".padEnd(MAX_NAME_LENGTH)}  (after: “b”)`,
+    );
   });
 });

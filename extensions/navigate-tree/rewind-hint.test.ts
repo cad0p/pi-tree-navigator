@@ -85,9 +85,9 @@ describe("buildRewindHintText", () => {
         1_400,
         20_000,
         100_000,
-        "'start' 20.9% of 100k",
+        "Active anchors (root → leaf, % of 100k):\n  20.9%  start",
       ),
-      "[navigate_tree hint] Context is at 98.6% of 100k — 1.4k tokens left, within the 20.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 20.9% of 100k",
+      "[navigate_tree hint] Context is at 98.6% of 100k — 1.4k tokens left, within the 20.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 100k):\n  20.9%  start",
     );
   });
 
@@ -98,9 +98,9 @@ describe("buildRewindHintText", () => {
         48_000,
         50_000,
         1_000_000,
-        "'start' 4.1% · 'context-gathered' 12.0% of 1.0M",
+        "Active anchors (root → leaf, % of 1.0M):\n   4.1%  start\n  12.0%  context-gathered",
       ),
-      "[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 4.1% · 'context-gathered' 12.0% of 1.0M",
+      "[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   4.1%  start\n  12.0%  context-gathered",
     );
   });
 
@@ -131,7 +131,7 @@ describe("buildRewindHintText", () => {
         -70_100,
         20_000,
         100_000,
-        "'start' 20.9% of 100k",
+        "Active anchors (root → leaf, % of 100k):\n  20.9%  start",
       ),
       /at 170\.1% of 100k — 0\.0k tokens left/,
     );

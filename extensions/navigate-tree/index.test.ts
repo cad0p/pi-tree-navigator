@@ -1504,6 +1504,31 @@ describe("dispatch: list action", () => {
     assert.match(text, /^\s+\d+\.\d+%\s+\S+/m);
   });
 
+  it("renders the shared anchor table with an aligned (after:) column for a 40-char name (#101 D19)", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    const long = "a".repeat(MAX_NAME_LENGTH);
+    const t1 = appendTurn(sm, "u1", "first reply", 100);
+    pi.pi.setLabel(t1.assistantId, "anchor:start");
+    const t2 = appendTurn(sm, "u2", "second reply", 200);
+    pi.pi.setLabel(t2.assistantId, `anchor:${long}`);
+    const result = await tool.execute(
+      "tc-1",
+      { action: "list" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const body = result.content[0].text.split("\n\n")[1];
+    assert.equal(
+      body,
+      [
+        "Active anchors (root → leaf, % of 1.0M):",
+        `   0.0%  ${"start".padEnd(MAX_NAME_LENGTH)}  (after: “first reply”)`,
+        `   0.0%  ${long}  (after: “second reply”)`,
+      ].join("\n"),
+    );
+  });
+
   it("omits ' of <window>' from the header when contextWindow is 0", async () => {
     const { sm, tool, ctx } = setup({ contextWindow: 0 });
     appendTurn(sm, "u", "a");
@@ -5197,12 +5222,12 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     // Variant A guidance + the full chronological anchor list, including
     // rewindTo itself.
     assert.match(text, /Rewind further back to actually free context/);
-    assert.match(text, /'kickoff'/);
-    assert.match(text, /'impl-start'/);
+    assert.match(text, / {2}kickoff\n/);
+    assert.match(text, / {2}impl-start$/);
     // Byte-exact pin (#84 moved the anchor walk into formatActiveAnchors).
     assert.equal(
       text,
-      "Rewinding to 'impl-start' (as 'done') would free only ~0.0k tokens. Rewind further back to actually free context, or keep working. Active anchors: 'kickoff' 0.6% · 'impl-start' 1.2% of 1.0M",
+      "Rewinding to 'impl-start' (as 'done') would free only ~0.0k tokens. Rewind further back to actually free context, or keep working.\nActive anchors (root → leaf, % of 1.0M):\n   0.6%  kickoff\n   1.2%  impl-start",
     );
     // The numeric bar itself is NEVER printed agent-visible.
     assert.ok(
@@ -5250,7 +5275,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.match(text, /'start'/);
     assert.equal(
       text,
-      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it. Active anchors: 'start' 0.6% of 1.0M",
+      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it.\nActive anchors (root → leaf, % of 1.0M):\n   0.6%  start",
     );
     assert.ok(!text.includes(String(MIN_REWIND_SAVINGS_TOKENS)));
     assert.equal(fireToolCall(pi, ctx), undefined);
@@ -5277,7 +5302,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     assert.equal(r.details.rejected, "min-savings");
     assert.equal(
       r.content[0].text,
-      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it. Active anchors: 'start' 6.0k",
+      "Rewinding to 'start' (as 'done') would free only ~0.0k tokens. No earlier anchors — keep working and rewind later once more has accumulated above it.\nActive anchors (root → leaf):\n   6.0k  start",
     );
   });
 
@@ -5308,7 +5333,7 @@ describe("dispatch: rewind min-savings floor (#21)", () => {
     // The rejection lists only names rewindTo accepts (no `''`).
     assert.match(
       r.content[0].text,
-      /Active anchors: 'start' [\d.]+% of 1\.0M$/,
+      /\nActive anchors \(root → leaf, % of 1\.0M\):\n +[\d.]+% {2}start$/,
     );
   });
 
@@ -5579,7 +5604,7 @@ function usageAt(percent: number, contextWindow = 1_000_000): ContextUsage {
  */
 function expectedHint(
   percent: number,
-  anchors = "'start' 0.0% of 1.0M",
+  anchors = "Active anchors (root → leaf, % of 1.0M):\n   0.0%  start",
   reserve = 100_000,
   contextWindow = 1_000_000,
 ): string {
@@ -5701,7 +5726,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       // Byte-exact pin: the anchors are named, so no `list` call is needed.
       assert.equal(
         pi.sendMessageCalls[0][0].content,
-        "[navigate_tree hint] Context is at 90.0% of 1.0M — 100.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 0.0% of 1.0M",
+        "[navigate_tree hint] Context is at 90.0% of 1.0M — 100.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   0.0%  start",
       );
     } finally {
       cleanupConfigFixture(fixture);
@@ -6034,7 +6059,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.equal(pi.sendMessageCalls.length, 1);
       assert.equal(
         (pi.sendMessageCalls[0][0] as { content: string }).content,
-        "[navigate_tree hint] Context is at 105.0% of 1.0M — 0.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 0.0% of 1.0M",
+        "[navigate_tree hint] Context is at 105.0% of 1.0M — 0.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   0.0%  start",
       );
     } finally {
       cleanupConfigFixture(fixture);
@@ -6176,7 +6201,10 @@ describe("rewind hint: turn_end handler (#44)", () => {
       const text = String(
         (pi.sendMessageCalls[0][0] as { content: unknown }).content,
       );
-      assert.match(text, /Active anchors: 'start' [\d.]+% of 1\.0M$/);
+      assert.match(
+        text,
+        /\nActive anchors \(root → leaf, % of 1\.0M\):\n +[\d.]+% {2}start$/,
+      );
     } finally {
       cleanupConfigFixture(fixture);
     }
@@ -6464,7 +6492,9 @@ describe("rewind hint: turn_end handler (#44)", () => {
         { sessionManager: sm } as never,
       ) as { messages: unknown[] };
       assert.ok(
-        JSON.stringify(projected.messages).includes(text),
+        JSON.stringify(projected.messages).includes(
+          JSON.stringify(text).slice(1, -1),
+        ),
         "the rewind hint custom_message must survive the context projection",
       );
     } finally {
@@ -6552,7 +6582,10 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
         [
           {
             customType: REWIND_HINT_CUSTOM_TYPE,
-            content: expectedHint(95, "'start' 0.6% · 'end' 0.6% of 1.0M"),
+            content: expectedHint(
+              95,
+              "Active anchors (root → leaf, % of 1.0M):\n   0.6%  start\n   0.6%  end",
+            ),
             display: true,
           },
         ],

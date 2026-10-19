@@ -98,8 +98,13 @@ Enable it with `rewindHintReserveTokens` (see [Configuration](#configuration-tre
 When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message naming every active anchor with its cumulative context percentage — so the model knows a rewind target exists (including the automatic `start`) without a `list` call. Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
 
 ```text
-[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 4.1% · 'context-gathered' 12.0% of 1.0M
+[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.
+Active anchors (root → leaf, % of 1.0M):
+   4.1%  start
+  12.0%  context-gathered
 ```
+
+The same anchor table (cumulative context % at each anchor, root → leaf) ends the min-savings refusal and the forced-rewind message, and is the body of `list` (which adds an `(after: “…”)` preview column).
 
 With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
 
