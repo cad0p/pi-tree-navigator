@@ -1,6 +1,6 @@
 /**
  * Tests for the in-band rewind summary instruction and stored-summary shape
- * (#80).
+ * (#80), and the instruction message content (#90).
  *
  * Node test runner. Run with: `pnpm test`
  *
@@ -17,6 +17,7 @@ import {
   BRANCH_SUMMARY_PREAMBLE,
   buildStoredSummary,
   buildSummaryInstruction,
+  buildSummaryRequestText,
   computeFileLists,
   formatFileOperations,
   REWIND_SUMMARY_PROMPT,
@@ -217,5 +218,25 @@ describe("buildStoredSummary", () => {
       buildStoredSummary("## Goal\nx", [], []),
       `${BRANCH_SUMMARY_PREAMBLE}## Goal\nx`,
     );
+  });
+});
+
+// =============================================================================
+// Instruction message content (#90 S3)
+// =============================================================================
+
+describe("buildSummaryRequestText", () => {
+  it("is a [navigate_tree] source line, then the r5d instruction", () => {
+    const text = buildSummaryRequestText(14, "keep the parser API");
+    assert.equal(
+      text,
+      `[navigate_tree]\n${buildSummaryInstruction(14, "keep the parser API")}`,
+    );
+    assert.ok(
+      text.startsWith(
+        "[navigate_tree]\nSummarize only messages 14 onwards in the conversation above",
+      ),
+    );
+    assert.ok(text.endsWith("\n\nAdditional focus: keep the parser API"));
   });
 });
