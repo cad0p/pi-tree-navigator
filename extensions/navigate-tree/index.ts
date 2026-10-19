@@ -3596,12 +3596,19 @@ Operations (set \`action\`):
       // nothing is pending. Detection fails open (`null`).
       // A rewind from a codemode script is keyed on the codemode call (#103):
       // that call is the one in the assistant message and the transcript.
-      const callerId = nestedRewindCallers.get(toolCallId) ?? toolCallId;
+      // A nested rewind is solo too (#103, D): a sibling nested call of the
+      // same script, issued before or in flight, refuses it like a batch. The
+      // siblings run normally, as with a direct batch.
+      const nestedCaller = nestedRewindCallers.get(toolCallId);
+      const callerId = nestedCaller ?? toolCallId;
       const batch = findInFlightAssistantToolCalls(sm, callerId);
-      if (batch && batch.length > 1) {
+      const nestedSiblings =
+        nestedCaller !== undefined &&
+        (nestedCallCounts.get(nestedCaller) ?? 0) > 1;
+      if ((batch && batch.length > 1) || nestedSiblings) {
         return toolError(SOLO_REWIND_REFUSAL, {
           rejected: "batched-rewind",
-          batchedToolCalls: batch.map((call) => call.name),
+          batchedToolCalls: batch?.map((call) => call.name) ?? [],
         });
       }
       if (!isValidName(p.rewindTo)) {

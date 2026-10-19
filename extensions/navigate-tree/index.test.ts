@@ -8369,6 +8369,39 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("codemode (#103, D): a nested rewind with a sibling nested call in its script is refused like a batch", async () => {
+    const f = await forcedSetup();
+    try {
+      appendToolCallAssistant(f.sm, [
+        { id: "tc-code", name: "codemode", arguments: { code: CODE } },
+      ]);
+      assert.equal(
+        fireToolCall(f.pi, f.ctx, "codemode", { code: CODE }),
+        undefined,
+      );
+      assert.equal(
+        fireNested(f, "tc-code/1", "tc-code", TOOL_NAME, REWIND_ARGS),
+        undefined,
+      );
+      assert.equal(
+        fireNested(f, "tc-code/2", "tc-code", "read", { path: "x" }),
+        undefined,
+      );
+      const result = await f.tool.execute(
+        "tc-code/1",
+        REWIND_ARGS,
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      assert.equal(result.content[0].text, SOLO_REWIND_REFUSAL);
+      assert.equal((result.details as { refusal?: unknown }).refusal, true);
+      assert.equal(outcomeEntries(f.sm).length, 0);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("codemode (#103): a script with no rewind is a failed forced attempt; the third ends with D8", async () => {
     const f = await forcedSetup();
     try {
