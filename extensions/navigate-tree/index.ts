@@ -48,6 +48,11 @@
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+  type AssistantMessage,
+  isContextOverflow,
+  isRecoverableLength,
+} from "@earendil-works/pi-ai";
+import {
   AgentSession,
   buildSessionContext,
   buildSessionProjection,
@@ -55,11 +60,13 @@ import {
   collectEntriesForBranchSummary,
   convertToLlm,
   type ExtensionAPI,
+  estimateTokens,
   getAgentDir,
   prepareBranchEntries,
   type SessionBoundaryDraft,
   type SessionEntry,
   type SessionManager,
+  SettingsManager,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -91,8 +98,20 @@ import {
   toOneLine,
 } from "./helpers.ts";
 import {
+  buildForcedRewindText,
   buildNoAnchorText,
+  buildReserveOrderWarning,
+  buildRewindCompactionFailedText,
   buildRewindHintText,
+  buildWithheldNoticeText,
+  COMPACTION_FAILED_ABORTED,
+  COMPACTION_FAILED_NO_ANCHOR,
+  COMPACTION_FAILED_NO_REWIND,
+  COMPACTION_FAILED_OVERFLOWED_AGAIN,
+  COMPACTION_FAILED_RUN_ENDED,
+  COMPACTION_FAILED_STILL_OVER,
+  FORCED_REWIND_BLOCK_REASON,
+  REWIND_COMPACTION_OFF_TEXT,
   REWIND_HINT_CUSTOM_TYPE,
   RewindHintTracker,
 } from "./rewind-hint.ts";
@@ -720,6 +739,112 @@ function rewindMessageDraft(
     display: true,
     details,
   };
+}
+
+/** The model fields rewind-driven compaction reads (#101). */
+interface OverflowModel {
+  provider: string;
+  id: string;
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
+/**
+ * True when `message` is a context overflow by pi's own checks (#101, D1):
+ * an explicit overflow error, a silent overflow, or a reply squeezed by the
+ * context (`isRecoverableLength`). Same model only (pi's `sameModel`): a
+ * reply from another model says nothing about this window.
+ */
+function overflowed(
+  message: unknown,
+  model: OverflowModel | undefined,
+): boolean {
+  const m = message as Partial<AssistantMessage> | undefined;
+  if (m?.role !== "assistant" || !model) return false;
+  if (m.provider !== model.provider || m.model !== model.id) return false;
+  try {
+    return (
+      isContextOverflow(m as AssistantMessage, model.contextWindow) ||
+      isRecoverableLength(m as AssistantMessage, model.maxTokens ?? 0)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** What withholding tool results plans (#101, D3/D4). */
+interface WithholdPlan {
+  drafts: SessionBoundaryDraft[];
+  withheld: number;
+  fits: boolean;
+}
+
+/**
+ * Withhold the tool results that overflowed (#101, D3): walk back from
+ * `fromEntryId` (excluded) to the assistant that issued them, and replace
+ * their content newest-first with the D4 notice until the estimate fits
+ * `target`. User and custom messages are never withheld; a result already
+ * hidden or replaced is skipped. The estimate is the projection without
+ * `hiddenIds` (sliced at `instructionEntryId`, the frozen request of a
+ * pending rewind), minus what each notice saves.
+ */
+function planWithhold(
+  sm: SessionManager,
+  fromEntryId: string,
+  hiddenIds: readonly string[],
+  target: number,
+  instructionEntryId?: string,
+): WithholdPlan {
+  const branch = sm.getBranch();
+  const lastEdit = new Map<string, unknown>();
+  for (const entry of branch) {
+    if (entry.type === "context_edit") {
+      lastEdit.set(entry.targetId, entry.replacement);
+    }
+  }
+  const hidden = new Set(hiddenIds);
+  let entries = sm.buildSessionProjection().entries;
+  if (instructionEntryId) {
+    const at = entries.findIndex(
+      (e) => e.sourceEntry.id === instructionEntryId,
+    );
+    if (at >= 0) entries = entries.slice(0, at + 1);
+  }
+  let estimate = estimateContextTokens(
+    entries
+      .filter((e) => !hidden.has(e.sourceEntry.id))
+      .flatMap((e) => e.messages)
+      .filter((m) => m.role !== "system"),
+  );
+  const drafts: SessionBoundaryDraft[] = [];
+  const start = branch.findIndex((e) => e.id === fromEntryId);
+  for (let i = start - 1; i >= 0 && estimate > target; i--) {
+    const entry = branch[i];
+    if (entry.type !== "message") continue;
+    if (entry.message.role === "assistant") break;
+    if (entry.message.role !== "toolResult" || lastEdit.has(entry.id)) {
+      continue;
+    }
+    const original = estimateTokens(entry.message);
+    const text = buildWithheldNoticeText(original);
+    const content = [{ type: "text" as const, text }];
+    estimate -= original - estimateTokens({ ...entry.message, content });
+    drafts.push({
+      type: "context_edit",
+      targetId: entry.id,
+      replacement: { content },
+    });
+  }
+  return { drafts, withheld: drafts.length, fits: estimate <= target };
+}
+
+/** `context_edit` drafts hiding `ids` (a failed attempt, #90 O3). */
+function hideDrafts(ids: readonly string[]): SessionBoundaryDraft[] {
+  return ids.map((targetId) => ({
+    type: "context_edit",
+    targetId,
+    replacement: null,
+  }));
 }
 
 /** Why a summary attempt failed (#90, O3/O5); the last one names the ending. */
@@ -1362,6 +1487,221 @@ export default function (pi: ExtensionAPI) {
   // them, so neither lands on a rewind in progress or on a hidden attempt.
   const rewindTurns = new WeakSet<object>();
 
+  // A forced rewind (#101, rewind-driven compaction), keyed by session id:
+  // set when the forced-rewind message goes out, deleted when the rewind
+  // lands. A final error (D8) inside a run marks it `ended` instead (the gate
+  // lifts, no second forced rewind in the same run, no start anchor) and
+  // `agent_settled` deletes it.
+  const forcedRewinds = new Map<
+    string,
+    { attempts: number; ended?: boolean }
+  >();
+
+  // Where pi's settings are read from (#101, S4): the session's cwd, agent
+  // dir and project trust, set at `session_start`. `null` = cannot tell.
+  let piSettingsSource: {
+    cwd: string;
+    agentDir: string;
+    projectTrusted: boolean;
+  } | null = null;
+
+  /** pi's compaction settings for `model` (#101, S3/S4), or `null`. */
+  function piCompaction(
+    model: OverflowModel | undefined,
+  ): { enabled: boolean; reserveTokens: number } | null {
+    if (!piSettingsSource) return null;
+    try {
+      const settings = SettingsManager.create(
+        piSettingsSource.cwd,
+        piSettingsSource.agentDir,
+        { projectTrusted: piSettingsSource.projectTrusted },
+      ).getCompactionSettings(model);
+      return {
+        enabled: settings.enabled,
+        reserveTokens: settings.reserveTokens,
+      };
+    } catch {
+      // Invalid settings: pi's own compaction throws on them too.
+      return null;
+    }
+  }
+
+  /**
+   * The window and target of rewind-driven compaction for `model`, or
+   * `null` when it is off (#101, S2/S3): the model has a hint reserve,
+   * `navigate_tree` is active for the session, and pi's auto-compaction is
+   * off.
+   */
+  function rewindCompactionTarget(
+    sessionId: string,
+    model: OverflowModel | undefined,
+  ): { contextWindow: number; target: number } | null {
+    if (!model || !(model.contextWindow && model.contextWindow > 0)) {
+      return null;
+    }
+    if ((toolActiveBySession.get(sessionId) ?? toolActive) === false) {
+      return null;
+    }
+    const reserve = resolveRewindHintReserve(
+      {
+        rewindHintReserveTokens,
+        rewindHintModelReserveTokens: hintByModel,
+      },
+      `${model.provider}/${model.id}`,
+    );
+    if (reserve === null) return null;
+    const pc = piCompaction(model);
+    if (!pc || pc.enabled) return null;
+    return {
+      contextWindow: model.contextWindow,
+      target: model.contextWindow - pc.reserveTokens,
+    };
+  }
+
+  /**
+   * End rewind-driven compaction with the final error (#101, D8): the record
+   * is marked ended (created if absent) and the D8 message is returned as a
+   * boundary draft. The caller returns no `continue`.
+   */
+  function compactionFailed(
+    sessionId: string,
+    reason: string,
+  ): SessionBoundaryDraft[] {
+    const record = forcedRewinds.get(sessionId) ?? { attempts: 0 };
+    record.ended = true;
+    forcedRewinds.set(sessionId, record);
+    return [
+      rewindMessageDraft(buildRewindCompactionFailedText(reason), {
+        status: "failed",
+        reason,
+      }),
+    ];
+  }
+
+  /** True while a forced rewind gates the session (#101, D6). */
+  function forcedActive(sessionId: string): boolean {
+    const record = forcedRewinds.get(sessionId);
+    return !!record && !record.ended;
+  }
+
+  /**
+   * Rewind-driven compaction (#101, D2–D5, D11, D14, S6): the one entry
+   * point of both boundaries, after an overflow. `failedEntryId` is the
+   * overflowed assistant (the withholding walk starts above it), `failedIds`
+   * the entries of the failed attempt to hide. Returns the boundary drafts
+   * and `continue`, or `null` to stand down.
+   */
+  function startRewindCompaction(
+    sm: SessionManager,
+    sessionId: string,
+    at: { contextWindow: number; target: number },
+    failedEntryId: string,
+    failedIds: readonly string[],
+    opts: { stepAsideWhenNothingWithheld: boolean },
+  ): { drafts: SessionBoundaryDraft[]; continue: boolean } | null {
+    const record = forcedRewinds.get(sessionId);
+    // A final error already ended it in this run: pi ends the run.
+    if (record?.ended) return null;
+    const pending = livePending(sm, sessionId);
+    // S6: one recovery per overflow.
+    if (record) {
+      const ending = pending
+        ? endAtBoundary(
+            sm,
+            sessionId,
+            pending,
+            "failed",
+            COMPACTION_FAILED_OVERFLOWED_AGAIN,
+            failedIds,
+          )
+        : hideDrafts(failedIds);
+      return {
+        drafts: [
+          ...ending,
+          ...compactionFailed(sessionId, COMPACTION_FAILED_OVERFLOWED_AGAIN),
+        ],
+        continue: false,
+      };
+    }
+    // D11: the pending rewind's summary request overflowed. Keep the
+    // rewind, withhold before its call and re-send the frozen request.
+    if (pending) {
+      let instructionEntryId: string | undefined;
+      try {
+        instructionEntryId = pendingInstructionEntryId(sm.getBranch(), pending);
+      } catch {
+        instructionEntryId = undefined;
+      }
+      const plan = planWithhold(
+        sm,
+        pending.rewindEntryId,
+        failedIds,
+        at.target,
+        instructionEntryId,
+      );
+      // Nothing to withhold: a cut-off summary, #93's to classify.
+      if (plan.withheld === 0 && opts.stepAsideWhenNothingWithheld) {
+        return null;
+      }
+      if (!plan.fits) {
+        return {
+          drafts: [
+            ...endAtBoundary(
+              sm,
+              sessionId,
+              pending,
+              "failed",
+              COMPACTION_FAILED_STILL_OVER,
+              failedIds,
+            ),
+            ...compactionFailed(sessionId, COMPACTION_FAILED_STILL_OVER),
+          ],
+          continue: false,
+        };
+      }
+      pending.hiddenEntryIds.push(...failedIds);
+      forcedRewinds.set(sessionId, { attempts: 0 });
+      hintTracker.markSpent();
+      return {
+        drafts: [...hideDrafts(failedIds), ...plan.drafts],
+        continue: true,
+      };
+    }
+    // A fresh forced rewind.
+    const allEntries = sm.getEntries();
+    const byId = new Map<string, SessionEntry>();
+    for (const e of allEntries) byId.set(e.id, e);
+    const anchors = formatActiveAnchors(sm, at.contextWindow, allEntries, byId);
+    // D14: nothing to rewind to.
+    if (anchors.names.length === 0) {
+      return {
+        drafts: [
+          ...hideDrafts(failedIds),
+          ...compactionFailed(sessionId, COMPACTION_FAILED_NO_ANCHOR),
+        ],
+        continue: false,
+      };
+    }
+    const plan = planWithhold(sm, failedEntryId, failedIds, at.target);
+    forcedRewinds.set(sessionId, { attempts: 0 });
+    hintTracker.markSpent();
+    return {
+      drafts: [
+        ...hideDrafts(failedIds),
+        ...plan.drafts,
+        rewindMessageDraft(
+          buildForcedRewindText(at.contextWindow, plan.withheld, anchors.text),
+          {
+            status: "forced",
+            withheld: plan.withheld,
+            contextWindow: at.contextWindow,
+          },
+        ),
+      ],
+      continue: true,
+    };
+  }
+
   /** Best-effort label write: `pi.setLabel`, else the captured manager. */
   function writeLabel(
     sm: SessionManager,
@@ -1744,6 +2084,8 @@ export default function (pi: ExtensionAPI) {
       );
     }
     pendingRewinds.delete(sessionId);
+    // A forced rewind landed: the gate lifts (#101, D7).
+    forcedRewinds.delete(sessionId);
     // The summary landed unlabeled if both writes fail; `list` simply won't
     // show it.
     writeLabel(sm, summaryId, LABEL_PREFIX + pending.newLabel);
@@ -1831,10 +2173,31 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return undefined;
     }
-    if (!livePending(ctx.sessionManager as SessionManager, sessionId)) {
-      return undefined;
+    // A forced rewind (#101, D6): `terminate` so a turn of blocked calls
+    // ends the run unless `turn_end` re-sends (an ending's `continue: false`
+    // must hold).
+    const forced = forcedActive(sessionId);
+    if (livePending(ctx.sessionManager as SessionManager, sessionId)) {
+      return {
+        block: true,
+        reason: SUMMARY_PENDING_BLOCK_REASON,
+        ...(forced ? { terminate: true } : {}),
+      };
     }
-    return { block: true, reason: SUMMARY_PENDING_BLOCK_REASON };
+    if (
+      forced &&
+      !(
+        event.toolName === TOOL_NAME &&
+        (event.input as { action?: unknown } | undefined)?.action === "rewind"
+      )
+    ) {
+      return {
+        block: true,
+        reason: FORCED_REWIND_BLOCK_REASON,
+        terminate: true,
+      };
+    }
+    return undefined;
   });
 
   // Rewind turn and summary attempts (#80, #90). Registered before the hint
@@ -1850,23 +2213,109 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const pending = livePending(sm, sessionId);
-    if (!pending) return;
-    if (event.message && typeof event.message === "object") {
-      rewindTurns.add(event.message);
-    }
     // Every return keeps other handlers' entries (pi replaces the list per
     // handler) and drops `context_edit`s whose target left the branch, ours
     // included (one invalid draft makes pi drop the whole list).
-    const deliver = (drafts: SessionBoundaryDraft[], cont: boolean) => ({
+    const deliverRaw = (drafts: SessionBoundaryDraft[], cont: boolean) => ({
       entries: keepValidDrafts(sm, [...(event.entries ?? []), ...drafts]),
       continue: cont,
     });
+    // A failed ending of the pending rewind during a forced rewind ends
+    // rewind-driven compaction too (#101, D7): D8, no `continue`.
+    const deliver = (drafts: SessionBoundaryDraft[], cont: boolean) => {
+      const ending = pendingRewinds.get(sessionId)?.committing;
+      if (ending?.status !== "failed" || !forcedActive(sessionId)) {
+        return deliverRaw(drafts, cont);
+      }
+      const last = pendingRewinds.get(sessionId)?.lastCause;
+      const reason =
+        last && ending.reason === buildAttemptsExhaustedReason(last)
+          ? COMPACTION_FAILED_NO_REWIND
+          : ending.reason;
+      return deliverRaw(
+        [...drafts, ...compactionFailed(sessionId, reason)],
+        false,
+      );
+    };
     const message = event.message as {
       role?: string;
       content?: unknown;
       stopReason?: string;
     };
     if (message?.role !== "assistant") return;
+    const messageEntryId =
+      typeof event.messageEntryId === "string" ? event.messageEntryId : "";
+    const turnIds = messageEntryId
+      ? [
+          messageEntryId,
+          ...(event.toolResultEntryIds ?? []).filter(
+            (id): id is string => typeof id === "string",
+          ),
+        ]
+      : [];
+    // Rewind-driven compaction (#101, D2): a `length` / silent overflow is
+    // handled here, so the model never retries the oversized call; an
+    // explicit error ends the loop and is handled at `agent_before_settle`.
+    // Another extension's `continue` owns the turn.
+    if (!event.continue && messageEntryId && overflowed(message, ctx.model)) {
+      const at = rewindCompactionTarget(sessionId, ctx.model);
+      if (at) {
+        rewindTurns.add(message);
+        if (message.stopReason === "error") return;
+        // A silent `stop` reply stays visible (§9.1); a squeezed reply and
+        // its failed calls, or a summary attempt, are hidden.
+        const failedIds =
+          message.stopReason === "length" || pending ? turnIds : [];
+        const result = startRewindCompaction(
+          sm,
+          sessionId,
+          at,
+          messageEntryId,
+          failedIds,
+          { stepAsideWhenNothingWithheld: true },
+        );
+        if (result) return deliverRaw(result.drafts, result.continue);
+      }
+    }
+    if (!pending) {
+      // A forced-rewind attempt (#101, D6): anything but an accepted
+      // `rewind` (which makes the rewind pending) is hidden and re-sent.
+      if (!forcedActive(sessionId)) return;
+      rewindTurns.add(message);
+      let aborted = message.stopReason === "aborted";
+      try {
+        aborted ||= ctx.signal?.aborted === true;
+      } catch {
+        // Stale ctx: treat as not aborted.
+      }
+      // Esc: `agent_settled` ends it (D16). An error: pi's retry, or
+      // `agent_settled`.
+      if (aborted || message.stopReason === "error") return;
+      // A refused `rewind` is not an attempt (D7): it stays visible.
+      const refused = (event.toolResults ?? []).some((r) => {
+        const result = r as { toolName?: string; details?: unknown };
+        return (
+          result.toolName === TOOL_NAME &&
+          (result.details as { refusal?: unknown } | undefined)?.refusal ===
+            true
+        );
+      });
+      if (refused) return;
+      const record = forcedRewinds.get(sessionId);
+      if (!record) return;
+      record.attempts++;
+      if (record.attempts < MAX_SUMMARY_ATTEMPTS) {
+        return deliverRaw(hideDrafts(turnIds), true);
+      }
+      return deliverRaw(
+        [
+          ...hideDrafts(turnIds),
+          ...compactionFailed(sessionId, COMPACTION_FAILED_NO_REWIND),
+        ],
+        false,
+      );
+    }
+    rewindTurns.add(message);
     const content = Array.isArray(message.content)
       ? (message.content as Array<{
           type?: string;
@@ -1922,17 +2371,7 @@ export default function (pi: ExtensionAPI) {
 
     // A summary attempt. Its own entries — the assistant and every
     // resolvable tool result, never one without the other (O3) — are what
-    // a failure hides.
-    const messageEntryId =
-      typeof event.messageEntryId === "string" ? event.messageEntryId : "";
-    const turnIds = messageEntryId
-      ? [
-          messageEntryId,
-          ...(event.toolResultEntryIds ?? []).filter(
-            (id): id is string => typeof id === "string",
-          ),
-        ]
-      : [];
+    // a failure hides (`turnIds`).
     // Esc while a blocked attempt's tools resolve: the assistant completed
     // (`toolUse`) but the run was aborted. Esc while pending is an abort
     // (O6), never a failed attempt.
@@ -2066,6 +2505,44 @@ export default function (pi: ExtensionAPI) {
     ) {
       return { continue: true };
     }
+    // Rewind-driven compaction (#101, D2): an explicit overflow error ended
+    // the loop; pi did not retry (overflow) or compact (off). Recover in the
+    // same run. Another extension's `continue` owns the recovery.
+    if (event.outcome === "error" && !event.continue) {
+      let last: SessionEntry | undefined;
+      try {
+        last = sm
+          .getBranch()
+          .findLast(
+            (e) => e.type === "message" && e.message.role === "assistant",
+          );
+      } catch {
+        last = undefined;
+      }
+      const failed = last?.type === "message" ? last.message : undefined;
+      if (
+        last &&
+        (failed as { stopReason?: string } | undefined)?.stopReason ===
+          "error" &&
+        overflowed(failed, ctx.model)
+      ) {
+        const at = rewindCompactionTarget(sessionId, ctx.model);
+        const result = at
+          ? startRewindCompaction(sm, sessionId, at, last.id, [last.id], {
+              stepAsideWhenNothingWithheld: false,
+            })
+          : null;
+        if (result) {
+          return {
+            entries: keepValidDrafts(sm, [
+              ...(event.entries ?? []),
+              ...result.drafts,
+            ]),
+            continue: result.continue,
+          };
+        }
+      }
+    }
     const pending = pendingRewinds.get(sessionId);
     if (!pending || event.outcome === "error" || event.continue) return;
     if (event.outcome === "aborted") {
@@ -2076,18 +2553,24 @@ export default function (pi: ExtensionAPI) {
         ]),
       };
     }
+    const ending = endAtBoundary(
+      sm,
+      sessionId,
+      pending,
+      "failed",
+      "the run ended before the summary",
+    );
+    // During a forced rewind: D8, the run ends (#101, D7).
+    const failed = forcedActive(sessionId)
+      ? compactionFailed(sessionId, "the run ended before the summary")
+      : [];
     return {
       entries: keepValidDrafts(sm, [
         ...(event.entries ?? []),
-        ...endAtBoundary(
-          sm,
-          sessionId,
-          pending,
-          "failed",
-          "the run ended before the summary",
-        ),
+        ...ending,
+        ...failed,
       ]),
-      continue: true,
+      continue: failed.length === 0,
     };
   });
 
@@ -2104,6 +2587,39 @@ export default function (pi: ExtensionAPI) {
       );
     } catch {
       // Stale ctx: nothing to end.
+    }
+    // A forced rewind still gating the session (#101, D16): lift the gate
+    // and say so. An ended one already said it (D8).
+    let sm: SessionManager;
+    let sessionId: string;
+    try {
+      sm = ctx.sessionManager as SessionManager;
+      sessionId = sm.getSessionId();
+    } catch {
+      return;
+    }
+    const record = forcedRewinds.get(sessionId);
+    forcedRewinds.delete(sessionId);
+    if (!record || record.ended) return;
+    const reason = event.aborted
+      ? COMPACTION_FAILED_ABORTED
+      : COMPACTION_FAILED_RUN_ENDED;
+    const content = buildRewindCompactionFailedText(reason);
+    const details = { status: "failed", reason };
+    try {
+      // Idle: a plain append, no turn started.
+      pi.sendMessage({
+        customType: REWIND_CUSTOM_TYPE,
+        content,
+        display: true,
+        details,
+      });
+    } catch {
+      try {
+        sm.appendCustomMessageEntry(REWIND_CUSTOM_TYPE, content, true, details);
+      } catch {
+        // Fail-open: the gate is lifted either way.
+      }
     }
   });
 
@@ -2172,6 +2688,20 @@ export default function (pi: ExtensionAPI) {
       );
     },
   );
+  // The final error of rewind-driven compaction (#101, D8): one
+  // error-styled row, full text, nothing to expand. Every other rewind
+  // message (the continuation, the forced-rewind message) keeps pi's
+  // default rendering.
+  pi.registerMessageRenderer(REWIND_CUSTOM_TYPE, (message, options, theme) => {
+    const status = (message.details as { status?: unknown } | undefined)
+      ?.status;
+    if (status !== "failed") return undefined;
+    return new StyledLines(
+      extractTextContent(message.content).split("\n"),
+      (line) => theme.fg("error", line),
+      options.outputPad ?? 1,
+    );
+  });
 
   // Rewind-hint closure state (#44): fresh per factory invocation and reset
   // on every `session_start`, so `/new` / `/resume` / `/reload` sessions
@@ -2220,6 +2750,9 @@ export default function (pi: ExtensionAPI) {
     // clear this session's gate. Absent = fail-open until a gate is set.
     if (toolActiveBySession.get(sessionId) === false) return;
     if (anchorStartSettled.has(sessionId)) return;
+    // Never at the context limit (#101, D14): not during a forced rewind,
+    // nor after its final error in the same run.
+    if (forcedRewinds.has(sessionId)) return;
     // Per-session threshold (#55): two sessions started with different
     // project configs must not share one closure value.
     const startAfterTurns =
@@ -2276,9 +2809,19 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui;
     const sm = ctx.sessionManager as SessionManager;
     const sessionId = sm.getSessionId();
+    let model: OverflowModel | undefined;
+    try {
+      model = ctx.model;
+    } catch {
+      model = undefined;
+    }
+    const agentDir = getAgentDir();
+    // pi's settings as this session reads them (#101, S4).
+    piSettingsSource = { cwd, agentDir, projectTrusted };
     // A committing ending pi dropped is re-applied with its own reason.
     settleCommittingEnding(sm, sessionId);
     pendingRewinds.delete(sessionId);
+    forcedRewinds.delete(sessionId);
     // O8 (#90): a rewind that died mid-flight (restart, crash) left its
     // instruction in context with nothing waiting for it — end it.
     resolveOrphanRewinds(sm);
@@ -2292,7 +2835,7 @@ export default function (pi: ExtensionAPI) {
     let warnings: string[] = [];
     try {
       const loaded = await loadTreeNavigatorConfig({
-        agentDir: getAgentDir(),
+        agentDir,
         projectPath: join(cwd, CONFIG_DIR_NAME, TREE_NAVIGATOR_CONFIG_FILENAME),
         projectTrusted,
       });
@@ -2316,10 +2859,57 @@ export default function (pi: ExtensionAPI) {
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
     toolActiveBySession.delete(sessionId);
+    if (reserve !== null || byModel.size > 0) {
+      warnings.push(...reserveOrderWarnings(model));
+    }
     if (hasUI) {
       for (const warning of warnings) ui.notify(warning, "warning");
     }
   });
+
+  /**
+   * D10 (#101): one warning per model whose hint reserve is below pi's
+   * `compaction.reserveTokens` (both have per-model overrides), while pi's
+   * compaction is off (on, both features are off and D9 says so).
+   */
+  function reserveOrderWarnings(model: OverflowModel | undefined): string[] {
+    if (!piSettingsSource) return [];
+    const warnings: string[] = [];
+    try {
+      const settings = SettingsManager.create(
+        piSettingsSource.cwd,
+        piSettingsSource.agentDir,
+        { projectTrusted: piSettingsSource.projectTrusted },
+      );
+      if (settings.getCompactionSettings(model).enabled) return [];
+      const keys = new Set<string>();
+      if (model) keys.add(`${model.provider}/${model.id}`);
+      for (const key of hintByModel.keys()) keys.add(key);
+      const overrides = settings.getSettings().compaction?.modelOverrides;
+      for (const key of Object.keys(overrides ?? {})) keys.add(key);
+      for (const key of keys) {
+        const slash = key.indexOf("/");
+        if (slash <= 0) continue;
+        const hint = resolveRewindHintReserve(
+          {
+            rewindHintReserveTokens,
+            rewindHintModelReserveTokens: hintByModel,
+          },
+          key,
+        );
+        const piReserve = settings.getCompactionReserveTokens({
+          provider: key.slice(0, slash),
+          id: key.slice(slash + 1),
+        });
+        if (hint !== null && hint < piReserve) {
+          warnings.push(buildReserveOrderWarning(hint, piReserve, key));
+        }
+      }
+    } catch {
+      // Invalid pi settings: pi reports them itself.
+    }
+    return warnings;
+  }
 
   // Public context event: replace the wire messages with the session-tree
   // projection before every LLM call. This is the public-API replacement for
@@ -2523,6 +3113,15 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!hintTracker.observe(tokensLeft, reserve)) return;
+    // Either-or with pi's compaction (#101, S3/D9), read at the crossing
+    // (between crossings the hint has no effect, so no per-turn read): on,
+    // the hint and rewind-driven compaction are off, and the crossing shows
+    // why (TUI only; headless stays silent). The crossing is spent.
+    // (`compaction.enabled` has no per-model override: no `ctx.model` read.)
+    if (piCompaction(undefined)?.enabled) {
+      if (ctx.hasUI) ctx.ui.notify(REWIND_COMPACTION_OFF_TEXT, "error");
+      return;
+    }
     if (anchors.names.length > 0) {
       const text = buildRewindHintText(
         usage.percent,
@@ -2586,10 +3185,16 @@ export default function (pi: ExtensionAPI) {
   // X-th turn still settles (a one-turn first run anchors at turn 1).
   // `agent_end` fires on complete / aborted / errored runs; the settled set
   // makes this a no-op once the turn trigger already wrote.
-  pi.on("agent_end", (_event, ctx) => {
+  pi.on("agent_end", (event, ctx) => {
     let sm: typeof ctx.sessionManager;
     try {
       sm = ctx.sessionManager;
+      // A run that ended on an overflow (#101, D14): its leaf is at the
+      // context limit, a useless rewind target.
+      const last = (event.messages ?? []).findLast(
+        (m) => m.role === "assistant",
+      );
+      if (last && overflowed(last, ctx.model)) return;
     } catch {
       return;
     }

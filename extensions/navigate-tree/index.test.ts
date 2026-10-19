@@ -5559,7 +5559,31 @@ function makeConfigFixture(): ConfigFixture {
   const projectDir = join(root, "project");
   mkdirSync(agentDir, { recursive: true });
   mkdirSync(projectDir, { recursive: true });
+  // pi's auto-compaction defaults to on, which turns the hint off (#101,
+  // D9): the fixture's pi settings turn it off unless a test says otherwise.
+  writePiSettings(
+    { root, agentDir, projectDir },
+    { compaction: { enabled: false } },
+  );
   return { root, agentDir, projectDir };
+}
+
+/** Write the fixture's global pi `settings.json` (#101). */
+function writePiSettings(fixture: ConfigFixture, settings: unknown): void {
+  writeFileSync(
+    join(fixture.agentDir, "settings.json"),
+    JSON.stringify(settings),
+  );
+}
+
+/** Write the fixture's project pi `.pi/settings.json` (#101). */
+function writeProjectPiSettings(
+  fixture: ConfigFixture,
+  settings: unknown,
+): void {
+  const dir = join(fixture.projectDir, CONFIG_DIR_NAME);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
 }
 
 function cleanupConfigFixture(fixture: ConfigFixture): void {
