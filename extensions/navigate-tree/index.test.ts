@@ -22,7 +22,13 @@
  */
 
 import * as assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -33,6 +39,7 @@ import {
   type ExtensionAPI,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   START_ANCHOR_DEFAULT_TURNS,
   START_ANCHOR_MAX_TURNS,
@@ -44,18 +51,27 @@ import navigateTree, {
   __testHooks,
   ANCHOR_MANDATE,
   buildLateEntriesNote,
-  buildRewindCancelledText,
+  buildRewindAcceptedText,
   buildRewindDoneText,
-  buildSummaryRetryText,
+  buildRewindFailedText,
+  buildRewindOutcomeRow,
+  buildSummaryFailedText,
+  buildSummaryRequestRow,
   extractSummaryText,
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
   MAX_SUMMARY_ATTEMPTS,
   MIN_REWIND_SAVINGS_TOKENS,
   MIN_SUMMARY_FOCUS_LENGTH,
+  NESTED_REWIND_REFUSAL,
+  REWIND_ABORTED_TEXT,
   REWIND_CUSTOM_TYPE,
+  REWIND_OUTCOME_CUSTOM_TYPE,
+  SOLO_REWIND_REFUSAL,
   START_ANCHOR_LABEL,
   SUMMARY_PENDING_BLOCK_REASON,
+  SUMMARY_REQUEST_CUSTOM_TYPE,
+  wrapPlainLine,
 } from "./index.ts";
 import {
   buildNoAnchorText,
@@ -66,6 +82,7 @@ import {
   BRANCH_SUMMARY_PREAMBLE,
   buildStoredSummary,
   buildSummaryInstruction,
+  buildSummaryRequestText,
 } from "./summary-prompt.ts";
 
 afterEach(() => {
@@ -117,15 +134,30 @@ interface FakePi {
   sendLog: Array<"sendMessage" | "sendUserMessage">;
   /** Folded `turn_end` boundary results, one per `fireTurnEndAll`. */
   boundaryResults: BoundaryResult[];
+  /** `appendEntry(customType, data)` calls (routed to `sm.appendCustomEntry`). */
+  appendEntryCalls: Array<[string, unknown]>;
+  /** `registerMessageRenderer` registrations, keyed by customType. */
+  messageRenderers: Map<string, (...args: never[]) => unknown>;
+  /** `registerEntryRenderer` registrations, keyed by customType. */
+  entryRenderers: Map<string, (...args: never[]) => unknown>;
 }
 
-/** A `turn_end` boundary entry draft (pi's custom_message shape). */
+/**
+ * A boundary entry draft (pi's `SessionBoundaryDraft` union, loosely typed):
+ * `custom_message` (customType/content/display/details), `custom`
+ * (customType/data), `context_edit` (targetId/replacement) or `compaction`.
+ */
 interface BoundaryDraft {
   type: string;
   customType: string;
   content: string;
   display: boolean;
   details: Record<string, unknown>;
+  data?: Record<string, unknown>;
+  targetId?: string;
+  replacement?: { content: unknown } | null;
+  summary?: string;
+  firstKeptEntryId?: string | null;
 }
 
 /** The folded `turn_end` boundary result, as `emitBoundary` returns it. */
@@ -149,7 +181,26 @@ function makeFakePi(sm: SessionManager): FakePi {
   const sendUserMessageCalls: unknown[][] = [];
   const sendLog: FakePi["sendLog"] = [];
   const boundaryResults: BoundaryResult[] = [];
+  const appendEntryCalls: Array<[string, unknown]> = [];
+  const messageRenderers = new Map<string, (...args: never[]) => unknown>();
+  const entryRenderers = new Map<string, (...args: never[]) => unknown>();
   const pi = {
+    appendEntry(customType: string, data?: unknown) {
+      appendEntryCalls.push([customType, data]);
+      sm.appendCustomEntry(customType, data);
+    },
+    registerMessageRenderer(
+      customType: string,
+      renderer: (...args: never[]) => unknown,
+    ) {
+      messageRenderers.set(customType, renderer);
+    },
+    registerEntryRenderer(
+      customType: string,
+      renderer: (...args: never[]) => unknown,
+    ) {
+      entryRenderers.set(customType, renderer);
+    },
     registerTool(tool: CapturedTool) {
       registered.push(tool);
     },
@@ -183,6 +234,9 @@ function makeFakePi(sm: SessionManager): FakePi {
     sendUserMessageCalls,
     sendLog,
     boundaryResults,
+    appendEntryCalls,
+    messageRenderers,
+    entryRenderers,
   };
 }
 
@@ -211,6 +265,8 @@ interface FakeCtx {
   getContextUsage(): ContextUsage | undefined;
   /** Test-only setter driving `getContextUsage`. */
   setContextUsage(usage: ContextUsage | undefined): void;
+  /** The current abort signal (pi: undefined when not streaming). */
+  signal: AbortSignal | undefined;
 }
 
 function makeCtx(
@@ -251,6 +307,7 @@ function makeCtx(
     setContextUsage(next: ContextUsage | undefined) {
       usage = next;
     },
+    signal: undefined,
   };
 }
 
@@ -462,15 +519,139 @@ function setupRewindable(
 // -----------------------------------------------------------------------------
 
 /**
- * Fire every registered `turn_end` handler in registration order, awaiting
- * each, and fold their results exactly as pi's `ExtensionRunner.emitBoundary`
+ * Commit boundary drafts the way pi's `_commitBoundaryDrafts` does: all or
+ * nothing. pi previews the whole list (`runner.emitBoundary` →
+ * `buildContext`), and a `context_edit` whose target is off the active
+ * branch invalidates it, dropping every draft. Returns false when dropped.
+ */
+function commitBoundaryDrafts(
+  sm: SessionManager,
+  drafts: readonly BoundaryDraft[],
+): boolean {
+  let onBranch: Set<string>;
+  try {
+    onBranch = new Set(sm.getBranch().map((e) => e.id));
+  } catch {
+    return false;
+  }
+  if (
+    drafts.some(
+      (d) => d.type === "context_edit" && !onBranch.has(d.targetId ?? ""),
+    )
+  ) {
+    return false;
+  }
+  for (const draft of drafts) {
+    switch (draft.type) {
+      case "custom_message":
+        sm.appendCustomMessageEntry(
+          draft.customType,
+          draft.content,
+          draft.display,
+          draft.details,
+        );
+        break;
+      case "custom":
+        sm.appendCustomEntry(draft.customType, draft.data);
+        break;
+      case "context_edit":
+        sm.appendContextEdit(
+          draft.targetId as string,
+          (draft.replacement ?? null) as never,
+        );
+        break;
+      case "compaction":
+        sm.appendCompaction(
+          draft.summary ?? "",
+          (draft.firstKeptEntryId ?? null) as never,
+          0,
+          draft.details,
+          true,
+        );
+        break;
+    }
+  }
+  return true;
+}
+
+/**
+ * The turn's persisted entry ids, as pi resolves them for `turn_end`: the
+ * assistant's entry (`messageEntryId`) and the tool results that follow it
+ * on the branch (`toolResults` / `toolResultEntryIds`).
+ */
+function resolveTurnEntries(
+  sm: SessionManager,
+  message: unknown,
+): {
+  messageEntryId: string | undefined;
+  toolResults: unknown[];
+  toolResultEntryIds: string[];
+} {
+  let branch: ReturnType<SessionManager["getBranch"]>;
+  try {
+    branch = sm.getBranch();
+  } catch {
+    // A test that stubs getBranch to throw drives the handlers anyway.
+    branch = [];
+  }
+  const index = branch.findIndex(
+    (e) => e.type === "message" && (e.message as unknown) === message,
+  );
+  if (index < 0) {
+    return {
+      messageEntryId: undefined,
+      toolResults: [],
+      toolResultEntryIds: [],
+    };
+  }
+  const toolResults: unknown[] = [];
+  const toolResultEntryIds: string[] = [];
+  for (const entry of branch.slice(index + 1)) {
+    if (entry.type !== "message" || entry.message.role !== "toolResult") break;
+    toolResults.push(entry.message);
+    toolResultEntryIds.push(entry.id);
+  }
+  return { messageEntryId: branch[index].id, toolResults, toolResultEntryIds };
+}
+
+/**
+ * Fold boundary handlers exactly as pi's `ExtensionRunner.emitBoundary`
  * does: every handler sees the running `{ entries, continue }`, and a result
- * carrying `entries` / `continue` replaces it. The folded result is returned
- * and recorded on `pi.boundaryResults`. `entries` seeds the list (another
- * extension's drafts earlier in the chain). `commit` replicates pi's commit
- * of the drafts onto the session right after the handlers, for tests that
- * assert branch order. `turnIndex` defaults to 0 so the auto start-anchor
- * (default X=2) stays out of the way.
+ * carrying `entries` / `continue` replaces it. Then commit the drafts
+ * all-or-nothing (pi's `_commitBoundaryDrafts`); an invalid list folds to
+ * `{ entries: [], continue: false }` like pi's preview failure.
+ */
+async function foldBoundary(
+  handlers: Array<(e: never, c: never) => unknown>,
+  ctx: FakeCtx,
+  base: Record<string, unknown>,
+  opts: { entries?: BoundaryDraft[]; continue?: boolean; commit?: boolean },
+): Promise<BoundaryResult> {
+  let entries = opts.entries ?? [];
+  let shouldContinue = opts.continue ?? false;
+  for (const handler of handlers) {
+    const result = (await handler(
+      { ...base, entries, continue: shouldContinue } as never,
+      ctx as never,
+    )) as { entries?: BoundaryDraft[]; continue?: boolean } | undefined;
+    if (result?.entries !== undefined) entries = result.entries;
+    if (result?.continue !== undefined) shouldContinue = result.continue;
+  }
+  if (opts.commit === false) return { entries, continue: shouldContinue };
+  if (!commitBoundaryDrafts(ctx.sessionManager, entries)) {
+    return { entries: [], continue: false };
+  }
+  return { entries, continue: shouldContinue };
+}
+
+/**
+ * Fire every registered `turn_end` handler in registration order, awaiting
+ * each, with the event fields pi passes (`messageEntryId`, `toolResults`,
+ * `toolResultEntryIds`, `outcome`), and fold + commit their results (see
+ * `foldBoundary`). The folded result is returned and recorded on
+ * `pi.boundaryResults`. `entries` seeds the list (another extension's drafts
+ * earlier in the chain). `commit: false` skips pi's commit. `turnIndex`
+ * defaults to 0 so the auto start-anchor (default X=2) stays out of the way.
  */
 async function fireTurnEndAll(
   pi: FakePi,
@@ -480,40 +661,104 @@ async function fireTurnEndAll(
     turnIndex?: number;
     entries?: BoundaryDraft[];
     commit?: boolean;
+    messageEntryId?: string;
   } = {},
 ): Promise<BoundaryResult> {
   const handlers = pi.onCalls.get("turn_end");
   assert.ok(handlers, "factory must register turn_end handlers");
-  let entries = opts.entries ?? [];
-  let shouldContinue = false;
-  for (const handler of handlers) {
-    const result = (await handler(
+  const resolved = resolveTurnEntries(ctx.sessionManager, message);
+  const stopReason = (message as { stopReason?: string } | undefined)
+    ?.stopReason;
+  const folded = await foldBoundary(
+    handlers,
+    ctx,
+    {
+      type: "turn_end",
+      turnIndex: opts.turnIndex ?? 0,
+      message,
+      toolResults: resolved.toolResults,
+      messageEntryId: opts.messageEntryId ?? resolved.messageEntryId,
+      toolResultEntryIds: resolved.toolResultEntryIds,
+      outcome:
+        stopReason === "aborted"
+          ? "aborted"
+          : stopReason === "error"
+            ? "error"
+            : "completed",
+    },
+    opts,
+  );
+  pi.boundaryResults.push(folded);
+  return folded;
+}
+
+/** Fire every `agent_before_settle` handler (a boundary, folded + committed). */
+async function fireAgentBeforeSettle(
+  pi: FakePi,
+  ctx: FakeCtx,
+  opts: {
+    outcome?: "completed" | "aborted" | "error";
+    continue?: boolean;
+    entries?: BoundaryDraft[];
+    commit?: boolean;
+  } = {},
+): Promise<BoundaryResult> {
+  const handlers = pi.onCalls.get("agent_before_settle") ?? [];
+  const folded = await foldBoundary(
+    handlers,
+    ctx,
+    { type: "agent_before_settle", outcome: opts.outcome ?? "completed" },
+    opts,
+  );
+  pi.boundaryResults.push(folded);
+  return folded;
+}
+
+/** Fire every `agent_settled` handler. */
+async function fireAgentSettled(
+  pi: FakePi,
+  ctx: FakeCtx,
+  aborted = false,
+): Promise<void> {
+  for (const handler of pi.onCalls.get("agent_settled") ?? []) {
+    await handler({ type: "agent_settled", aborted } as never, ctx as never);
+  }
+}
+
+/** Append a compaction (as pi does) and fire every `session_compact` handler. */
+async function fireSessionCompact(
+  pi: FakePi,
+  ctx: FakeCtx,
+  firstKeptEntryId: string,
+  reason: "manual" | "threshold" | "overflow" = "threshold",
+): Promise<string> {
+  const sm = ctx.sessionManager;
+  const id = sm.appendCompaction("compacted", firstKeptEntryId, 1000);
+  for (const handler of pi.onCalls.get("session_compact") ?? []) {
+    await handler(
       {
-        type: "turn_end",
-        turnIndex: opts.turnIndex ?? 0,
-        message,
-        toolResults: [],
-        entries,
-        continue: shouldContinue,
+        type: "session_compact",
+        compactionEntry: sm.getEntry(id),
+        fromExtension: false,
+        reason,
+        willRetry: reason === "overflow",
       } as never,
       ctx as never,
-    )) as { entries?: BoundaryDraft[]; continue?: boolean } | undefined;
-    if (result?.entries !== undefined) entries = result.entries;
-    if (result?.continue !== undefined) shouldContinue = result.continue;
+    );
   }
-  const folded = { entries, continue: shouldContinue };
-  pi.boundaryResults.push(folded);
-  if (opts.commit) {
-    for (const draft of entries) {
-      ctx.sessionManager.appendCustomMessageEntry(
-        draft.customType,
-        draft.content,
-        draft.display,
-        draft.details,
-      );
-    }
-  }
-  return folded;
+  return id;
+}
+
+/** Fire the `context` handler and return the messages it would send. */
+function fireContext(pi: FakePi, ctx: FakeCtx): Array<Record<string, unknown>> {
+  const handlers = pi.onCalls.get("context");
+  assert.ok(handlers, "factory must register a context handler");
+  assert.equal(handlers.length, 1);
+  const result = handlers[0](
+    { type: "context", messages: [] } as never,
+    ctx as never,
+  ) as { messages: Array<Record<string, unknown>> };
+  return result.messages;
 }
 
 /** Fire the `tool_call` gate for a tool call in `ctx`'s session. */
@@ -587,7 +832,9 @@ async function summaryTurn(
 }> {
   const message = assistantMessage([{ type: "text", text }], stopReason, 100);
   const entryId = f.sm.appendMessage(message as never);
-  const boundary = await fireTurnEndAll(f.pi, f.ctx, message, opts);
+  const boundary = await fireTurnEndAll(f.pi, f.ctx, message, {
+    commit: opts.commit ?? false,
+  });
   return { entryId, message, boundary };
 }
 
@@ -612,6 +859,62 @@ function rewindMessages(
       .filter((draft) => draft.customType === REWIND_CUSTOM_TYPE)
       .map((message) => ({ message, continue: result.continue })),
   );
+}
+
+/** The latest summary-instruction draft returned by a boundary (#90). */
+function summaryRequestDraftOf(pi: FakePi): BoundaryDraft {
+  const drafts = pi.boundaryResults.flatMap((r) =>
+    r.entries.filter((d) => d.customType === SUMMARY_REQUEST_CUSTOM_TYPE),
+  );
+  const draft = drafts.at(-1);
+  assert.ok(draft, "a summary instruction draft was returned");
+  return draft;
+}
+
+/** Outcome entries (`navigate-tree-rewind-outcome`) on the active branch. */
+function outcomeEntries(sm: SessionManager): Array<Record<string, unknown>> {
+  return sm
+    .getBranch()
+    .filter(
+      (e) => e.type === "custom" && e.customType === REWIND_OUTCOME_CUSTOM_TYPE,
+    )
+    .map((e) => (e as { data: Record<string, unknown> }).data);
+}
+
+/** Ids hidden (last `context_edit` null) on the active branch. */
+function hiddenIds(sm: SessionManager): Set<string> {
+  const last = new Map<string, unknown>();
+  for (const e of sm.getBranch()) {
+    if (e.type === "context_edit") last.set(e.targetId, e.replacement);
+  }
+  return new Set([...last].filter(([, r]) => r === null).map(([id]) => id));
+}
+
+/**
+ * A failed summary attempt that calls tools: persist the assistant, the
+ * blocked tool results pi records for it, and fire `turn_end`.
+ */
+async function toolCallAttempt(
+  f: { sm: SessionManager; pi: FakePi; ctx: FakeCtx },
+  ids: string[] = ["tc-read"],
+  stopReason = "toolUse",
+): Promise<{ entryId: string; resultIds: string[]; boundary: BoundaryResult }> {
+  const message = assistantMessage(
+    ids.map((id) => ({
+      type: "toolCall",
+      id,
+      name: "read",
+      arguments: { path: `src/${id}.ts` },
+    })),
+    stopReason,
+    100,
+  );
+  const entryId = f.sm.appendMessage(message as never);
+  const resultIds = ids.map((id) =>
+    appendToolResult(f.sm, id, "read", SUMMARY_PENDING_BLOCK_REASON),
+  );
+  const boundary = await fireTurnEndAll(f.pi, f.ctx, message);
+  return { entryId, resultIds, boundary };
 }
 
 /**
@@ -1827,10 +2130,12 @@ describe("dispatch: refusal results surface as failed tool calls", () => {
 // =============================================================================
 
 describe("dispatch: rewind phase 1 (summary request)", () => {
-  it("returns exactly buildSummaryInstruction(first, focus) and the request details", async () => {
+  it("returns only the byte-exact 'accepted' text and the request details (#90 S2)", async () => {
     const { sm, pi, tool, ctx } = setup();
     const { anchorId } = setupRewindable(sm, pi);
-    appendToolCallAssistant(sm, [{ id: "tc-rewind", name: TOOL_NAME }]);
+    appendToolCallAssistant(sm, [
+      { id: "tc-rewind", name: TOOL_NAME, arguments: REWIND_ARGS },
+    ]);
     const result = await tool.execute(
       "tc-rewind",
       REWIND_ARGS,
@@ -1840,11 +2145,15 @@ describe("dispatch: rewind phase 1 (summary request)", () => {
     );
     assert.equal(result.isError, undefined);
     assert.equal(result.content.length, 1);
-    // u1 + a1 are background → the collapsed segment starts at message 3.
     assert.equal(
       result.content[0].text,
-      buildSummaryInstruction(3, REWIND_ARGS.summaryFocus),
+      "[navigate_tree] Rewind to 'start' accepted (collapse as 'end'). Follow the navigate_tree message below to complete it.",
     );
+    assert.equal(
+      result.content[0].text,
+      buildRewindAcceptedText("start", "end"),
+    );
+    // u1 + a1 are background → the collapsed segment starts at message 3.
     assert.deepEqual(result.details, {
       status: "summary-requested",
       rewindTo: "start",
@@ -1852,9 +2161,83 @@ describe("dispatch: rewind phase 1 (summary request)", () => {
       targetId: anchorId,
       first: 3,
       contextBefore: result.details.contextBefore,
+      tokensAtTarget: result.details.tokensAtTarget,
       contextWindow: 1_000_000,
     });
     assert.equal(typeof result.details.contextBefore, "number");
+    assert.equal(typeof result.details.tokensAtTarget, "number");
+  });
+
+  it("the rewind turn's turn_end returns the instruction custom message + continue (#90 S1/S3)", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    const { result } = await requestRewind(f);
+    const boundary = f.pi.boundaryResults.at(-1);
+    assert.ok(boundary);
+    assert.equal(boundary.continue, true);
+    assert.equal(boundary.entries.length, 1);
+    const draft = boundary.entries[0];
+    assert.equal(draft.type, "custom_message");
+    assert.equal(draft.customType, SUMMARY_REQUEST_CUSTOM_TYPE);
+    assert.equal(draft.display, true);
+    assert.equal(
+      draft.content,
+      `[navigate_tree]\n${buildSummaryInstruction(3, REWIND_ARGS.summaryFocus)}`,
+    );
+    assert.equal(
+      draft.content,
+      buildSummaryRequestText(3, REWIND_ARGS.summaryFocus),
+    );
+    assert.deepEqual(draft.details, {
+      toolCallId: "tc-rewind",
+      rewindTo: "start",
+      newLabel: "end",
+      contextBefore: result.details.contextBefore,
+      tokensAtTarget: result.details.tokensAtTarget,
+      contextWindow: 1_000_000,
+      first: 3,
+    });
+    // Committed right after the rewind's tool result.
+    const leaf = f.sm.getEntry(f.sm.getLeafId() as string);
+    assert.ok(leaf && leaf.type === "custom_message");
+    assert.equal(leaf.customType, SUMMARY_REQUEST_CUSTOM_TYPE);
+    const parent = f.sm.getEntry(leaf.parentId as string);
+    assert.ok(parent && parent.type === "message");
+    assert.equal(parent.message.role, "toolResult");
+  });
+
+  it("Esc during the rewind turn ends it aborted: no instruction, no continue (#90 O6)", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    const controller = new AbortController();
+    controller.abort();
+    f.ctx.signal = controller.signal;
+    await requestRewind(f);
+    const boundary = f.pi.boundaryResults.at(-1);
+    assert.ok(boundary);
+    assert.equal(boundary.continue, false);
+    assert.ok(
+      !boundary.entries.some(
+        (d) => d.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+      ),
+    );
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(
+      outcome[0].text,
+      "Summarization aborted. Nothing was collapsed.",
+    );
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "nothing pending");
+    // The tool result now reads as the abort, as an error.
+    f.ctx.signal = undefined;
+    const sent = fireContext(f.pi, f.ctx);
+    const toolResult = sent.find((m) => m.role === "toolResult");
+    assert.ok(toolResult);
+    assert.equal(toolResult.isError, true);
+    assert.deepEqual(toolResult.content, [
+      { type: "text", text: "Summarization aborted. Nothing was collapsed." },
+    ]);
   });
 
   it("does not mutate the tree, send a message, or write a label", async () => {
@@ -1897,19 +2280,18 @@ describe("dispatch: rewind phase 1 (summary request)", () => {
     assert.equal(result.details.contextWindow, 0);
   });
 
-  it("interpolates the focus verbatim (no truncation, no {first} left over)", async () => {
-    const { sm, pi, tool, ctx } = setup();
-    setupRewindable(sm, pi);
+  it("interpolates the focus verbatim into the instruction (no truncation, no {first} left over)", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
     const focus = `user said: ship it. ${"detail ".repeat(400)}`.trim();
-    const result = await tool.execute(
-      "tc-rewind",
-      { ...REWIND_ARGS, summaryFocus: focus },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.ok(result.content[0].text.endsWith(`Additional focus: ${focus}`));
-    assert.doesNotMatch(result.content[0].text, /\{first\}/);
+    const { result } = await requestRewind(f, {
+      ...REWIND_ARGS,
+      summaryFocus: focus,
+    });
+    assert.equal(result.isError, undefined);
+    const draft = summaryRequestDraftOf(f.pi);
+    assert.ok(draft.content.endsWith(`Additional focus: ${focus}`));
+    assert.doesNotMatch(draft.content, /\{first\}/);
   });
 
   it("numbers {first} from the context-edited projection, not the raw entry walk", async () => {
@@ -1931,7 +2313,6 @@ describe("dispatch: rewind phase 1 (summary request)", () => {
       ctx,
     );
     assert.equal(result.details.first, 3);
-    assert.match(result.content[0].text, /^Summarize only messages 3 onwards/);
   });
 
   it("numbers {first} past provider-invisible empty assistants (aborted attempt)", async () => {
@@ -1991,7 +2372,6 @@ describe("dispatch: rewind phase 1 (summary request)", () => {
     );
     assert.equal(result.isError, undefined);
     assert.equal(result.details.first, 1);
-    assert.match(result.content[0].text, /^Summarize only messages 1 onwards/);
   });
 
   it("countBackgroundMessages stops at the target entry", () => {
@@ -2053,7 +2433,10 @@ describe("rewind: tool_call gate while pending", () => {
       fireToolCall(f.pi, f.ctx, TOOL_NAME, { action: "list" }),
       expected,
     );
-    assert.match(SUMMARY_PENDING_BLOCK_REASON, /starting with '## Goal'/);
+    assert.equal(
+      SUMMARY_PENDING_BLOCK_REASON,
+      "navigate_tree: blocked: the model tried to call a tool instead of summarizing.",
+    );
   });
 
   it("does not block another session's tool calls", async () => {
@@ -2164,9 +2547,9 @@ describe("rewind phase 2: completion", () => {
       reappendedLateMessages: 0,
     });
     // Collapsed: the anchor's label-change entry, u2..a4 (6), the rewind
-    // call, its result, and the summary turn — all left on the abandoned
-    // branch.
-    assert.equal(d.collapsedEntries, 10);
+    // call, its result, the instruction message, and the summary turn — all
+    // left on the abandoned branch.
+    assert.equal(d.collapsedEntries, 11);
     assert.ok(
       (d.contextBefore as number) > (d.contextAfter as number),
       "the rewound chain must be smaller",
@@ -2568,12 +2951,12 @@ describe("rewind phase 2: completion", () => {
 // rewind phase 2 — failed summary turns, cancellation, abort (#80)
 // =============================================================================
 
-describe("rewind phase 2: failures", () => {
+describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
   async function pending() {
     const f = setup();
     const { anchorId } = setupRewindable(f.sm, f.pi, { capture: true });
-    await requestRewind(f);
-    return { ...f, anchorId };
+    const { callId } = await requestRewind(f);
+    return { ...f, anchorId, callId };
   }
 
   function assertNotBranched(sm: SessionManager): void {
@@ -2583,55 +2966,203 @@ describe("rewind phase 2: failures", () => {
     );
   }
 
-  /** A failed summary turn that calls a tool instead of summarizing. */
-  async function toolCallTurn(
-    f: Awaited<ReturnType<typeof pending>>,
-    id: string,
-  ): Promise<void> {
-    const { message } = appendToolCallAssistant(f.sm, [
-      { id, name: "bash", arguments: { command: "ls" } },
-    ]);
-    await fireTurnEndAll(f.pi, f.ctx, message);
+  /** A committed text attempt (pi persists it, then commits the drafts). */
+  function attempt(
+    f: { sm: SessionManager; pi: FakePi; ctx: FakeCtx },
+    text: string,
+    stopReason = "stop",
+  ) {
+    return summaryTurn(f, text, stopReason, { commit: true });
   }
 
-  it("a tool-call turn spends an attempt silently (the blocked result re-asks)", async () => {
+  function rewindResultEntryId(sm: SessionManager): string {
+    const entry = sm
+      .getBranch()
+      .find(
+        (e) =>
+          e.type === "message" &&
+          e.message.role === "toolResult" &&
+          e.message.toolCallId === "tc-rewind",
+      );
+    assert.ok(entry);
+    return entry.id;
+  }
+
+  function instructionEntryId(sm: SessionManager): string {
+    const entry = sm
+      .getBranch()
+      .find(
+        (e) =>
+          e.type === "custom_message" &&
+          e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+      );
+    assert.ok(entry);
+    return entry.id;
+  }
+
+  /**
+   * §15.2/§15.4: once a rewind has ended, what pi stores (the projection
+   * that `{first}`, estimates and compaction read) and what the `context`
+   * handler sends agree, except the `isError` flag on the rewind's result.
+   */
+  function assertProjectionAgrees(f: {
+    sm: SessionManager;
+    pi: FakePi;
+    ctx: FakeCtx;
+  }): void {
+    const stored = f.sm
+      .buildSessionProjection()
+      .messages.filter((m) => m.role !== "system")
+      .map((m) =>
+        m.role === "toolResult" && m.toolCallId === "tc-rewind"
+          ? { ...m, isError: true }
+          : m,
+      );
+    assert.deepEqual(fireContext(f.pi, f.ctx), stored);
+  }
+
+  it("a text attempt without '## Goal' hides only that assistant and re-sends, nothing appended", async () => {
     const f = await pending();
-    await toolCallTurn(f, "tc-bash-1");
-    assert.equal(rewindMessages(f.pi).length, 0);
+    const before = fireContext(f.pi, f.ctx);
+    const { entryId, boundary } = await attempt(f, "Okay, I'll summarize now.");
+    assert.equal(boundary.continue, true);
+    assert.deepEqual(boundary.entries, [
+      { type: "context_edit", targetId: entryId, replacement: null },
+    ]);
+    assert.deepEqual([...hiddenIds(f.sm)], [entryId]);
+    assert.equal(outcomeEntries(f.sm).length, 0);
     assertNotBranched(f.sm);
     assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
-    await toolCallTurn(f, "tc-bash-2");
-    assert.equal(rewindMessages(f.pi).length, 0);
-    // Third turn is a valid summary: lands with the attempt count.
-    await summaryTurn(f);
-    const done = rewindMessages(f.pi)[0].message;
-    assert.equal(done.details.status, "done");
-    assert.equal(done.details.summaryAttempts, MAX_SUMMARY_ATTEMPTS);
+    assert.deepEqual(fireContext(f.pi, f.ctx), before, "identical retry");
   });
 
-  it("a tool-call failure below the cap returns no boundary result", async () => {
+  it("a tool-call attempt hides the assistant and ALL its tool results together", async () => {
     const f = await pending();
-    const { message } = appendToolCallAssistant(f.sm, [
-      { id: "tc-bash-1", name: "bash", arguments: { command: "ls" } },
+    const { entryId, resultIds, boundary } = await toolCallAttempt(f, [
+      "tc-a",
+      "tc-b",
     ]);
-    const handlers = f.pi.onCalls.get("turn_end");
-    assert.ok(handlers);
-    const result = await handlers[0](
-      {
-        type: "turn_end",
-        turnIndex: 0,
-        message,
-        toolResults: [],
-        entries: [],
-        continue: false,
-      } as never,
-      f.ctx as never,
+    assert.equal(boundary.continue, true);
+    assert.deepEqual(
+      boundary.entries.map((d) => [d.type, d.targetId, d.replacement]),
+      [entryId, ...resultIds].map((id) => ["context_edit", id, null]),
     );
-    assert.equal(result, undefined);
-    assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
+    assertNotBranched(f.sm);
   });
 
-  it("a mixed text + tool-call turn is a failure even with a ## Goal heading", async () => {
+  it("identical retries: a user steer and an extension message mid-pending never reach the request", async () => {
+    const f = await pending();
+    const before = fireContext(f.pi, f.ctx);
+    // Steer drained after the instruction + another extension's message.
+    f.sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "also check X" }],
+      timestamp: Date.now(),
+    } as never);
+    f.sm.appendCustomMessageEntry("subagent-result", "done", true);
+    assert.deepEqual(fireContext(f.pi, f.ctx), before, "attempt 1 request");
+    await toolCallAttempt(f);
+    assert.deepEqual(fireContext(f.pi, f.ctx), before, "attempt 2 request");
+    await attempt(f, "no heading");
+    assert.deepEqual(fireContext(f.pi, f.ctx), before, "attempt 3 request");
+    // The request ends at the instruction.
+    const last = before.at(-1) as { role?: string; customType?: string };
+    assert.equal(last.role, "custom");
+    assert.equal(last.customType, SUMMARY_REQUEST_CUSTOM_TYPE);
+  });
+
+  const causes: Array<{
+    name: string;
+    run: (f: Awaited<ReturnType<typeof pending>>) => Promise<unknown>;
+    text: string;
+    reason: string;
+  }> = [
+    {
+      name: "cut off",
+      run: (f) => attempt(f, SUMMARY_TEXT, "length"),
+      text: "Summarization failed: no summary after 3 attempts (last: cut off). Nothing was collapsed. Try again with a tighter summaryFocus.",
+      reason: "no summary after 3 attempts (last: cut off)",
+    },
+    {
+      name: "called a tool",
+      run: (f) => toolCallAttempt(f, [`tc-${Math.random()}`]),
+      text: "Summarization failed: no summary after 3 attempts (last: called a tool). Nothing was collapsed. Try again; the reply after the rewind must be only the summary.",
+      reason: "no summary after 3 attempts (last: called a tool)",
+    },
+    {
+      name: "no '## Goal' summary",
+      run: (f) => attempt(f, "Sure, summarizing."),
+      text: "Summarization failed: no summary after 3 attempts (last: no '## Goal' summary). Nothing was collapsed. Try again; the reply after the rewind must be only the summary.",
+      reason: "no summary after 3 attempts (last: no '## Goal' summary)",
+    },
+  ];
+  for (const c of causes) {
+    it(`3rd failure (last: ${c.name}) ends the rewind as a failed tool call (O5)`, async () => {
+      const f = await pending();
+      const resultId = rewindResultEntryId(f.sm);
+      const instructionId = instructionEntryId(f.sm);
+      // Attempts 1-2 use another cause: the LAST attempt names the ending.
+      await attempt(f, "first try");
+      await toolCallAttempt(f, ["tc-2"]);
+      await c.run(f);
+      const boundary = f.pi.boundaryResults.at(-1);
+      assert.ok(boundary);
+      assert.equal(boundary.continue, true);
+      assert.equal(c.text, buildSummaryFailedText(c.name as never));
+      const outcome = outcomeEntries(f.sm);
+      assert.equal(outcome.length, 1);
+      assert.equal(outcome[0].status, "failed");
+      assert.equal(outcome[0].text, c.text);
+      assert.equal(outcome[0].reason, c.reason);
+      assert.equal(outcome[0].toolCallId, "tc-rewind");
+      assert.equal(outcome[0].toolResultEntryId, resultId);
+      assert.ok(hiddenIds(f.sm).has(instructionId), "instruction hidden");
+      // The tool result now reads as the failure, as an error (clone).
+      const sent = fireContext(f.pi, f.ctx);
+      const result = sent.find(
+        (m) => m.role === "toolResult" && m.toolCallId === "tc-rewind",
+      );
+      assert.ok(result);
+      assert.equal(result.isError, true);
+      assert.deepEqual(result.content, [{ type: "text", text: c.text }]);
+      assert.ok(
+        !sent.some(
+          (m) =>
+            (m as { customType?: string }).customType ===
+            SUMMARY_REQUEST_CUSTOM_TYPE,
+        ),
+      );
+      assert.ok(
+        !sent.some(
+          (m, i) => i > sent.indexOf(result) && m.role === "assistant",
+        ),
+        "every attempt hidden",
+      );
+      // The session's own message objects are never mutated.
+      const stored = f.sm.getEntry(resultId);
+      assert.ok(stored && stored.type === "message");
+      assert.equal((stored.message as { isError?: boolean }).isError, false);
+      assertProjectionAgrees(f);
+      assertNotBranched(f.sm);
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate re-opened");
+      // A later valid summary turn no longer completes anything.
+      await attempt(f, SUMMARY_TEXT);
+      assertNotBranched(f.sm);
+    });
+  }
+
+  it("a cut-off reply that also calls a tool counts as 'cut off'", async () => {
+    const f = await pending();
+    await attempt(f, "x");
+    await attempt(f, "y");
+    await toolCallAttempt(f, ["tc-cut"], "length");
+    assert.equal(
+      outcomeEntries(f.sm)[0].text,
+      buildSummaryFailedText("cut off"),
+    );
+  });
+
+  it("a summary plus a tool call is a failure ('called a tool')", async () => {
     const f = await pending();
     const message = assistantMessage(
       [
@@ -2640,102 +3171,60 @@ describe("rewind phase 2: failures", () => {
       ],
       "toolUse",
     );
-    f.sm.appendMessage(message as never);
+    const entryId = f.sm.appendMessage(message as never);
+    const resultId = appendToolResult(f.sm, "tc-x", "bash", "blocked");
     await fireTurnEndAll(f.pi, f.ctx, message);
     assertNotBranched(f.sm);
-    assert.equal(rewindMessages(f.pi).length, 0);
+    assert.deepEqual(hiddenIds(f.sm), new Set([entryId, resultId]));
     assert.ok(fireToolCall(f.pi, f.ctx));
   });
 
-  it("text without '## Goal' sends a retry message", async () => {
+  it("late input becomes visible again after a failure, right after the failed result (O1b)", async () => {
     const f = await pending();
-    await summaryTurn(f, "Okay, I'll summarize now.");
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].continue, true);
-    assert.equal(calls[0].message.customType, REWIND_CUSTOM_TYPE);
-    assert.equal(calls[0].message.content, buildSummaryRetryText("start"));
-    assert.equal(calls[0].message.display, true);
-    assert.deepEqual(calls[0].message.details, {
-      status: "summary-retry",
-      rewindTo: "start",
-      newLabel: "end",
-      summaryAttempts: 1,
-    });
-    assertNotBranched(f.sm);
-    assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
-  });
-
-  it("a truncated summary (stopReason 'length') is a failure", async () => {
-    const f = await pending();
-    await summaryTurn(f, SUMMARY_TEXT, "length");
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].message.details.status, "summary-retry");
-    assertNotBranched(f.sm);
-  });
-
-  it(`cancels after MAX_SUMMARY_ATTEMPTS (${MAX_SUMMARY_ATTEMPTS}) failures and re-opens the gate`, async () => {
-    const f = await pending();
-    const leafBefore = f.sm.getLeafId();
-    for (let i = 0; i < MAX_SUMMARY_ATTEMPTS; i++) {
-      await summaryTurn(f, `attempt ${i}`);
-    }
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, MAX_SUMMARY_ATTEMPTS);
-    for (let i = 0; i < MAX_SUMMARY_ATTEMPTS - 1; i++) {
-      assert.equal(calls[i].message.details.status, "summary-retry");
-      assert.equal(calls[i].message.details.summaryAttempts, i + 1);
-    }
-    const cancel = calls[MAX_SUMMARY_ATTEMPTS - 1];
-    const reason = `no summary after ${MAX_SUMMARY_ATTEMPTS} attempts`;
-    assert.equal(cancel.continue, true);
-    assert.equal(
-      cancel.message.content,
-      buildRewindCancelledText("start", reason),
+    const steerId = f.sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "also check X" }],
+      timestamp: Date.now(),
+    } as never);
+    for (let i = 0; i < MAX_SUMMARY_ATTEMPTS; i++) await attempt(f, `a${i}`);
+    const sent = fireContext(f.pi, f.ctx);
+    const resultAt = sent.findIndex(
+      (m) => m.role === "toolResult" && m.toolCallId === "tc-rewind",
     );
-    assert.deepEqual(cancel.message.details, {
-      status: "cancelled",
-      rewindTo: "start",
-      newLabel: "end",
-      reason,
-      summaryAttempts: MAX_SUMMARY_ATTEMPTS,
-    });
-    assertNotBranched(f.sm);
-    assert.notEqual(f.sm.getLeafId(), leafBefore, "failed turns stay on");
-    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate re-opened");
-    // A later valid summary turn no longer completes anything.
-    await summaryTurn(f);
-    assert.equal(rewindMessages(f.pi).length, MAX_SUMMARY_ATTEMPTS);
-    assertNotBranched(f.sm);
+    const steerAt = sent.findIndex(
+      (m) =>
+        m.role === "user" && JSON.stringify(m.content).includes("also check X"),
+    );
+    assert.ok(resultAt >= 0 && steerAt === resultAt + 1);
+    assert.ok(!hiddenIds(f.sm).has(steerId));
   });
 
-  it("tool-call failures count toward the cap and cancel on the last one", async () => {
+  it("an aborted attempt ends the rewind aborted: attempt hidden, no continue", async () => {
     const f = await pending();
-    for (let i = 0; i < MAX_SUMMARY_ATTEMPTS; i++) {
-      await toolCallTurn(f, `tc-bash-${i}`);
-    }
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].message.details.status, "cancelled");
-    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
-  });
-
-  it("an aborted turn drops the rewind silently", async () => {
-    const f = await pending();
-    await summaryTurn(f, SUMMARY_TEXT, "aborted");
-    assert.equal(rewindMessages(f.pi).length, 0);
+    const { entryId, boundary } = await attempt(
+      f,
+      "## Goal\npartial",
+      "aborted",
+    );
+    assert.equal(boundary.continue, false);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+    assert.equal(
+      REWIND_ABORTED_TEXT,
+      "Summarization aborted. Nothing was collapsed.",
+    );
+    assert.ok(hiddenIds(f.sm).has(entryId));
+    assertProjectionAgrees(f);
     assertNotBranched(f.sm);
     assert.equal(fireToolCall(f.pi, f.ctx), undefined);
-    await summaryTurn(f);
-    assertNotBranched(f.sm);
   });
 
   it("an error turn keeps the rewind pending without spending an attempt", async () => {
     const f = await pending();
-    await summaryTurn(f, "", "error");
-    assert.equal(rewindMessages(f.pi).length, 0);
-    assertNotBranched(f.sm);
+    const { boundary } = await attempt(f, "", "error");
+    assert.deepEqual(boundary.entries, []);
     assert.ok(fireToolCall(f.pi, f.ctx), "still pending after an error");
     await summaryTurn(f);
     const done = rewindMessages(f.pi)[0].message;
@@ -2743,79 +3232,238 @@ describe("rewind phase 2: failures", () => {
     assert.equal(done.details.summaryAttempts, 1);
   });
 
-  it("agent_end drops a pending rewind", async () => {
+  it("pi-fallback-provider coexistence: its null edit on the errored attempt + ours stay valid; not counted", async () => {
+    const f = await pending();
+    const errored = await attempt(f, "", "error");
+    // The fallback provider hides the errored attempt at agent_before_settle
+    // and continues on another model.
+    const settle = await fireAgentBeforeSettle(f.pi, f.ctx, {
+      outcome: "error",
+      continue: true,
+      entries: [
+        {
+          type: "context_edit",
+          targetId: errored.entryId,
+          replacement: null,
+        } as BoundaryDraft,
+      ],
+    });
+    assert.equal(settle.continue, true);
+    assert.equal(settle.entries.length, 1, "the fallback's edit survives");
+    assert.ok(hiddenIds(f.sm).has(errored.entryId));
+    assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
+    const failed = await attempt(f, "no heading");
+    // Same target hidden again by both: still a valid list.
+    const both = await fireTurnEndAll(f.pi, f.ctx, failed.message, {
+      entries: [
+        {
+          type: "context_edit",
+          targetId: failed.entryId,
+          replacement: null,
+        } as BoundaryDraft,
+      ],
+    });
+    assert.equal(both.entries.length, 2);
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi).at(-1)?.message;
+    assert.equal(done?.details.status, "done");
+  });
+
+  it("agent_end keeps a pending rewind (agent_before_settle decides)", async () => {
     const f = await pending();
     fireAgentEnd(f.pi, f.ctx);
-    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
-    await summaryTurn(f);
-    assert.equal(rewindMessages(f.pi).length, 0);
-    assertNotBranched(f.sm);
+    assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
   });
 
-  it("session_start clears a pending rewind", async () => {
-    const fixture = makeConfigFixture();
-    try {
-      const f = await pending();
-      await runSessionStart(f.pi, f.ctx, fixture, "reload");
-      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
-    } finally {
-      cleanupConfigFixture(fixture);
-    }
-  });
-
-  it("an error turn survives agent_end (pi's auto-retry follows it) and the retry completes", async () => {
+  it("agent_before_settle ends a pending rewind: 'the run ended before the summary', continue", async () => {
     const f = await pending();
-    await summaryTurn(f, "", "error");
-    fireAgentEnd(f.pi, f.ctx);
-    assert.ok(fireToolCall(f.pi, f.ctx), "still pending across agent_end");
-    await summaryTurn(f);
-    const done = rewindMessages(f.pi)[0].message;
-    assert.equal(done.details.status, "done");
-    assert.equal(done.details.summaryAttempts, 1);
-  });
-
-  it("a non-error turn after an error resets the mark: agent_end drops again", async () => {
-    const f = await pending();
-    await summaryTurn(f, "", "error");
-    await summaryTurn(f, "Okay, summarizing now.");
+    const result = await fireAgentBeforeSettle(f.pi, f.ctx);
+    assert.equal(result.continue, true);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "failed");
     assert.equal(
-      rewindMessages(f.pi)[0].message.details.status,
-      "summary-retry",
+      outcome[0].text,
+      "Summarization failed: the run ended before the summary. Nothing was collapsed. Try again.",
     );
-    fireAgentEnd(f.pi, f.ctx);
+    assert.equal(
+      outcome[0].text,
+      buildRewindFailedText("the run ended before the summary"),
+    );
+    assert.ok(hiddenIds(f.sm).has(instructionEntryId(f.sm)));
+    assertProjectionAgrees(f);
     assert.equal(fireToolCall(f.pi, f.ctx), undefined);
   });
 
-  it("before_agent_start (a new user prompt) drops a pending rewind, even an errored one", async () => {
+  it("agent_before_settle leaves it pending on an error outcome or an explicit continue", async () => {
     const f = await pending();
-    await summaryTurn(f, "", "error");
+    await fireAgentBeforeSettle(f.pi, f.ctx, { outcome: "error" });
+    assert.ok(fireToolCall(f.pi, f.ctx));
+    await fireAgentBeforeSettle(f.pi, f.ctx, { continue: true });
+    assert.ok(fireToolCall(f.pi, f.ctx));
+    assert.equal(outcomeEntries(f.sm).length, 0);
+  });
+
+  it("Esc while a blocked attempt's tools resolve ends it aborted, not failed (O6)", async () => {
+    const f = await pending();
+    const controller = new AbortController();
+    controller.abort();
+    f.ctx.signal = controller.signal;
+    const { entryId, resultIds, boundary } = await toolCallAttempt(f);
+    f.ctx.signal = undefined;
+    assert.equal(boundary.continue, false);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+    for (const id of [entryId, ...resultIds]) {
+      assert.ok(hiddenIds(f.sm).has(id), "the aborted attempt is hidden");
+    }
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
+  it("agent_before_settle on an aborted outcome ends it aborted without continue", async () => {
+    const f = await pending();
+    const result = await fireAgentBeforeSettle(f.pi, f.ctx, {
+      outcome: "aborted",
+    });
+    assert.equal(result.continue, false);
+    assert.equal(outcomeEntries(f.sm)[0].status, "aborted");
+  });
+
+  it("agent_settled with the rewind still pending (errored, no retry) ends it aborted outside a boundary", async () => {
+    const f = await pending();
+    const errored = await attempt(f, "", "error");
+    await fireAgentBeforeSettle(f.pi, f.ctx, { outcome: "error" });
+    await fireAgentSettled(f.pi, f.ctx);
+    assert.equal(f.pi.appendEntryCalls.length, 1);
+    assert.equal(f.pi.appendEntryCalls[0][0], REWIND_OUTCOME_CUSTOM_TYPE);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+    assert.ok(hiddenIds(f.sm).has(instructionEntryId(f.sm)));
+    // The errored attempt is pi's to hide; ours are exact ids only.
+    assert.ok(!hiddenIds(f.sm).has(errored.entryId));
+    const replaced = f.sm
+      .getBranch()
+      .find(
+        (e) =>
+          e.type === "context_edit" && e.targetId === rewindResultEntryId(f.sm),
+      );
+    assert.ok(replaced, "the tool result rewrite is persisted");
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
+  it("agent_settled names the reason: aborted run vs an error with no retry", async () => {
+    const f = await pending();
+    await attempt(f, "", "error");
+    await fireAgentSettled(f.pi, f.ctx, true);
+    assert.equal(outcomeEntries(f.sm)[0].reason, "aborted");
+    assert.equal(outcomeEntries(f.sm)[0].text, REWIND_ABORTED_TEXT);
+    const g = await pending();
+    await attempt(g, "", "error");
+    await fireAgentSettled(g.pi, g.ctx, false);
+    assert.equal(
+      outcomeEntries(g.sm)[0].reason,
+      "the run ended after an error",
+    );
+  });
+
+  it("before_agent_start (a new prompt) ends a pending rewind aborted", async () => {
+    const f = await pending();
+    await attempt(f, "", "error");
     await fireBeforeAgentStart(f.pi, f.ctx, undefined);
+    assert.equal(outcomeEntries(f.sm)[0].status, "aborted");
     assert.equal(fireToolCall(f.pi, f.ctx), undefined);
     await summaryTurn(f);
-    assert.equal(rewindMessages(f.pi).length, 0);
     assertNotBranched(f.sm);
   });
 
-  it("cancels when a compaction landed after the rewind call", async () => {
+  it("session_compact while pending ends it before the next request (O7)", async () => {
+    const f = await pending();
+    await fireSessionCompact(f.pi, f.ctx, f.anchorId);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(
+      outcome[0].text,
+      "Summarization failed: the context was compacted. Nothing was collapsed. Try again.",
+    );
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
+  it("a compaction entry after the rewind call ends it at the next request / turn_end", async () => {
     const f = await pending();
     f.sm.appendCompaction("COMPACTED", f.anchorId, 20_000);
-    await summaryTurn(f);
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    const reason =
-      "the context was compacted while the summary was being written";
-    assert.equal(
-      calls[0].message.content,
-      buildRewindCancelledText("start", reason),
-    );
-    assert.equal(calls[0].message.details.reason, reason);
-    assertNotBranched(f.sm);
+    fireContext(f.pi, f.ctx);
+    assert.equal(outcomeEntries(f.sm)[0].reason, "the context was compacted");
     assert.equal(fireToolCall(f.pi, f.ctx), undefined);
   });
 
-  it("cancels when the rewind call is no longer on the active branch", async () => {
+  it("a compaction seen first at the attempt's turn_end ends it there", async () => {
     const f = await pending();
-    // Move the leaf back above the rewind call (anchor and labels intact).
+    f.sm.appendCompaction("COMPACTED", f.anchorId, 20_000);
+    const { boundary } = await attempt(f, SUMMARY_TEXT);
+    assert.equal(boundary.continue, true);
+    assert.equal(outcomeEntries(f.sm)[0].reason, "the context was compacted");
+    assertNotBranched(f.sm);
+  });
+
+  it("instruction never committed: the request ends it 'could not be delivered' (§15.5)", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    // Another handler's invalid draft drops the whole list (instruction too).
+    const call = appendToolCallAssistant(f.sm, [
+      { id: "tc-rewind", name: TOOL_NAME, arguments: REWIND_ARGS },
+    ]);
+    const result = await f.tool.execute(
+      "tc-rewind",
+      REWIND_ARGS,
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    appendToolResult(f.sm, "tc-rewind", TOOL_NAME, result.content[0].text);
+    await fireTurnEndAll(f.pi, f.ctx, call.message, { commit: false });
+    assert.ok(fireToolCall(f.pi, f.ctx), "pending");
+    const sent = fireContext(f.pi, f.ctx);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(
+      outcome[0].text,
+      "Summarization failed: the summary request could not be delivered. Nothing was collapsed. Try again.",
+    );
+    const toolResult = sent.find(
+      (m) => m.role === "toolResult" && m.toolCallId === "tc-rewind",
+    );
+    assert.equal(toolResult?.isError, true);
+  });
+
+  it("instruction never committed and no request seen: the attempt's turn_end ends it", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    const call = appendToolCallAssistant(f.sm, [
+      { id: "tc-rewind", name: TOOL_NAME, arguments: REWIND_ARGS },
+    ]);
+    const result = await f.tool.execute(
+      "tc-rewind",
+      REWIND_ARGS,
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    appendToolResult(f.sm, "tc-rewind", TOOL_NAME, result.content[0].text);
+    await fireTurnEndAll(f.pi, f.ctx, call.message, { commit: false });
+    const { entryId } = await attempt(f, SUMMARY_TEXT);
+    assert.equal(
+      outcomeEntries(f.sm)[0].reason,
+      "the summary request could not be delivered",
+    );
+    assert.ok(hiddenIds(f.sm).has(entryId));
+    assertNotBranched(f.sm);
+  });
+
+  it("ends when the rewind call is no longer on the active branch", async () => {
+    const f = await pending();
     const a4 = f.sm
       .getBranch()
       .find(
@@ -2827,85 +3475,804 @@ describe("rewind phase 2: failures", () => {
     assert.ok(a4);
     f.sm.branch(a4.id);
     await summaryTurn(f);
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
+    const drafts = f.pi.boundaryResults.at(-1)?.entries ?? [];
+    const outcome = drafts.find(
+      (d) => d.customType === REWIND_OUTCOME_CUSTOM_TYPE,
+    );
     assert.equal(
-      calls[0].message.details.reason,
+      outcome?.data?.reason,
       "the rewind call is no longer on the active branch",
     );
     assertNotBranched(f.sm);
   });
 
-  it("a throwing branchWithSummary cancels: message delivered, pending cleared, gate reopened", async () => {
+  it("a throwing branchWithSummary ends it failed and clears the branch: label", async () => {
     const f = await pending();
     (f.sm as unknown as { branchWithSummary: () => string }).branchWithSummary =
       () => {
         throw new Error("disk full");
       };
-    const labelCallsBefore = f.pi.setLabelCalls.length;
-    await summaryTurn(f);
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    const reason = "the branch could not be written (disk full)";
-    assert.equal(calls[0].continue, true);
+    const { entryId, boundary } = await attempt(f, SUMMARY_TEXT);
+    assert.equal(boundary.continue, true);
+    const outcome = outcomeEntries(f.sm);
     assert.equal(
-      calls[0].message.content,
-      buildRewindCancelledText("start", reason),
+      outcome[0].text,
+      "Summarization failed: the branch could not be written (disk full). Nothing was collapsed. Try again.",
     );
-    assert.deepEqual(calls[0].message.details, {
-      status: "cancelled",
-      rewindTo: "start",
-      newLabel: "end",
-      reason,
-      summaryAttempts: 0,
-    });
+    assert.equal(f.sm.getLabel(entryId), undefined, "branch: label cleared");
+    assert.ok(hiddenIds(f.sm).has(entryId), "the summary turn is hidden too");
     assertNotBranched(f.sm);
-    assert.equal(f.pi.setLabelCalls.length, labelCallsBefore, "no label");
     assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
-    await summaryTurn(f);
-    assert.equal(rewindMessages(f.pi).length, 1, "nothing left to complete");
   });
 
-  it("cancels when the anchor no longer resolves to the same entry", async () => {
+  it("a branch_summary disk write that throws after pi moved the leaf restores the leaf before failing", async () => {
+    const f = await pending();
+    // pi's branchWithSummary moves the leaf and appends in memory, THEN the
+    // file append throws (session-manager `_appendEntry` \u2192 `_persist`).
+    const internals = f.sm as unknown as { _persist: (e: unknown) => void };
+    const origPersist = internals._persist.bind(f.sm);
+    internals._persist = (entry: unknown) => {
+      if ((entry as { type?: string }).type === "branch_summary") {
+        throw new Error("ENOSPC");
+      }
+      origPersist(entry);
+    };
+    const { entryId, boundary } = await attempt(f, SUMMARY_TEXT);
+    assert.equal(boundary.continue, true);
+    const branch = f.sm.getBranch();
+    assert.ok(
+      !branch.some((e) => e.type === "branch_summary"),
+      "the active branch is not collapsed",
+    );
+    assert.ok(
+      branch.some((e) => e.id === entryId),
+      "the leaf is back on the summary turn's branch",
+    );
+    assert.ok(
+      branch.some(
+        (e) =>
+          e.type === "label" &&
+          e.targetId === entryId &&
+          e.label === "branch:end",
+      ),
+      "restored to the leaf right before the branch call (label entry kept)",
+    );
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(
+      outcome[0].text,
+      "Summarization failed: the branch could not be written (ENOSPC). Nothing was collapsed. Try again.",
+    );
+    assert.ok(hiddenIds(f.sm).has(entryId), "the summary turn is hidden");
+    assert.ok(hiddenIds(f.sm).has(instructionEntryId(f.sm)));
+    assert.equal(f.sm.getLabel(entryId), undefined, "branch: label cleared");
+  });
+
+  it("ends when the anchor no longer resolves to the same entry", async () => {
     const f = await pending();
     f.pi.pi.setLabel(f.anchorId, undefined);
-    await summaryTurn(f);
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    const reason = "'start' is no longer on the active branch";
+    await attempt(f, SUMMARY_TEXT);
     assert.equal(
-      calls[0].message.content,
-      buildRewindCancelledText("start", reason),
+      outcomeEntries(f.sm)[0].text,
+      "Summarization failed: 'start' is no longer on the active branch. Nothing was collapsed. Try again.",
     );
-    assert.equal(calls[0].message.details.status, "cancelled");
-    assert.equal(calls[0].message.details.reason, reason);
     assertNotBranched(f.sm);
-    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
   });
 
-  it("cancels when the anchor label moved to a different entry", async () => {
+  it("ends when the anchor label moved to a different entry", async () => {
     const f = await pending();
-    const leaf = f.sm.getLeafId() as string;
-    f.pi.pi.setLabel(leaf, "anchor:start");
-    await summaryTurn(f);
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls[0].message.details.status, "cancelled");
+    f.pi.pi.setLabel(f.sm.getLeafId() as string, "anchor:start");
+    await attempt(f, SUMMARY_TEXT);
+    assert.equal(outcomeEntries(f.sm)[0].status, "failed");
     assertNotBranched(f.sm);
   });
 
-  it("cancels when newLabel was taken before completion", async () => {
+  it("ends when newLabel was taken before completion", async () => {
     const f = await pending();
     f.pi.pi.setLabel(f.sm.getLeafId() as string, "anchor:end");
-    await summaryTurn(f);
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    const reason = "a label 'end' now exists on the active branch";
+    await attempt(f, SUMMARY_TEXT);
     assert.equal(
-      calls[0].message.content,
-      buildRewindCancelledText("start", reason),
+      outcomeEntries(f.sm)[0].reason,
+      "a label 'end' now exists on the active branch",
     );
-    assert.equal(calls[0].message.details.reason, reason);
     assertNotBranched(f.sm);
+  });
+
+  it("success after hidden attempts: their blocked calls stay out of the file lists (O3-B)", async () => {
+    const f = await pending();
+    await toolCallAttempt(f, ["tc-ghost"]);
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi)[0].message;
+    assert.equal(done.details.status, "done");
+    assert.equal(done.details.summaryAttempts, 2);
+    assert.deepEqual(done.details.readFiles, []);
+    const summary = f.sm.getEntry(done.details.summaryId as string);
+    assert.ok(summary && summary.type === "branch_summary");
+    assert.doesNotMatch(summary.summary, /tc-ghost/);
+  });
+});
+
+describe("rewind: an ending dropped by pi (#90)", () => {
+  // Another extension's invalid draft (e.g. a later handler's) makes pi drop
+  // the whole boundary list, our ending included (`commit: false`): it must
+  // be re-applied outside the boundary.
+
+  it("a dropped agent_before_settle ending is re-applied at the next request", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await fireAgentBeforeSettle(f.pi, f.ctx, { commit: false });
+    assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+    const sent = fireContext(f.pi, f.ctx);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(
+      outcome[0].text,
+      "Summarization failed: the run ended before the summary. Nothing was collapsed. Try again.",
+    );
+    const instruction = f.sm
+      .getBranch()
+      .find(
+        (e) =>
+          e.type === "custom_message" &&
+          e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+      );
+    assert.ok(instruction && hiddenIds(f.sm).has(instruction.id));
+    const result = sent.find(
+      (m) => m.role === "toolResult" && m.toolCallId === "tc-rewind",
+    );
+    assert.equal(result?.isError, true);
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
+    // Not written twice.
+    fireContext(f.pi, f.ctx);
+    assert.equal(outcomeEntries(f.sm).length, 1);
+  });
+
+  it("a dropped turn_end ending is re-applied at agent_settled", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    const message = assistantMessage([], "aborted", 100);
+    const entryId = f.sm.appendMessage(message as never);
+    await fireTurnEndAll(f.pi, f.ctx, message, { commit: false });
+    assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+    await fireAgentSettled(f.pi, f.ctx, true);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+    assert.ok(hiddenIds(f.sm).has(entryId), "the aborted attempt is hidden");
+  });
+
+  it("a dropped exhausted-attempts ending is re-applied at agent_before_settle with continue", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryTurn(f, "no goal 1", "stop", { commit: true });
+    await summaryTurn(f, "no goal 2", "stop", { commit: true });
+    // Attempt 3 exhausts the attempts; pi drops its turn_end list
+    // (another extension's invalid draft): entries [], continue false.
+    const third = await summaryTurn(f, "no goal 3", "stop", {
+      commit: false,
+    });
+    assert.equal(third.boundary.continue, true, "our ending asked to continue");
+    assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+    const result = await fireAgentBeforeSettle(f.pi, f.ctx);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "failed");
+    assert.ok(hiddenIds(f.sm).has(third.entryId), "attempt 3 is hidden");
+    assert.equal(
+      result.continue,
+      true,
+      "the model reads the failure in the same run",
+    );
+  });
+
+  it("a dropped failed ending re-applied at an aborted / errored settle does not continue", async () => {
+    for (const outcome of ["aborted", "error"] as const) {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      await summaryTurn(f, "no goal 1", "stop", { commit: true });
+      await summaryTurn(f, "no goal 2", "stop", { commit: true });
+      await summaryTurn(f, "no goal 3", "stop", { commit: false });
+      const result = await fireAgentBeforeSettle(f.pi, f.ctx, { outcome });
+      assert.equal(outcomeEntries(f.sm)[0].status, "failed");
+      assert.equal(result.continue, false, outcome);
+    }
+  });
+
+  it("a committed ending is not re-applied", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await fireAgentBeforeSettle(f.pi, f.ctx);
+    fireContext(f.pi, f.ctx);
+    await fireAgentSettled(f.pi, f.ctx);
+    assert.equal(outcomeEntries(f.sm).length, 1);
+    assert.equal(f.pi.appendEntryCalls.length, 0);
+  });
+});
+
+describe("rewind: reused tool-call ids (#90)", () => {
+  // OpenAI-compatible servers may send "" or reuse ids: everything a
+  // rewind keys on is its own entry ids, never the toolCallId alone.
+  for (const id of ["X", ""]) {
+    it(`two rewinds sharing toolCallId ${JSON.stringify(id)}: frozen view, rewrite and ending follow each rewind's own entries`, async () => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f, REWIND_ARGS, id);
+      await fireAgentBeforeSettle(f.pi, f.ctx);
+      assert.equal(outcomeEntries(f.sm).length, 1);
+      appendTurn(f.sm, "u9", "a9", 30_000);
+      await requestRewind(f, { ...REWIND_ARGS, newLabel: "end2" }, id);
+      assert.ok(fireToolCall(f.pi, f.ctx), "the second rewind is pending");
+      const instructions = f.sm
+        .getBranch()
+        .filter(
+          (e) =>
+            e.type === "custom_message" &&
+            e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+        );
+      assert.equal(instructions.length, 2);
+      const sent = fireContext(f.pi, f.ctx);
+      // Frozen at the SECOND instruction (the first one is hidden).
+      assert.equal(
+        (sent.at(-1) as { details?: { newLabel?: string } }).details?.newLabel,
+        "end2",
+      );
+      assert.ok(
+        sent.some((m) => JSON.stringify(m.content).includes('"a9"')),
+        "work after the first rewind is still sent",
+      );
+      const results = () =>
+        fireContext(f.pi, f.ctx).filter(
+          (m) => m.role === "toolResult" && m.toolCallId === id,
+        );
+      // Only the first (ended) rewind's result reads as failed.
+      let r = results();
+      assert.equal(r.length, 2);
+      assert.equal(r[0].isError, true);
+      assert.notEqual(r[1].isError, true);
+      assert.match(JSON.stringify(r[1].content), /accepted/);
+      // The second ends aborted: its own result and instruction only.
+      await fireAgentBeforeSettle(f.pi, f.ctx, { outcome: "aborted" });
+      const outcomes = outcomeEntries(f.sm);
+      assert.equal(outcomes.length, 2);
+      assert.notEqual(
+        outcomes[0].toolResultEntryId,
+        outcomes[1].toolResultEntryId,
+      );
+      assert.ok(hiddenIds(f.sm).has(instructions[1].id));
+      r = results();
+      assert.equal(r.length, 2);
+      assert.equal(
+        (r[0].content as Array<{ text: string }>)[0].text,
+        "Summarization failed: the run ended before the summary. Nothing was collapsed. Try again.",
+      );
+      assert.equal(
+        (r[1].content as Array<{ text: string }>)[0].text,
+        REWIND_ABORTED_TEXT,
+      );
+      assert.equal(r[1].isError, true);
+    });
+
+    it(`an attempt calling a tool with the rewind's id ${JSON.stringify(id)} is an attempt, not the rewind turn (matched by messageEntryId)`, async () => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f, REWIND_ARGS, id);
+      const { entryId, resultIds } = await toolCallAttempt(f, [id]);
+      const instructions = f.sm
+        .getBranch()
+        .filter(
+          (e) =>
+            e.type === "custom_message" &&
+            e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+        );
+      assert.equal(instructions.length, 1, "no second instruction");
+      for (const hidden of [entryId, ...resultIds]) {
+        assert.ok(hiddenIds(f.sm).has(hidden), "the attempt is hidden");
+      }
+      assert.equal(outcomeEntries(f.sm).length, 0);
+      assert.ok(fireToolCall(f.pi, f.ctx), "still pending, re-sent");
+    });
+
+    it(`the rewind turn's boundary skipped: a later turn calling ${JSON.stringify(id)} is not taken for it (matched by messageEntryId)`, async () => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      appendToolCallAssistant(f.sm, [
+        { id, name: TOOL_NAME, arguments: REWIND_ARGS },
+      ]);
+      const result = await f.tool.execute(
+        id,
+        REWIND_ARGS,
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      appendToolResult(f.sm, id, TOOL_NAME, result.content[0].text);
+      // pi never fired the rewind turn's turn_end.
+      const { entryId } = await toolCallAttempt(f, [id]);
+      assert.ok(
+        !f.pi.boundaryResults.some((r) =>
+          r.entries.some((d) => d.customType === SUMMARY_REQUEST_CUSTOM_TYPE),
+        ),
+        "no instruction for a turn that did not issue the rewind",
+      );
+      const outcome = outcomeEntries(f.sm);
+      assert.equal(outcome.length, 1);
+      assert.equal(
+        outcome[0].reason,
+        "the summary request could not be delivered",
+      );
+      assert.ok(hiddenIds(f.sm).has(entryId));
+    });
+  }
+});
+
+describe("rewind: restart while pending (#90 O8)", () => {
+  async function withSessionStart(
+    run: (fixture: ConfigFixture) => Promise<void>,
+  ): Promise<void> {
+    const fixture = makeConfigFixture();
+    try {
+      await run(fixture);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  }
+
+  it("an orphan instruction (no branch: label, no outcome) is ended aborted at session_start", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      const attempt = await summaryTurn(f, "partial", "stop", {
+        commit: false,
+      });
+      // A fresh extension instance (restart / reload): nothing pending.
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      await runSessionStart(g.pi, f.ctx, fixture, "resume");
+      const outcome = outcomeEntries(f.sm);
+      assert.equal(outcome.length, 1);
+      assert.equal(outcome[0].status, "aborted");
+      assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+      assert.ok(hiddenIds(f.sm).has(attempt.entryId), "the attempt is hidden");
+      // Idempotent: the outcome resolves it.
+      await runSessionStart(g.pi, f.ctx, fixture, "resume");
+      assert.equal(outcomeEntries(f.sm).length, 1);
+    });
+  });
+
+  it("orphan hiding skips a steer typed while pending (it sits before attempt 1); the steer stays visible", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      const steerId = f.sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "steer" }],
+      } as never);
+      const attempt = await summaryTurn(f, "partial", "stop", {
+        commit: false,
+      });
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      await runSessionStart(g.pi, f.ctx, fixture, "resume");
+      const hidden = hiddenIds(f.sm);
+      assert.ok(hidden.has(attempt.entryId), "attempt 1 after the steer");
+      assert.ok(!hidden.has(steerId), "the steer stays visible");
+    });
+  });
+
+  it("orphan hiding stops after MAX_SUMMARY_ATTEMPTS assistant turns", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      const ids: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        // User messages (steers) between turns do not end the window.
+        f.sm.appendMessage({
+          role: "user",
+          content: [{ type: "text", text: `steer ${i}` }],
+        } as never);
+        ids.push(
+          f.sm.appendMessage(
+            assistantMessage(
+              [{ type: "text", text: `t${i}` }],
+              "stop",
+              100,
+            ) as never,
+          ),
+        );
+      }
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      await runSessionStart(g.pi, f.ctx, fixture, "resume");
+      const hidden = hiddenIds(f.sm);
+      for (const id of ids.slice(0, 3)) assert.ok(hidden.has(id));
+      assert.ok(!hidden.has(ids[3]), "a 4th assistant turn was not an attempt");
+    });
+  });
+
+  it("the same session_start in-process also drops the in-memory pending rewind", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi);
+      await requestRewind(f);
+      await runSessionStart(f.pi, f.ctx, fixture, "reload");
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+      assert.equal(outcomeEntries(f.sm)[0].status, "aborted");
+    });
+  });
+
+  it("success leaves branch:<newLabel> on the summary turn; going back to the old branch is not an orphan", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = await rewindFixture({ commit: true });
+      assert.equal(f.sm.getLabel(f.summaryEntryId), "branch:end");
+      // `list` never shows it.
+      const list = await f.tool.execute(
+        "tc-list",
+        { action: "list" },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      assert.doesNotMatch(list.content[0].text, /branch:|\bend\b.*branch/);
+      // Back onto the abandoned branch (e.g. /tree), then a restart.
+      f.sm.branch(f.summaryEntryId);
+      await runSessionStart(f.pi, f.ctx, fixture, "resume");
+      assert.equal(outcomeEntries(f.sm).length, 0);
+    });
+  });
+
+  it("a later rewind's outcome with the same toolCallId does not resolve an orphan (matched by instructionEntryId)", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      // Rewind 1 (id "X") dies mid-flight: no outcome is ever written.
+      await requestRewind(f, REWIND_ARGS, "X");
+      // A fresh instance (nothing pending) runs rewind 2, reusing "X", and
+      // ends it: its outcome lands after rewind 1's instruction.
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      g.tool = g.pi.registered[0];
+      await requestRewind(g, { ...REWIND_ARGS, newLabel: "end2" }, "X");
+      await fireAgentBeforeSettle(g.pi, g.ctx);
+      const instructions = f.sm
+        .getBranch()
+        .filter(
+          (e) =>
+            e.type === "custom_message" &&
+            e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+        );
+      assert.equal(instructions.length, 2);
+      assert.equal(outcomeEntries(f.sm).length, 1);
+      assert.equal(
+        outcomeEntries(f.sm)[0].instructionEntryId,
+        instructions[1].id,
+      );
+      // Restart: rewind 1 is still an orphan.
+      const h = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(h.pi.pi);
+      await runSessionStart(h.pi, f.ctx, fixture, "resume");
+      const outcomes = outcomeEntries(f.sm);
+      assert.equal(outcomes.length, 2, "rewind 1 is ended at restart");
+      assert.equal(outcomes[1].instructionEntryId, instructions[0].id);
+      assert.equal(outcomes[1].status, "aborted");
+      assert.ok(hiddenIds(f.sm).has(instructions[0].id));
+    });
+  });
+
+  it("a failed rewind's outcome resolves its instruction", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi);
+      await requestRewind(f);
+      await fireAgentBeforeSettle(f.pi, f.ctx);
+      await runSessionStart(f.pi, f.ctx, fixture, "resume");
+      assert.equal(outcomeEntries(f.sm).length, 1);
+    });
+  });
+});
+
+describe("rewind: solo-call guard (#37, restored by #90 S6)", () => {
+  async function rewindIn(batch: Array<{ id: string; name: string }>) {
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    appendToolCallAssistant(
+      f.sm,
+      batch.map((c) => ({
+        ...c,
+        arguments: c.id === "tc-rewind" ? REWIND_ARGS : { path: "x" },
+      })),
+    );
+    const result = await f.tool.execute(
+      "tc-rewind",
+      REWIND_ARGS,
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    return { ...f, result };
+  }
+
+  it("refuses a rewind batched with other calls; nothing is recorded", async () => {
+    const f = await rewindIn([
+      { id: "tc-read", name: "read" },
+      { id: "tc-rewind", name: TOOL_NAME },
+    ]);
+    assert.equal(f.result.isError, true);
+    assert.equal(
+      f.result.content[0].text,
+      "rewind must be the only tool call in its message — re-issue only the rewind, alone. The other calls in this message ran normally.",
+    );
+    assert.equal(f.result.content[0].text, SOLO_REWIND_REFUSAL);
+    assert.deepEqual(f.result.details.batchedToolCalls, ["read", TOOL_NAME]);
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "nothing pending");
+  });
+
+  it("allows a solo rewind", async () => {
+    const f = await rewindIn([{ id: "tc-rewind", name: TOOL_NAME }]);
+    assert.equal(f.result.isError, undefined);
+  });
+
+  it("fails open when getBranch throws", () => {
+    const sm = {
+      getBranch() {
+        throw new Error("boom");
+      },
+    } as unknown as SessionManager;
+    assert.equal(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      null,
+    );
+  });
+
+  it("finds the declaring assistant by id even with sibling results after it", () => {
+    const sm = SessionManager.inMemory("/tmp");
+    appendToolCallAssistant(sm, [
+      { id: "tc-a", name: "read" },
+      { id: "tc-rewind", name: TOOL_NAME },
+    ]);
+    appendToolResult(sm, "tc-a", "read", "ok");
+    assert.deepEqual(
+      __testHooks.findInFlightAssistantToolCalls(sm, "tc-rewind"),
+      [
+        { id: "tc-a", name: "read" },
+        { id: "tc-rewind", name: TOOL_NAME },
+      ],
+    );
+    assert.equal(__testHooks.findInFlightAssistantToolCalls(sm, "nope"), null);
+  });
+
+  it("blocks a nested rewind (issued by another tool)", () => {
+    const { pi, ctx } = setup();
+    const handlers = pi.onCalls.get("tool_call");
+    assert.ok(handlers);
+    const result = handlers[0](
+      {
+        type: "tool_call",
+        toolCallId: "tc-code/1",
+        parentToolCallId: "tc-code",
+        toolName: TOOL_NAME,
+        input: { action: "rewind" },
+      } as never,
+      ctx as never,
+    );
+    assert.deepEqual(result, { block: true, reason: NESTED_REWIND_REFUSAL });
+    assert.equal(
+      NESTED_REWIND_REFUSAL,
+      "rewind cannot be called from inside another tool — call navigate_tree directly.",
+    );
+    // A nested list is fine.
+    assert.equal(
+      handlers[0](
+        {
+          type: "tool_call",
+          toolCallId: "tc-code/2",
+          parentToolCallId: "tc-code",
+          toolName: TOOL_NAME,
+          input: { action: "list" },
+        } as never,
+        ctx as never,
+      ),
+      undefined,
+    );
+  });
+});
+
+describe("rewind: TUI renderers (#90 O1 / O9)", () => {
+  const theme = { fg: (color: string, text: string) => `<${color}>${text}` };
+
+  it("summary request row: byte-exact, with and without a window", () => {
+    assert.equal(
+      buildSummaryRequestRow({
+        rewindTo: "context-gathered",
+        newLabel: "parser-done",
+        contextBefore: 304_000,
+        tokensAtTarget: 120_000,
+        contextWindow: 1_000_000,
+      }),
+      "[rewind to 'context-gathered' · collapse as 'parser-done'] · summarizing · context 30.4% → ~12.0% of 1.0M",
+    );
+    assert.equal(
+      buildSummaryRequestRow({
+        rewindTo: "a",
+        newLabel: "b",
+        contextBefore: 30400,
+        tokensAtTarget: 12000,
+        contextWindow: 0,
+      }),
+      "[rewind to 'a' · collapse as 'b'] · summarizing · tokens 30400 → ~12000",
+    );
+  });
+
+  it("outcome rows: failed with its reason, aborted without", () => {
+    assert.equal(
+      buildRewindOutcomeRow({
+        status: "failed",
+        reason: "no summary after 3 attempts (last: called a tool)",
+        rewindTo: "context-gathered",
+        newLabel: "parser-done",
+      }),
+      "[rewind to 'context-gathered' · collapse as 'parser-done'] · failed: no summary after 3 attempts (last: called a tool) · nothing collapsed",
+    );
+    assert.equal(
+      buildRewindOutcomeRow({
+        status: "aborted",
+        reason: "aborted",
+        rewindTo: "a",
+        newLabel: "b",
+      }),
+      "[rewind to 'a' · collapse as 'b'] · aborted · nothing collapsed",
+    );
+  });
+
+  it("registers a message renderer: collapsed = the row, expanded = row + full text", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    await requestRewind(f);
+    const renderer = f.pi.messageRenderers.get(SUMMARY_REQUEST_CUSTOM_TYPE);
+    assert.ok(renderer);
+    const draft = summaryRequestDraftOf(f.pi);
+    const message = {
+      role: "custom",
+      customType: draft.customType,
+      content: draft.content,
+      display: true,
+      details: draft.details,
+      timestamp: 0,
+    };
+    const collapsed = (
+      renderer as (...a: unknown[]) => { render(w: number): string[] }
+    )(message, { expanded: false, outputPad: 1 }, theme);
+    const row = buildSummaryRequestRow(draft.details as never);
+    assert.deepEqual(collapsed.render(400), [` <customMessageText>${row}`]);
+    const expanded = (
+      renderer as (...a: unknown[]) => { render(w: number): string[] }
+    )(message, { expanded: true, outputPad: 1 }, theme);
+    const lines = expanded.render(10_000);
+    assert.equal(lines[0], ` <customMessageText>${row}`);
+    assert.ok(lines.some((l) => l.includes("[navigate_tree]")));
+    for (const line of collapsed.render(30)) {
+      assert.ok(line.replace(/<[^>]+>/g, "").length <= 30, "wrapped to width");
+    }
+  });
+
+  it("registers an entry renderer for the outcome, error-styled", () => {
+    const f = setup();
+    const renderer = f.pi.entryRenderers.get(REWIND_OUTCOME_CUSTOM_TYPE) as (
+      ...a: unknown[]
+    ) => { render(w: number): string[] } | undefined;
+    assert.ok(renderer);
+    const out = renderer(
+      {
+        type: "custom",
+        customType: REWIND_OUTCOME_CUSTOM_TYPE,
+        data: {
+          status: "aborted",
+          reason: "aborted",
+          rewindTo: "a",
+          newLabel: "b",
+        },
+      },
+      { expanded: false },
+      theme,
+    );
+    assert.ok(out);
+    assert.deepEqual(out.render(200), [
+      " <error>[rewind to 'a' · collapse as 'b'] · aborted · nothing collapsed",
+    ]);
+    assert.equal(
+      renderer({ type: "custom", data: {} }, { expanded: false }, theme),
+      undefined,
+    );
+  });
+
+  it("wrapPlainLine word-wraps and hard-breaks long words", () => {
+    assert.deepEqual(wrapPlainLine("aaa bbb ccc", 7), ["aaa bbb", "ccc"]);
+    assert.deepEqual(wrapPlainLine("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    assert.deepEqual(wrapPlainLine("short", 10), ["short"]);
+  });
+
+  it("wrapPlainLine wraps by terminal cells: CJK, emoji and tabs never exceed the width", () => {
+    for (const text of [
+      "保持用户指令并继续工作，直到完成所有任务为止。".repeat(3),
+      "🚀🔥✅ emoji focus 🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪",
+      "\tTabbed\tfocus\twith\ttabs\teverywhere\t\t\t",
+    ]) {
+      for (const width of [1, 2, 3, 5, 8, 13, 400]) {
+        for (const line of wrapPlainLine(text, width)) {
+          assert.ok(
+            visibleWidth(line) <= width,
+            `${JSON.stringify(line)} is ${visibleWidth(line)} cells > ${width}`,
+          );
+          assert.ok(!line.includes("\t"), `${JSON.stringify(line)} has a tab`);
+        }
+      }
+    }
+  });
+
+  it("renderers never emit a line wider than the terminal (pi-tui crashes on one)", async () => {
+    const ansi = {
+      fg: (_color: string, text: string) => `\x1b[31m${text}\x1b[39m`,
+    };
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    await requestRewind(f, {
+      ...REWIND_ARGS,
+      newLabel: "cjk-end",
+      summaryFocus:
+        "保持用户指令并继续工作。🚀🔥✅🧪\tTabbed\tfocus\t保持用户指令并继续工作。",
+    });
+    const renderer = f.pi.messageRenderers.get(SUMMARY_REQUEST_CUSTOM_TYPE) as (
+      ...a: unknown[]
+    ) => { render(w: number): string[] };
+    const draft = summaryRequestDraftOf(f.pi);
+    const message = {
+      role: "custom",
+      customType: draft.customType,
+      content: draft.content,
+      display: true,
+      details: draft.details,
+      timestamp: 0,
+    };
+    const outcome = f.pi.entryRenderers.get(REWIND_OUTCOME_CUSTOM_TYPE) as (
+      ...a: unknown[]
+    ) => { render(w: number): string[] };
+    for (const width of [1, 2, 3, 7, 10, 17, 40, 400]) {
+      const rendered = [
+        ...renderer(message, { expanded: true, outputPad: 1 }, ansi).render(
+          width,
+        ),
+        ...outcome(
+          {
+            type: "custom",
+            customType: REWIND_OUTCOME_CUSTOM_TYPE,
+            data: {
+              status: "failed",
+              reason: "the branch could not be written (磁盘已满 🚫\tdisk)",
+              rewindTo: "开始",
+              newLabel: "结束🚀",
+            },
+          },
+          { expanded: true },
+          ansi,
+        ).render(width),
+      ];
+      for (const line of rendered) {
+        assert.ok(
+          visibleWidth(line) <= width,
+          `${JSON.stringify(line)} is ${visibleWidth(line)} cells > ${width}`,
+        );
+        // Tabs are expanded to spaces: no raw tab reaches a row.
+        assert.ok(!line.includes("\t"), `${JSON.stringify(line)} has a tab`);
+      }
+    }
   });
 });
 
@@ -3093,17 +4460,17 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     );
   });
 
-  it("does not re-append this extension's own rewind messages (e.g. a summary-retry)", async () => {
+  it("does not re-append this extension's own instruction message (#90)", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
     await requestRewind(f);
-    // `commit`: pi persists the delivered retry message.
+    // A failed attempt first: the retry re-sends, nothing appended.
     await summaryTurn(f, "Okay, summarizing now.", "stop", { commit: true });
-    const retry = rewindMessages(f.pi)[0].message;
-    assert.equal(retry.details.status, "summary-retry");
+    assert.equal(rewindMessages(f.pi).length, 0);
     await summaryTurn(f);
-    const done = rewindMessages(f.pi)[1].message;
+    const done = rewindMessages(f.pi)[0].message;
     assert.equal(done.details.status, "done");
+    assert.equal(done.details.summaryAttempts, 2);
     assert.equal(done.details.reappendedLateMessages, 0);
     assert.deepEqual(tailAfterSummary(f.sm), ["branch_summary", "label"]);
     assert.ok(!done.content.includes("arrived while the rewind was pending"));
@@ -3222,7 +4589,7 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     );
   });
 
-  it("a throwing getBranch before the write cancels with the completion reason", async () => {
+  it("a throwing getBranch before the write ends it with the completion reason", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
     await requestRewind(f);
@@ -3231,28 +4598,23 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     sm.getBranch = () => {
       throw new Error("branch boom");
     };
+    let boundary: BoundaryResult | undefined;
     try {
-      await assert.doesNotReject(summaryTurn(f));
+      await assert.doesNotReject(async () => {
+        boundary = (await summaryTurn(f)).boundary;
+      });
     } finally {
       sm.getBranch = origGetBranch;
     }
-    const calls = rewindMessages(f.pi);
-    assert.equal(calls.length, 1);
-    const reason = "the rewind could not be completed (branch boom)";
-    assert.equal(calls[0].continue, true);
-    assert.equal(calls[0].message.type, "custom_message");
-    assert.equal(calls[0].message.display, true);
-    assert.equal(
-      calls[0].message.content,
-      buildRewindCancelledText("start", reason),
+    assert.ok(boundary);
+    assert.equal(boundary.continue, true);
+    const outcome = boundary.entries.find(
+      (d) => d.customType === REWIND_OUTCOME_CUSTOM_TYPE,
     );
-    assert.deepEqual(calls[0].message.details, {
-      status: "cancelled",
-      rewindTo: "start",
-      newLabel: "end",
-      reason,
-      summaryAttempts: 0,
-    });
+    assert.equal(
+      outcome?.data?.text,
+      "Summarization failed: the rewind could not be completed (branch boom). Nothing was collapsed. Try again.",
+    );
     assert.ok(!f.sm.getEntries().some((e) => e.type === "branch_summary"));
     assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
   });
@@ -3293,24 +4655,28 @@ describe("rewind message copy (byte-exact)", () => {
     );
   });
 
-  it("SUMMARY_PENDING_BLOCK_REASON", () => {
+  it("SUMMARY_PENDING_BLOCK_REASON (TUI-only, #90 O9)", () => {
     assert.equal(
       SUMMARY_PENDING_BLOCK_REASON,
-      "navigate_tree: a rewind is waiting for its summary — tool calls are blocked until it lands. Your entire next reply must be the summary in the format the rewind result requested, starting with '## Goal' — no acknowledgement, no tool calls.",
+      "navigate_tree: blocked: the model tried to call a tool instead of summarizing.",
     );
   });
 
-  it("buildSummaryRetryText", () => {
+  it("buildRewindAcceptedText (#90 S2)", () => {
     assert.equal(
-      buildSummaryRetryText("start"),
-      "[navigate_tree] The rewind to 'start' is still waiting for its summary. Your entire reply must be the summary in the format the rewind result requested, starting with '## Goal' — no acknowledgement, no tool calls.",
+      buildRewindAcceptedText("context-gathered", "parser-done"),
+      "[navigate_tree] Rewind to 'context-gathered' accepted (collapse as 'parser-done'). Follow the navigate_tree message below to complete it.",
     );
   });
 
-  it("buildRewindCancelledText", () => {
+  it("ending texts (#90 O5 / O6)", () => {
     assert.equal(
-      buildRewindCancelledText("start", "no summary after 3 attempts"),
-      "[navigate_tree] Rewind to 'start' cancelled: no summary after 3 attempts. Nothing was collapsed — continue the work and rewind again later.",
+      buildRewindFailedText("the context was compacted"),
+      "Summarization failed: the context was compacted. Nothing was collapsed. Try again.",
+    );
+    assert.equal(
+      REWIND_ABORTED_TEXT,
+      "Summarization aborted. Nothing was collapsed.",
     );
   });
 });
@@ -5170,14 +6536,11 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
 
       await requestRewind(f);
       assert.equal(hintCalls(f.pi).length, 0, "the rewind call's turn");
-      await summaryTurn(f, "Okay, summarizing now.");
-      assert.equal(
-        rewindMessages(f.pi)[0].message.details.status,
-        "summary-retry",
-      );
+      await summaryTurn(f, "Okay, summarizing now.", "stop", { commit: true });
+      assert.equal(rewindMessages(f.pi).length, 0);
       assert.equal(hintCalls(f.pi).length, 0, "a failed attempt");
       await summaryTurn(f);
-      assert.equal(rewindMessages(f.pi)[1].message.details.status, "done");
+      assert.equal(rewindMessages(f.pi)[0].message.details.status, "done");
       assert.equal(hintCalls(f.pi).length, 0, "the completing turn");
 
       // The crossing stayed unspent: the next normal turn fires it once.
@@ -5199,7 +6562,7 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
     }
   });
 
-  it("skips a tool-call failure turn too, and the start anchor still runs on it", async () => {
+  it("skips a tool-call failure turn too, and the start anchor skips it as well (#90)", async () => {
     const fixture = makeConfigFixture();
     try {
       writeGlobalConfig(
@@ -5224,9 +6587,16 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
       ]);
       await fireTurnEndAll(f.pi, f.ctx, message, { turnIndex: 1 });
       assert.equal(hintCalls(f.pi).length, 0, "a tool-call failure turn");
-      assert.ok(
+      assert.equal(
         __testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL),
-        "the start anchor is not gated by the rewind",
+        null,
+        "never on an attempt that is about to be hidden",
+      );
+      // agent_end while pending writes nothing either.
+      fireAgentEnd(f.pi, f.ctx);
+      assert.equal(
+        __testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL),
+        null,
       );
     } finally {
       cleanupConfigFixture(fixture);
@@ -6037,5 +7407,23 @@ describe("automatic start anchor (#55)", () => {
     } finally {
       cleanupConfigFixture(fixture);
     }
+  });
+});
+
+describe("README: history-mirroring providers (#90)", () => {
+  const readme = readFileSync(
+    new URL("../../README.md", import.meta.url),
+    "utf8",
+  );
+
+  it("does not claim the summary is the paused Claude Code query", () => {
+    assert.doesNotMatch(readme, /paused Claude Code query/);
+  });
+
+  it("says the #90 flow is untested on history-mirroring providers", () => {
+    assert.match(
+      readme,
+      /instruction message and its hidden re-sends \(#90\) are untested on history-mirroring providers/,
+    );
   });
 });

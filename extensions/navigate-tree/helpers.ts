@@ -29,6 +29,13 @@ export const TOOL_NAME = "navigate_tree";
 // copy builders can't desync on a rename.
 export const LABEL_PREFIX = "anchor:";
 
+// Reserved label prefix for the rewind-completion marker (#90): a successful
+// rewind labels its summary turn (the abandoned branch's last real entry)
+// `branch:<newLabel>`, so `/tree` can jump back to the collapsed segment and
+// the restart check knows that rewind finished. Never resolved by `rewindTo`
+// and never listed by `list`.
+export const BRANCH_LABEL_PREFIX = "branch:";
+
 // Hard cap on label-name length. 40 chars accommodates descriptive names
 // (e.g. 'parser-edge-case-investigation', 31 chars) while keeping list
 // output column-friendly under common terminal widths and preventing a

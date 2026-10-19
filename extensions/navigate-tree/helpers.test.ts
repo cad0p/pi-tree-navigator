@@ -10,6 +10,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  BRANCH_LABEL_PREFIX,
   extractTextContent,
   formatContextDelta,
   formatPct1,
@@ -267,5 +268,11 @@ describe("extractTextContent", () => {
       ]),
       " kept",
     );
+  });
+});
+
+describe("reserved label prefixes", () => {
+  it("branch: marks a completed rewind's summary turn (#90)", () => {
+    assert.equal(BRANCH_LABEL_PREFIX, "branch:");
   });
 });

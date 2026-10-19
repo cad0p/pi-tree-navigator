@@ -1,12 +1,12 @@
 /**
- * summary-prompt — the in-band rewind summary instruction (#80).
+ * summary-prompt — the in-band rewind summary instruction (#80, #90).
  *
- * `rewind` no longer issues a separate summarization request. Its tool result
- * IS the instruction below, so the live model writes the summary as the next
- * turn of the live conversation — a plain append, served from the provider's
- * prompt cache on every provider (including history-mirroring ones such as
- * pi-claude-bridge, where the paused Claude Code query simply receives its
- * tool result). `index.ts` then branches from the anchor with that text.
+ * `rewind` does not issue a separate summarization request. Its tool result
+ * only reports that the rewind was accepted; the instruction below arrives
+ * right after it as a `navigate_tree` custom message (#90), so the live model
+ * writes the summary as the next turn of the live conversation — a plain
+ * append, served from the provider's prompt cache. `index.ts` then branches
+ * from the anchor with that text.
  */
 
 /**
@@ -51,8 +51,8 @@ Use this EXACT format, preserving all headings and their order:
 Keep each section concise. Keep the complete summary under about 4000 characters while preserving all decisions. Preserve exact file paths, function names, and error messages.`;
 
 /**
- * Compose the instruction text the rewind tool result carries. Mirrors
- * upstream's `customInstructions` append shape
+ * Compose the summary instruction: r5d with `{first}` substituted, plus the
+ * focus. Mirrors upstream's `customInstructions` append shape
  * (`${PROMPT}\n\nAdditional focus: ...`).
  */
 export function buildSummaryInstruction(first: number, focus: string): string {
@@ -60,6 +60,15 @@ export function buildSummaryInstruction(first: number, focus: string): string {
   // verbatim.
   const prompt = REWIND_SUMMARY_PROMPT.replaceAll("{first}", String(first));
   return `${prompt}\n\nAdditional focus: ${focus}`;
+}
+
+/**
+ * The content of the `navigate-tree-summary-request` custom message (#90):
+ * a `[navigate_tree]` source line, then the instruction. The message reaches
+ * the provider as a user message right after the rewind's tool result.
+ */
+export function buildSummaryRequestText(first: number, focus: string): string {
+  return `[navigate_tree]\n${buildSummaryInstruction(first, focus)}`;
 }
 
 /**
