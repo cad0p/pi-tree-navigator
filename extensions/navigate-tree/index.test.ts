@@ -7807,6 +7807,110 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  /**
+   * #101 walk fix: the withholding walk crosses older turns. T1's two big
+   * results sit before the newest usage (T2, `newestTokens`); T2 issued a
+   * tiny call (its result is the newest) plus the rewind's own navigate_tree
+   * call, which must never be withheld. The error reply overflowed.
+   */
+  async function crossTurnSetup(newestTokens: number) {
+    const f = await forcedSetup({ issuerTokens: 60_000 });
+    appendToolCallAssistant(
+      f.sm,
+      [
+        { id: "t3", name: "read", arguments: { path: "c" } },
+        { id: "n1", name: "navigate_tree", arguments: { action: "rewind" } },
+      ],
+      newestTokens,
+    );
+    const r3 = appendToolResult(f.sm, "t3", "read", "ok");
+    const nav = appendToolResult(f.sm, "n1", "navigate_tree", "accepted");
+    return { f, r3, nav };
+  }
+
+  function withheldTargets(entries: BoundaryResult["entries"]) {
+    return entries
+      .filter((d) => d.type === "context_edit" && d.replacement !== null)
+      .map((d) => d.targetId);
+  }
+
+  it("the live shape: the newest result, then the older turn's results, newest first (#101)", async () => {
+    const { f, r3, nav } = await crossTurnSetup(99_300);
+    try {
+      const err = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, err.message);
+      assert.deepEqual(
+        withheldTargets(settle.entries),
+        [r3, f.r2, f.r1],
+        "the walk does not stop at T2's assistant; T1's results are withheld after T2's",
+      );
+      assert.ok(!withheldTargets(settle.entries).includes(nav));
+      const [d5] = forcedDrafts(settle);
+      assert.deepEqual(d5.details, {
+        status: "forced",
+        withheld: 3,
+        contextWindow: WINDOW,
+      });
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("stops once the estimate fits: the older turn's second result is kept (#101)", async () => {
+    const { f, r3 } = await crossTurnSetup(90_000);
+    try {
+      const err = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, err.message);
+      assert.deepEqual(withheldTargets(settle.entries), [r3, f.r2]);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("a real count above the estimate scales the newest tail only; older results leave the baseline (#101, A)", async () => {
+    const f = await forcedSetup({ issuerTokens: 60_000 });
+    try {
+      appendToolCallAssistant(
+        f.sm,
+        [{ id: "t3", name: "read", arguments: { path: "c" } }],
+        99_300,
+      );
+      const r3 = appendToolResult(f.sm, "t3", "read", "x".repeat(4_000));
+      // Real 101k vs baseline 99.3k over a ~1k tail: ratio ~1.7 on the tail.
+      const message = {
+        ...assistantMessage([], "length", 0),
+        usage: { ...usageOf(101_000), input: 101_000 },
+      };
+      f.sm.appendMessage(message as never);
+      const turn = await fireTurnEndAll(f.pi, f.ctx, message);
+      assert.deepEqual(withheldTargets(turn.entries), [r3, f.r2, f.r1]);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("the walk stops at a compaction: nothing above it is withheld (#101)", async () => {
+    const f = await forcedSetup({ issuerTokens: 60_000 });
+    try {
+      const next = f.sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "next" }],
+      } as never);
+      f.sm.appendCompaction("COMPACTED", next, 20_000);
+      appendToolCallAssistant(
+        f.sm,
+        [{ id: "t3", name: "read", arguments: { path: "c" } }],
+        99_300,
+      );
+      const r3 = appendToolResult(f.sm, "t3", "read", "ok");
+      const err = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, err.message);
+      assert.deepEqual(withheldTargets(settle.entries), [r3]);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   /** The post-withhold estimate: the projection without hidden entries, tail scaled by `ratio`. */
   function scaledEstimate(sm: SessionManager, ratio: number): number {
     const hidden = hiddenIds(sm);

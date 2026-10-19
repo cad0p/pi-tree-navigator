@@ -98,21 +98,28 @@ export function splitContextEstimate(messages: AgentMessage[]): {
   baseline: number;
   tail: number;
 } {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const usage = validAssistantUsage(messages[i]);
-    if (!usage) continue;
-    let tail = 0;
-    for (let j = i + 1; j < messages.length; j++) {
-      tail += estimateTokens(messages[j]);
-    }
-    return { baseline: calculateContextTokens(usage), tail };
-  }
-
+  const anchor = newestUsageIndex(messages);
+  const usage = anchor >= 0 ? validAssistantUsage(messages[anchor]) : undefined;
   let tail = 0;
-  for (const message of messages) {
-    tail += estimateTokens(message);
+  for (let j = anchor + 1; j < messages.length; j++) {
+    tail += estimateTokens(messages[j]);
   }
-  return { baseline: 0, tail };
+  return {
+    baseline: usage ? calculateContextTokens(usage) : 0,
+    tail,
+  };
+}
+
+/**
+ * Index of the newest message carrying a valid assistant usage (the baseline
+ * of `splitContextEstimate`), or -1 with none. Messages at or before it are
+ * already counted by its real usage.
+ */
+export function newestUsageIndex(messages: AgentMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (validAssistantUsage(messages[i])) return i;
+  }
+  return -1;
 }
 
 /**

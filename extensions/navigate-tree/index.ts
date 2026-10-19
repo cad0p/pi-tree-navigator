@@ -83,6 +83,7 @@ import {
 } from "./config.ts";
 import {
   estimateContextTokens,
+  newestUsageIndex,
   splitContextEstimate,
 } from "./context-tokens.ts";
 import {
@@ -816,10 +817,12 @@ function overflowRequestTokens(
 
 /**
  * Withhold the tool results that overflowed (#101, D3): walk back from
- * `fromEntryId` (excluded) to the assistant that issued them, and replace
- * their content newest-first with the D4 notice until the estimate fits
- * `target`. User and custom messages are never withheld; a result already
- * hidden or replaced is skipped. The estimate is the projection without
+ * `fromEntryId` (excluded) through every older turn, and replace their
+ * content newest-first with the D4 notice until the estimate fits `target`.
+ * The walk stops at a compaction or branch summary (a context boundary: what
+ * is above it is not projected). User and custom messages are never
+ * withheld; a navigate_tree result, a result already hidden or replaced, and
+ * a result not in the projection are skipped. The estimate is the projection without
  * `hiddenIds` (sliced at `instructionEntryId`, the frozen request of a
  * pending rewind), minus what each notice saves.
  *
@@ -852,13 +855,24 @@ function planWithhold(
     );
     if (at >= 0) entries = entries.slice(0, at + 1);
   }
-  const { baseline, tail: tailEstimate } = splitContextEstimate(
-    entries
-      .filter((e) => !hidden.has(e.sourceEntry.id))
-      .flatMap((e) => e.messages)
-      .filter((m) => m.role !== "system"),
-  );
-  let tail = tailEstimate;
+  // The messages the estimate counts, and each entry's first position in them
+  // (#101, walk fix): an entry outside this list is not in the context.
+  const messages: AgentMessage[] = [];
+  const positions = new Map<string, number>();
+  for (const e of entries) {
+    if (hidden.has(e.sourceEntry.id)) continue;
+    for (const m of e.messages) {
+      if (m.role === "system") continue;
+      if (!positions.has(e.sourceEntry.id)) {
+        positions.set(e.sourceEntry.id, messages.length);
+      }
+      messages.push(m);
+    }
+  }
+  const anchor = newestUsageIndex(messages);
+  const split = splitContextEstimate(messages);
+  let baseline = split.baseline;
+  let tail = split.tail;
   const ratio =
     realTokens === undefined || tail <= 0
       ? 1
@@ -866,17 +880,39 @@ function planWithhold(
   const estimate = () => baseline + ratio * tail;
   const drafts: SessionBoundaryDraft[] = [];
   const start = branch.findIndex((e) => e.id === fromEntryId);
+  // Newest first, across turns: the failed attempt's own batch is not always
+  // enough (#101, walk fix). A compaction or branch summary is a context
+  // boundary: nothing above it is in the projected context.
   for (let i = start - 1; i >= 0 && estimate() > target; i--) {
     const entry = branch[i];
-    if (entry.type !== "message") continue;
-    if (entry.message.role === "assistant") break;
-    if (entry.message.role !== "toolResult" || lastEdit.has(entry.id)) {
+    if (entry.type === "compaction" || entry.type === "branch_summary") {
+      break;
+    }
+    if (entry.type !== "message" || entry.message.role !== "toolResult") {
+      continue;
+    }
+    const at = positions.get(entry.id);
+    if (
+      at === undefined ||
+      lastEdit.has(entry.id) ||
+      entry.message.toolName === TOOL_NAME
+    ) {
       continue;
     }
     const original = estimateTokens(entry.message);
     const text = buildWithheldNoticeText(original);
     const content = [{ type: "text" as const, text }];
-    tail -= original - estimateTokens({ ...entry.message, content });
+    const saving = original - estimateTokens({ ...entry.message, content });
+    // A result before the newest usage is already in its real count, so its
+    // saving comes off the baseline, as the unscaled estimate (it under-credits
+    // a dense result, which only withholds more). It must not go on the tail:
+    // the ratio would scale a negative tail into a false fit. A result after
+    // the usage is in the tail, which the ratio scales as before.
+    if (at < anchor) {
+      baseline -= saving;
+    } else {
+      tail -= saving;
+    }
     drafts.push({
       type: "context_edit",
       targetId: entry.id,
