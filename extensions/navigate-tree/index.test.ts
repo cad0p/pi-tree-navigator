@@ -8196,22 +8196,30 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
-  it("D11: nothing to withhold on a squeezed summary — #93 counts it as cut off", async () => {
+  it("D11: nothing to withhold on a squeezed summary — still over, D8 (the D11 check runs first)", async () => {
     const f = await forcedSetup();
     try {
-      await requestRewind(f);
+      await requestRewind(f, REWIND_ARGS, "tc-rewind", 200_000);
       const message = {
         ...assistantMessage([{ type: "text", text: "## Goal" }], "length", 0),
-        usage: { ...usageOf(40_000), output: 100 },
+        usage: { ...usageOf(200_000), output: 100 },
       };
       const id = f.sm.appendMessage(message as never);
       const turn = await fireTurnEndAll(f.pi, f.ctx, message);
-      assert.equal(turn.continue, true);
+      assert.equal(
+        turn.continue,
+        false,
+        "no #93 re-send of a squeezed summary",
+      );
       assert.ok(hiddenIds(f.sm).has(id));
-      assert.deepEqual(fireToolCall(f.pi, f.ctx), {
-        block: true,
-        reason: SUMMARY_PENDING_BLOCK_REASON,
-      });
+      assert.equal(
+        outcomeEntries(f.sm)[0].reason,
+        COMPACTION_FAILED_STILL_OVER,
+      );
+      assert.equal(
+        forcedDrafts(turn).at(-1)?.content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
+      );
     } finally {
       cleanupConfigFixture(f.fixture);
     }

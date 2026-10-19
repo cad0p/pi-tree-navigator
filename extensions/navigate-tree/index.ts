@@ -1620,7 +1620,6 @@ export default function (pi: ExtensionAPI) {
     at: { contextWindow: number; target: number },
     failedEntryId: string,
     failedIds: readonly string[],
-    opts: { stepAsideWhenNothingWithheld: boolean },
   ): { drafts: SessionBoundaryDraft[]; continue: boolean } | null {
     const record = forcedRewinds.get(sessionId);
     // A final error already ended it in this run: pi ends the run.
@@ -1662,10 +1661,8 @@ export default function (pi: ExtensionAPI) {
         at.target,
         instructionEntryId,
       );
-      // Nothing to withhold: a cut-off summary, #93's to classify.
-      if (plan.withheld === 0 && opts.stepAsideWhenNothingWithheld) {
-        return null;
-      }
+      // D11 runs before #93's classification: a squeezed summary is
+      // handled here, even with nothing to withhold.
       if (!plan.fits) {
         return {
           drafts: [
@@ -2301,7 +2298,6 @@ export default function (pi: ExtensionAPI) {
           at,
           messageEntryId,
           failedIds,
-          { stepAsideWhenNothingWithheld: true },
         );
         if (result) return deliverRaw(result.drafts, result.continue);
       }
@@ -2568,9 +2564,7 @@ export default function (pi: ExtensionAPI) {
       ) {
         const at = rewindCompactionTarget(sm, sessionId, ctx.model);
         const result = at
-          ? startRewindCompaction(sm, sessionId, at, last.id, [last.id], {
-              stepAsideWhenNothingWithheld: false,
-            })
+          ? startRewindCompaction(sm, sessionId, at, last.id, [last.id])
           : null;
         if (result) {
           return {
