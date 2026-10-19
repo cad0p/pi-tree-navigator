@@ -385,13 +385,13 @@ export function buildContextMessages(
   // entry id the outcome recorded.
   const outcomes = collectRewindOutcomes(sm);
   // Stale usage (#101): an assistant's `usage` measures the whole context it
-  // was sent with. A `context_edit` that replaces or omits an EARLIER entry
-  // (a withheld result, a hidden attempt) makes that usage overstate what is
-  // sent now, and pi's output clamp sizes max_tokens from it (window -
-  // estimate - 4096, floored at 1). From the first edited entry on, zero the
-  // usage: pi-ai then falls back to an older exact usage or chars/4. Earlier
-  // assistants counted only unedited content, so they keep theirs.
-  const staleFrom = firstEditedIndex(entries);
+  // was sent with. One produced after a `context_edit`'s target existed but
+  // before that edit applied was sent with the edited-away content counted, so
+  // pi's output clamp (window - estimate - 4096, floored at 1) would size
+  // max_tokens from an overstated count. Zero those (see staleUsageFlags); pi-ai
+  // then falls back to an older exact usage or chars/3.5. Assistants before the
+  // target, and after the edit, keep their exact usage.
+  const stale = staleUsageFlags(entries);
   const messages = entries.flatMap((e, i) => {
     const text = e.sourceEntry ? outcomes.get(e.sourceEntry.id) : undefined;
     const withOutcome =
@@ -406,37 +406,47 @@ export function buildContextMessages(
                 }
               : message,
           );
-    return i < staleFrom ? withOutcome : withOutcome.map(dropStaleUsage);
+    return stale[i] ? withOutcome.map(dropStaleUsage) : withOutcome;
   });
   return messages.filter((message) => message.role !== "system");
 }
 
 /**
- * Index of the first entry a `context_edit` targets (#101), or Infinity when
- * none is in `entries`. Targets outside the projection are ignored.
+ * Per entry, whether its assistant usage is stale (#101). An entry at `i` is
+ * stale iff some `context_edit` at `e` targets an entry at `t` with
+ * `t < i < e`: it was produced after the target existed but before the edit
+ * applied. Indices are branch order over the projection, which keeps the
+ * `context_edit` entries themselves (with no messages). Targets outside it are
+ * ignored.
  */
-function firstEditedIndex(
+function staleUsageFlags(
   entries: Array<{ sourceEntry: SessionEntry | null }>,
-): number {
-  const targets = new Set(
-    entries.flatMap((e) =>
-      e.sourceEntry?.type === "context_edit" ? [e.sourceEntry.targetId] : [],
-    ),
-  );
-  const at = entries.findIndex(
-    (e) => e.sourceEntry !== null && targets.has(e.sourceEntry.id),
-  );
-  return at < 0 ? Number.POSITIVE_INFINITY : at;
+): boolean[] {
+  const position = new Map<string, number>();
+  for (const [i, e] of entries.entries()) {
+    if (e.sourceEntry && !position.has(e.sourceEntry.id)) {
+      position.set(e.sourceEntry.id, i);
+    }
+  }
+  const stale = entries.map(() => false);
+  for (const [edit, e] of entries.entries()) {
+    const source = e.sourceEntry;
+    if (source?.type !== "context_edit" || !source.targetId) continue;
+    const target = position.get(source.targetId);
+    if (target === undefined) continue;
+    for (let i = target + 1; i < edit; i++) stale[i] = true;
+  }
+  return stale;
 }
 
 /**
- * `message` with a zeroed usage when it is an assistant (#101). Zeroed, not
- * deleted: pi-ai reads `usage.totalTokens` unguarded and would throw. Zero
+ * `message` with a zeroed usage when it is an assistant with one (#101). Zeroed,
+ * not deleted: pi-ai reads `usage.totalTokens` unguarded and would throw. Zero
  * totals are skipped, and every field is zeroed because `calculateContextTokens`
  * falls back to the four parts when `totalTokens` is 0.
  */
 function dropStaleUsage(message: AgentMessage): AgentMessage {
-  if (message.role !== "assistant") return message;
+  if (message.role !== "assistant" || !message.usage) return message;
   return {
     ...message,
     usage: {

@@ -1123,13 +1123,13 @@ describe("context event handler", () => {
       [10, 0, 0],
     );
     // pi-ai falls back to the exact usage before the edit, and the rest is
-    // chars/4: the notice and two short messages, not the stale 95k.
+    // chars/3.5: the notice and two short messages, not the stale 95k.
     const estimate = await piAiEstimateContextTokens(projected);
     assert.equal(estimate.lastUsageIndex, 1);
     assert.equal(estimate.usageTokens, 10);
     assert.ok(
       estimate.trailingTokens < 1_000,
-      `trailing estimate should be chars/4, got ${estimate.trailingTokens}`,
+      `trailing estimate should be chars/3.5, got ${estimate.trailingTokens}`,
     );
     // The session's own objects are untouched (the clone is per request).
     assert.deepEqual(
@@ -1140,6 +1140,76 @@ describe("context event handler", () => {
         ),
       [10, 90_000, 95_000],
     );
+  });
+
+  it("an assistant produced after the edit keeps its exact usage (#101)", async () => {
+    // The edit applied before this turn was sent, so its usage counts only the
+    // edited context and is exact. Only the turn between target and edit is
+    // stale.
+    const { sm } = setup();
+    const at = Date.now();
+    const model = {
+      api: "anthropic",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+    };
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "read it" }],
+      timestamp: at,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
+      ...model,
+      stopReason: "toolUse",
+      timestamp: at,
+      usage: usageOf(10),
+    } as never);
+    const resultId = sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "c1",
+      toolName: "read",
+      content: [{ type: "text", text: "x".repeat(40_000) }],
+      isError: false,
+      timestamp: at,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "next" }],
+      ...model,
+      stopReason: "endTurn",
+      timestamp: at,
+      usage: usageOf(90_000),
+    } as never);
+    sm.appendContextEdit(resultId, {
+      content: [{ type: "text", text: "[navigate_tree] Output withheld" }],
+    } as never);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "go on" }],
+      timestamp: at,
+    } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      ...model,
+      stopReason: "endTurn",
+      timestamp: at,
+      usage: usageOf(5_000),
+    } as never);
+
+    const projected = __testHooks.buildContextMessages(sm);
+    assert.deepEqual(
+      projected.flatMap((m) =>
+        m.role === "assistant" ? [m.usage.totalTokens] : [],
+      ),
+      [10, 0, 5_000],
+    );
+    // pi-ai anchors on the newest assistant, the one sent after the edit.
+    const estimate = await piAiEstimateContextTokens(projected);
+    assert.equal(estimate.lastUsageIndex, projected.length - 1);
+    assert.equal(estimate.usageTokens, 5_000);
   });
 
   it("without context_edits the projection keeps every assistant's usage (#101)", () => {
