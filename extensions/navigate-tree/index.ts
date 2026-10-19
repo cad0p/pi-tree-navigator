@@ -2252,20 +2252,26 @@ export default function (pi: ExtensionAPI) {
       entries: keepValidDrafts(sm, [...(event.entries ?? []), ...drafts]),
       continue: cont,
     });
-    // A failed ending of the pending rewind during a forced rewind ends
-    // rewind-driven compaction too (#101, D7): D8, no `continue`.
+    // The three-attempts ending of the pending rewind during a forced rewind
+    // ends rewind-driven compaction too (#101, D7): D8, no `continue`. Other
+    // failed endings leave the gate as it is.
     const deliver = (drafts: SessionBoundaryDraft[], cont: boolean) => {
-      const ending = pendingRewinds.get(sessionId)?.committing;
-      if (ending?.status !== "failed" || !forcedActive(sessionId)) {
+      const pendingNow = pendingRewinds.get(sessionId);
+      const ending = pendingNow?.committing;
+      const last = pendingNow?.lastCause;
+      if (
+        ending?.status !== "failed" ||
+        !forcedActive(sessionId) ||
+        !last ||
+        ending.reason !== buildAttemptsExhaustedReason(last)
+      ) {
         return deliverRaw(drafts, cont);
       }
-      const last = pendingRewinds.get(sessionId)?.lastCause;
-      const reason =
-        last && ending.reason === buildAttemptsExhaustedReason(last)
-          ? COMPACTION_FAILED_NO_REWIND
-          : ending.reason;
       return deliverRaw(
-        [...drafts, ...compactionFailed(sessionId, reason)],
+        [
+          ...drafts,
+          ...compactionFailed(sessionId, COMPACTION_FAILED_NO_REWIND),
+        ],
         false,
       );
     };

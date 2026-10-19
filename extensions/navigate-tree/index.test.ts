@@ -8070,6 +8070,32 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("D7 (fix 7): a failed summary that is not the third keeps the gate and continues", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await requestRewind(f);
+      // The anchor goes missing before the summary turn: not an exhausted attempt.
+      const start = f.sm
+        .getBranch()
+        .find((e) => f.sm.getLabel(e.id) === START_ANCHOR_LABEL);
+      assert.ok(start);
+      f.pi.pi.setLabel(start.id, undefined);
+      const { boundary } = await summaryTurn(f, SUMMARY_TEXT, "stop", {
+        commit: true,
+      });
+      assert.equal(
+        outcomeEntries(f.sm)[0].text,
+        "Summarization failed: 'start' is no longer on the active branch. Nothing was collapsed. Try again.",
+      );
+      assert.deepEqual(forcedDrafts(boundary), [], "no D8 row");
+      assert.equal(boundary.continue, true, "the run continues");
+      assert.notEqual(fireToolCall(f.pi, f.ctx), undefined, "the gate stays");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("S6: a second overflow during the forced rewind ends it", async () => {
     const f = await forcedSetup();
     try {
