@@ -7500,6 +7500,48 @@ describe("README: history-mirroring providers (#90)", () => {
   });
 });
 
+describe("README: rewind-driven compaction naming (#101)", () => {
+  const readme = readFileSync(
+    new URL("../../README.md", import.meta.url),
+    "utf8",
+  );
+
+  it("says 'overflow recovery' only inside the quoted final error", () => {
+    const lines = readme
+      .split("\n")
+      .filter((line) => /overflow recovery/i.test(line));
+    assert.ok(lines.length > 0);
+    for (const line of lines) {
+      assert.ok(
+        line.startsWith(
+          "[navigate_tree] Context overflow recovery failed: <reason>.",
+        ),
+        line,
+      );
+    }
+  });
+
+  it("documents the either-or error and the D8 text byte-exact", () => {
+    assert.ok(readme.includes(REWIND_COMPACTION_OFF_TEXT));
+    assert.ok(readme.includes(buildRewindCompactionFailedText("<reason>")));
+    assert.ok(
+      readme.includes(
+        buildReserveOrderWarning(10000, 16384, "anthropic/claude-haiku-5-5"),
+      ),
+    );
+    assert.ok(readme.includes(buildWithheldNoticeText(19_000)));
+    assert.ok(
+      readme.includes(
+        buildForcedRewindText(
+          100_000,
+          2,
+          "Active anchors (root → leaf, % of 100k):\n   4.1%  start\n  12.0%  context-gathered",
+        ),
+      ),
+    );
+  });
+});
+
 // =============================================================================
 // Rewind-driven compaction (#101)
 //
