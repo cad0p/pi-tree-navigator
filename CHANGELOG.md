@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(rewind)* Summary instruction as a custom message, failed attempts re-sent (closes #90, closes #82)
+
+
 ## [0.3.0] - 2026-10-15
 
 <!-- USER-EDITABLE SECTION START -->
