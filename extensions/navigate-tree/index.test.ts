@@ -8137,6 +8137,28 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("D16 (fix 6): agent_settled reads Esc from the last reply, not only the event flag", async () => {
+    // pi < 1.1.0 sends no `aborted` on agent_settled: the reply carries it.
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      f.sm.appendMessage(assistantMessage([], "aborted", 0) as never);
+      await fireAgentSettled(f.pi, f.ctx, false);
+      assert.deepEqual(f.pi.sendMessageCalls, [
+        [
+          {
+            customType: REWIND_CUSTOM_TYPE,
+            content: buildRewindCompactionFailedText(COMPACTION_FAILED_ABORTED),
+            display: true,
+            details: { status: "failed", reason: COMPACTION_FAILED_ABORTED },
+          },
+        ],
+      ]);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("D16: a run that settles mid-gate lifts it with one D8 row (aborted, or ended)", async () => {
     for (const [aborted, reason] of [
       [true, COMPACTION_FAILED_ABORTED],

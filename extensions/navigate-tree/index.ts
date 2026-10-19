@@ -2652,16 +2652,37 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
+  // The last assistant reply ended with Esc (stopReason "aborted", #101, D16).
+  function lastReplyAborted(sm: SessionManager): boolean {
+    try {
+      const last = sm
+        .getBranch()
+        .findLast(
+          (e) => e.type === "message" && e.message.role === "assistant",
+        );
+      return (
+        last?.type === "message" &&
+        (last.message as { stopReason?: string }).stopReason === "aborted"
+      );
+    } catch {
+      return false;
+    }
+  }
+
   // Fully settled with the rewind still pending: the run was aborted, or
   // the errored attempt's retry never came (#90, O6).
   pi.on("agent_settled", (event, ctx) => {
+    // Esc ended the run (#101, D16). The event flag exists on pi >= 1.1.0;
+    // on older pi the reply Esc cut short says it (peer floor 0.87.0).
+    let aborted = event.aborted === true;
     try {
       const sm = ctx.sessionManager as SessionManager;
+      aborted ||= lastReplyAborted(sm);
       endPendingOutsideBoundary(
         sm,
         sm.getSessionId(),
         "aborted",
-        event.aborted ? "aborted" : "the run ended after an error",
+        aborted ? "aborted" : "the run ended after an error",
       );
     } catch {
       // Stale ctx: nothing to end.
@@ -2679,7 +2700,7 @@ export default function (pi: ExtensionAPI) {
     const record = forcedRewinds.get(sessionId);
     forcedRewinds.delete(sessionId);
     if (!record || record.ended) return;
-    const reason = event.aborted
+    const reason = aborted
       ? COMPACTION_FAILED_ABORTED
       : COMPACTION_FAILED_RUN_ENDED;
     const content = buildRewindCompactionFailedText(reason);
