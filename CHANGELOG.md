@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - *(rewind)* Summary instruction as a custom message, failed attempts re-sent (closes #90, closes #82)
+- *(rewind)* Rewind-driven compaction — force a rewind on context overflow (closes #101)
 
 
 ## [0.3.0] - 2026-10-15
