@@ -3348,6 +3348,21 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
     assert.equal(fireToolCall(f.pi, f.ctx), undefined);
   });
 
+  it("agent_settled names the reason: aborted run vs an error with no retry", async () => {
+    const f = await pending();
+    await attempt(f, "", "error");
+    await fireAgentSettled(f.pi, f.ctx, true);
+    assert.equal(outcomeEntries(f.sm)[0].reason, "aborted");
+    assert.equal(outcomeEntries(f.sm)[0].text, REWIND_ABORTED_TEXT);
+    const g = await pending();
+    await attempt(g, "", "error");
+    await fireAgentSettled(g.pi, g.ctx, false);
+    assert.equal(
+      outcomeEntries(g.sm)[0].reason,
+      "the run ended after an error",
+    );
+  });
+
   it("before_agent_start (a new prompt) ends a pending rewind aborted", async () => {
     const f = await pending();
     await attempt(f, "", "error");

@@ -762,8 +762,6 @@ interface PendingRewind {
   attempts: number;
   /** The cause of the latest failed attempt. */
   lastCause?: SummaryFailureCause;
-  /** The latest summary turn ended in a provider error (auto-retry pending). */
-  lastTurnErrored?: boolean;
   /**
    * An ending returned as boundary drafts, not yet seen committed (#90): pi
    * drops a boundary's whole list when any handler's draft is invalid, so
@@ -1953,11 +1951,7 @@ export default function (pi: ExtensionAPI) {
     // Provider errors go through pi's auto-retry (or pi-fallback-provider's
     // retry on another model): not an attempt. The rewind waits; if no
     // retry comes, `agent_settled` / `before_agent_start` end it.
-    if (message.stopReason === "error") {
-      pending.lastTurnErrored = true;
-      return;
-    }
-    pending.lastTurnErrored = false;
+    if (message.stopReason === "error") return;
     const undelivered = undeliveredReason(sm, pending);
     if (undelivered) {
       return deliver(
@@ -2086,16 +2080,16 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // Fully settled with the rewind still pending: the errored attempt's
-  // retry never came (#90, O6).
-  pi.on("agent_settled", (_event, ctx) => {
+  // Fully settled with the rewind still pending: the run was aborted, or
+  // the errored attempt's retry never came (#90, O6).
+  pi.on("agent_settled", (event, ctx) => {
     try {
       const sm = ctx.sessionManager as SessionManager;
       endPendingOutsideBoundary(
         sm,
         sm.getSessionId(),
         "aborted",
-        "the run ended after an error",
+        event.aborted ? "aborted" : "the run ended after an error",
       );
     } catch {
       // Stale ctx: nothing to end.
