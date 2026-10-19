@@ -8158,6 +8158,29 @@ Active anchors (root → leaf, % of 100k):
     );
   }
 
+  /** The host's nested `tool_result` for a pi-codemode call (#103, C). */
+  function fireNestedResult(
+    f: Forced,
+    toolCallId: string,
+    parentId: string,
+    toolName: string,
+    result: { details?: unknown },
+  ): void {
+    const handlers = f.pi.onCalls.get("tool_result");
+    assert.ok(handlers, "factory must register a tool_result handler");
+    handlers[0](
+      {
+        type: "tool_result",
+        toolCallId,
+        parentToolCallId: parentId,
+        toolName,
+        details: result.details,
+        isError: false,
+      } as never,
+      f.ctx as never,
+    );
+  }
+
   const CODE = 'await navigate_tree({ action: "rewind" })';
 
   /** requestRewind through a codemode script whose first nested call rewinds (#103). */
@@ -8269,6 +8292,77 @@ Active anchors (root → leaf, % of 100k):
         f.ctx,
       );
       assert.equal(result.content[0].text, SOLO_REWIND_REFUSAL);
+      assert.equal(outcomeEntries(f.sm).length, 0);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("codemode (#103, C): refused nested rewinds under forced are not failed attempts", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const BAD =
+        'await navigate_tree({ action: "rewind", rewindTo: "Bad Name", newLabel: "end" })';
+      const BAD_ARGS = { ...REWIND_ARGS, rewindTo: "Bad Name" };
+      const refusedScript = async (id: string) => {
+        const call = appendToolCallAssistant(f.sm, [
+          { id, name: "codemode", arguments: { code: BAD } },
+        ]);
+        assert.equal(
+          fireNested(f, `${id}/1`, id, TOOL_NAME, BAD_ARGS),
+          undefined,
+        );
+        const r = await f.tool.execute(
+          `${id}/1`,
+          BAD_ARGS,
+          undefined,
+          undefined,
+          f.ctx,
+        );
+        assert.match(r.content[0].text, /kebab-case/);
+        fireNestedResult(f, `${id}/1`, id, TOOL_NAME, r);
+        appendToolResult(f.sm, id, "codemode", "script output");
+        const boundary = await fireTurnEndAll(f.pi, f.ctx, call.message);
+        return { call, boundary };
+      };
+      for (const id of ["c1", "c2", "c3"]) {
+        const { call, boundary } = await refusedScript(id);
+        assert.deepEqual(boundary.entries, []);
+        assert.ok(
+          !hiddenIds(f.sm).has(call.id),
+          "a refused nested rewind stays visible (D7)",
+        );
+      }
+      // Three refusals counted nothing: the next real attempts are 1, 2, 3.
+      assert.equal((await textAttempt(f)).continue, true);
+      assert.equal((await textAttempt(f)).continue, true);
+      assert.equal((await textAttempt(f)).continue, false);
+      assert.equal(outcomeEntries(f.sm).length, 0);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("codemode (#103, C): a nested rewind blocked behind a sibling is not a failed forced attempt", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const call = appendToolCallAssistant(f.sm, [
+        { id: "c2", name: "codemode", arguments: { code: CODE } },
+      ]);
+      fireNested(f, "c2/1", "c2", "read", { path: "x" });
+      assert.deepEqual(fireNested(f, "c2/2", "c2", TOOL_NAME, REWIND_ARGS), {
+        block: true,
+        reason: NESTED_REWIND_REFUSAL,
+      });
+      appendToolResult(f.sm, "c2", "codemode", "script output");
+      const out = await fireTurnEndAll(f.pi, f.ctx, call.message);
+      assert.deepEqual(
+        out.entries,
+        [],
+        "a refused nested rewind is not a failed attempt (D7)",
+      );
       assert.equal(outcomeEntries(f.sm).length, 0);
     } finally {
       cleanupConfigFixture(f.fixture);

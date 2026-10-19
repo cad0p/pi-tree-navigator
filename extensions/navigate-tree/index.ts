@@ -1535,6 +1535,9 @@ export default function (pi: ExtensionAPI) {
   // call, and the codemode call each accepted nested rewind lands on.
   const nestedCallCounts = new Map<string, number>();
   const nestedRewindCallers = new Map<string, string>();
+  // Codemode calls with a refused nested navigate_tree (#103, C): a refusal
+  // counts as a direct one (D7), so turn_end does not count it as an attempt.
+  const refusedNestedCallers = new Set<string>();
 
   // Turns the rewind handler owned (the rewind call's turn, summary
   // attempts, the completing turn): the hint and the auto start anchor skip
@@ -2268,6 +2271,7 @@ export default function (pi: ExtensionAPI) {
       nestedCallCounts.set(parentId, priorNested + 1);
       if (isRewind) {
         if (priorNested > 0) {
+          refusedNestedCallers.add(parentId);
           return { block: true, reason: NESTED_REWIND_REFUSAL };
         }
         nestedRewindCallers.set(event.toolCallId, parentId);
@@ -2412,14 +2416,22 @@ export default function (pi: ExtensionAPI) {
       }
       if (message.stopReason === "error") return;
       // A refused `rewind` is not an attempt (D7): it stays visible.
-      const refused = (event.toolResults ?? []).some((r) => {
-        const result = r as { toolName?: string; details?: unknown };
-        return (
-          result.toolName === TOOL_NAME &&
-          (result.details as { refusal?: unknown } | undefined)?.refusal ===
-            true
-        );
-      });
+      // A nested refusal (#103) is recorded under its codemode call.
+      const results = (event.toolResults ?? []) as Array<{
+        toolName?: string;
+        toolCallId?: string;
+        details?: unknown;
+      }>;
+      const refused = results.some(
+        (result) =>
+          refusedNestedCallers.has(result.toolCallId ?? "") ||
+          (result.toolName === TOOL_NAME &&
+            (result.details as { refusal?: unknown } | undefined)?.refusal ===
+              true),
+      );
+      for (const result of results) {
+        refusedNestedCallers.delete(result.toolCallId ?? "");
+      }
       if (refused) return;
       const record = forcedRewinds.get(sessionId);
       if (!record) return;
@@ -3191,7 +3203,12 @@ export default function (pi: ExtensionAPI) {
     nestedCallCounts.delete(event.toolCallId);
     if (event.toolName !== TOOL_NAME) return undefined;
     const details = event.details as { refusal?: boolean } | undefined;
-    return details?.refusal === true ? { isError: true } : undefined;
+    if (details?.refusal === true) {
+      if (event.parentToolCallId)
+        refusedNestedCallers.add(event.parentToolCallId);
+      return { isError: true };
+    }
+    return undefined;
   });
 
   // Rewind hint (#44): one check per turn, after the turn's tool results and
