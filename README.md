@@ -43,8 +43,9 @@ This repo uses [`cad0p/semver-calver-release`](https://github.com/cad0p/semver-c
 - Peer dependencies (the source of truth is `package.json` `peerDependencies`):
   - `@earendil-works/pi-coding-agent >=0.87.0`
   - `@earendil-works/pi-agent-core >=0.87.0`
+  - `@earendil-works/pi-ai >=0.87.0` (`isContextOverflow` / `isRecoverableLength`, the overflow checks rewind-driven compaction shares with pi)
   - `typebox ^1.0.0` (used to declare the tool's parameter schema; bundled with pi but listed explicitly so a standalone install resolves correctly).
-- The reflection bootstrap depends on plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt` (patched for session capture) and `agent.state.messages` (refreshed after a rewind so the next prompt snapshots the rewound chain). After a rewind the extension also emits `session_tree` through the captured session's plain `_extensionRunner` field (#79; see [History-mirroring providers](#history-mirroring-providers-pi-claude-bridge)). Per-turn in-loop context refresh runs through the **public** `context` extension event (see “In-loop context refresh” below) — no `agent.prepareNextTurn*` reflection. The rewind's same-run continuation relies on pi's `turn_end` boundary contract (handlers awaited before the steering drain, returned entries committed, `continue` honoured; public since 0.87). Verified against pi 1.2.0 via `scripts/pi-upstream-probe.mjs`.
+- The reflection bootstrap depends on plain (not `#`-private) internal pi/agent fields: `AgentSession.prototype.prompt` (patched for session capture) and `agent.state.messages` (refreshed after a rewind so the next prompt snapshots the rewound chain). After a rewind the extension also emits `session_tree` through the captured session's plain `_extensionRunner` field (#79; see [History-mirroring providers](#history-mirroring-providers-pi-claude-bridge)). Per-turn in-loop context refresh runs through the **public** `context` extension event (see “In-loop context refresh” below) — no `agent.prepareNextTurn*` reflection. The rewind's same-run continuation relies on pi's `turn_end` boundary contract (handlers awaited before the steering drain, returned entries committed, `continue` honoured; public since 0.87). Verified against pi 1.3.0 via `scripts/pi-upstream-probe.mjs`.
 
 ## What you get
 
@@ -97,8 +98,13 @@ Enable it with `rewindHintReserveTokens` (see [Configuration](#configuration-tre
 When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message naming every active anchor with its cumulative context percentage — so the model knows a rewind target exists (including the automatic `start`) without a `list` call. Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
 
 ```text
-[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor. Active anchors: 'start' 4.1% · 'context-gathered' 12.0% of 1.0M
+[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.
+Active anchors (root → leaf, % of 1.0M):
+   4.1%  start
+  12.0%  context-gathered
 ```
+
+The same anchor table (cumulative context % at each anchor, root → leaf) ends the min-savings refusal and the forced-rewind message, and is the body of `list` (which adds an `(after: “…”)` preview column).
 
 With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
 
@@ -124,9 +130,60 @@ Different models need different budgets: a model that writes long summaries or g
 
 Independent of the hint, the tool ships two static `promptGuidelines` bullets, present whenever `navigate_tree` is active: **when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive**, persisting durable findings to files first; and **don't rewind while a user decision or unresolved question is pending** — ask the user instead. The bullets are not config-gated (`registerTool` fixes the array at registration), cost ~64 tokens per request (257 chars / 4), and change the cached system-prompt prefix once per active session on upgrade (the provider-facing tool schema is unchanged).
 
+### Rewind-driven compaction
+
+`rewindHintReserveTokens` is one switch for two things: the hint (an early warning, above) and **rewind-driven compaction**, which takes over when the context still overflows. Wherever the hint is on for the active model (and `navigate_tree` is active), a real overflow forces a rewind instead of ending the run. It needs pi's auto-compaction off; see [Compaction guidance](#compaction-guidance).
+
+It acts only on a real overflow, detected with pi's own checks (`isContextOverflow` / `isRecoverableLength` from `@earendil-works/pi-ai`): the provider's context-length error, a silent overflow (input over the window), or a reply cut short because the context left no room for output. Only a reply from the active model counts, as in pi. There is no prediction and no capping of tool output.
+
+On an overflow, in the same run:
+
+1. The failed reply is hidden from the model (a provider error, or a cut-off reply and its failed tool calls; a silent overflow's complete reply stays).
+2. The newest tool results of the batch that caused it are replaced, one by one, until the estimate fits `contextWindow − compaction.reserveTokens` (pi's reserve for the active model, `compaction.modelOverrides` included). When the failed reply carries usage (a cut-off reply or a silent overflow), the estimate's tail is scaled by the provider's real count: ratio = (real input + cache read + cache write − newest usage) ÷ (estimated tail), never below 1. Each one reads: `[navigate_tree] Output withheld: adding it overflowed the context window (~19k tokens). The call ran; only its output was dropped. Rewind first, then re-run it if you still need the output.` User messages and other extensions' messages are never withheld.
+3. The model gets the forced-rewind message:
+
+```text
+[navigate_tree] Context overflowed the window (100k): 2 tool results were withheld. Rewind now — only navigate_tree rewind is allowed until it lands.
+Active anchors (root → leaf, % of 100k):
+   4.1%  start
+  12.0%  context-gathered
+```
+
+Until the rewind lands, every other tool call is blocked (`list` and `anchor` included). A `codemode` call passes so its script can rewind, but a nested call other than `rewind` is blocked (the gate still means rewind only). A reply without a `rewind` call is hidden and the same request is sent again, 3 attempts in total. A `rewind` refused by validation (min-savings floor, unknown anchor) stays visible and does not count. An accepted `rewind` runs the normal in-band flow (summary, branch, continuation), and the gate lifts when it lands. The hint does not also fire during it.
+
+When it cannot recover, the run ends with one error message, and the gate lifts:
+
+```text
+[navigate_tree] Context overflow recovery failed: <reason>. The session is at the context limit; rewind manually with /tree, /compact, or start a new session.
+```
+
+Reasons: `the context overflowed again during the forced rewind` (one forced rewind per overflow, as pi gives up after one compact-and-retry), `no rewind after 3 attempts` (also when the rewind's summary fails 3 times), `no anchor to rewind to` (an overflow before any anchor exists; the automatic `start` is not written on an overflowed run), `the context is still over the limit after withholding tool results` (an overflow while a voluntary rewind waited for its summary, when withholding cannot make room), `the forced rewind was aborted` (Esc), and `the run ended before the rewind`. Another rewind failure during a forced rewind ends it with that rewind's reason.
+
+An overflow while a voluntary rewind waits for its summary keeps the model's rewind: the summary attempt is hidden, tool results before the `rewind` call are withheld, and the summary request is sent again.
+
+There is no limit after a landing: if the rewind freed too little and the context overflows again later, that is a fresh forced rewind.
+
 ### Compaction guidance
 
-The hint is an alternative to auto-compaction. Auto-compaction fires at `contextWindow − reserveTokens` (`compaction.reserveTokens`, default 16384); the hint fires once `contextWindow − tokens <= rewindHintReserveTokens`, and pi's threshold compaction once `tokens > contextWindow − reserveTokens`, so — in sessions without context edits or compaction, where both measure the same last-usage tokens — the hint lands first on every window whenever `rewindHintReserveTokens` is at least the active model's compaction reserve (`compaction.modelOverrides["<provider>/<modelId>"].reserveTokens`, else `compaction.reserveTokens`); size it well above that to leave room for the persist and summary turns. Overflow-triggered compaction (a provider context-length error) is independent of either threshold. Recommended: disable auto-compaction (`"compaction": { "enabled": false }`) so running out mid-persist produces pi's loud context-window error instead of a silent lossy compaction. Keep compaction enabled only as a safety net if you'd rather the model continue and compact mid-write; the hint never overrides it.
+**Either-or.** With `rewindHintReserveTokens` set and pi's `compaction.enabled` true, both the hint and rewind-driven compaction are off, and each crossing shows this TUI error instead of the hint: `navigate_tree: the rewind hint and rewind-driven compaction are off because pi's auto-compaction is on. Disable compaction.enabled or remove rewindHintReserveTokens.` pi's default is `true`, so set it off in pi's `settings.json` (global or trusted project):
+
+```json
+{ "compaction": { "enabled": false } }
+```
+
+`anchor`, `list` and `rewind` keep working either way, and pi's own compaction (when on) works as before. pi's compaction settings are read from the session's live settings (the ones pi decides from) at each crossing and each overflow, so a `/settings` change applies at the next one. Before the session is captured (its first prompt) they are read from disk with the session's project-trust decision.
+
+**Headless sessions (subagents).** A headless session with the hint set and pi's compaction on (pi's default, or enabled by a project or agent) runs silently without the hint and without rewind-driven compaction: there is no UI for the error.
+
+**Reserve ordering.** The hint must fire before rewind-driven compaction's target: `rewindHintReserveTokens` ≥ the active model's `compaction.reserveTokens` (`compaction.modelOverrides["<provider>/<modelId>"].reserveTokens`, else `compaction.reserveTokens`, default 16384). Size it well above that to leave room for the persist and summary turns. With compaction off, session start warns per model when it is below (both still run), e.g.: `rewindHintReserveTokens (10000) is below pi's compaction.reserveTokens (16384) for anthropic/claude-haiku-5-5: rewind-driven compaction may fire before the hint, giving the model no time to prepare and persist what matters to files.`
+
+**Room for the forced turns.** The target `contextWindow − compaction.reserveTokens` must hold the forced message, the rewind call, the summary instruction and the summary, thinking included. At high thinking levels size pi's reserve per model, e.g.:
+
+```json
+{ "compaction": { "modelOverrides": { "anthropic/claude-haiku-5-5": { "reserveTokens": 30000 } } } }
+```
+
+The thinking level is not changed for the forced turns, so they stay cached.
 
 ## Automatic start anchor
 
@@ -193,7 +250,7 @@ Why this is more involved than just calling pi's `branchWithSummary`:
 
 Earlier releases summarized with a separate request: first pi's cold `generateBranchSummary` (re-billing the whole branch), then a replay of the captured live request (#33/#75) that hit the cache only while the replay stayed byte-identical to the live turn, with fallbacks (`stale-capture`, `capture-diverged`, `overflow`, ...) that re-billed cold. A separate request also cannot reach a provider that serves turns from its own session, such as pi-claude-bridge. The summary is now just the next turn of the live conversation:
 
-1. **`rewind` (tool call).** Refuses a rewind that shares its assistant message with other tool calls (`rewind must be the only tool call in its message — re-issue only the rewind, alone. The other calls in this message ran normally.`) and a rewind issued from inside another tool (e.g. a codemode script). Otherwise validates as before (names, `summaryFocus`, label uniqueness, the minimum-savings floor), records a pending rewind for the session, and returns a short result: `[navigate_tree] Rewind to '<rewindTo>' accepted (collapse as '<newLabel>'). Follow the navigate_tree message below to complete it.` The tree does not move yet.
+1. **`rewind` (tool call).** Refuses a rewind that shares its assistant message with other tool calls (`rewind must be the only tool call in its message — re-issue only the rewind, alone. The other calls in this message ran normally.`) and a rewind issued from a codemode script that is not the script's first nested call (`rewind from a codemode script must be the script's first nested call`). A script whose first nested call is a `rewind` is accepted like a direct one only if the script issues no other nested call: a sibling still in flight refuses it with the batch message above, and the siblings run normally. Otherwise validates as before (names, `summaryFocus`, label uniqueness, the minimum-savings floor), records a pending rewind for the session, and returns a short result: `[navigate_tree] Rewind to '<rewindTo>' accepted (collapse as '<newLabel>'). Follow the navigate_tree message below to complete it.` The tree does not move yet.
 2. **The instruction message.** The rewind turn's `turn_end` returns a `navigate-tree-summary-request` custom message as a boundary entry with `continue: true`: `[navigate_tree]`, a newline, then the eval-approved r5d instruction with `{first}` (the 1-based number of the first collapsed message in the projection the model sees) and `Additional focus: <summaryFocus>`. pi commits it right after the rewind's tool result and before queued steers. The model receives it as a user message rather than as a tool result, so it no longer reads like an instruction injected through a tool. In the TUI it renders as one line, `[rewind to '<rewindTo>' · collapse as '<newLabel>'] · summarizing · context 30.4% → ~12.0% of 1.0M` (the `~` figure is the estimate at the anchor before the summary is added), and expands to the full text.
 3. **The summary turn.** The model's next reply is the summary: an append to the live conversation, so it is served from the prompt cache like any other turn. While the rewind is pending, the request is frozen at the instruction message: the `context` handler drops everything after it, so steers and other extensions' messages that arrive meanwhile are not sent, and every retry sends the same messages. Every tool call is blocked (TUI-only reason: `navigate_tree: blocked: the model tried to call a tool instead of summarizing.`).
 4. **`turn_end`.** A text-only turn with the r5d `## Goal` heading completes the rewind: any preamble before `## Goal` is dropped, the summary turn is labeled `branch:<newLabel>`, the stored `branch_summary` gets upstream's preamble and `<read-files>`/`<modified-files>` lists (tool calls of hidden attempts excluded), `branchWithSummary` forks from the anchor, the label is written, `agent.state.messages` is refreshed and `session_tree` is emitted. The continuation message (`customType: "navigate-tree-rewind"`) is delivered in the same run, so the rewound context reaches a real turn — and the footer's token count updates — without a user prompt.
@@ -238,6 +295,8 @@ Cache behavior on the bridge:
 
 - **Tiny rewinds are rejected by a minimum-savings floor.** A `rewind` whose measured savings falls below an internal floor (~4k tokens of apparent context freed) is refused with guidance listing the active anchors instead of executing — collapsing a near-empty segment burns a summary turn and can even grow live context once the summary and its continuation message land on the kept chain. This pairs with anchoring early: anchor at the start of a stage, then rewind only once real work has accumulated above the anchor.
 
+- **The estimate can undercount.** The chars/4 estimate ran about 1.45× low on a live run of 15 parallel reads. The real-usage ratio corrects this only when the overflowed reply carries usage (a cut-off reply or a silent overflow). An explicit provider context-length error has none, so its ratio is 1 and a miss falls through to the second-overflow path (D8).
+
 - **Abandoned branches grow the JSONL forever.** Each rewind preserves the abandoned subtree on disk. Session files get bigger over time even as live context shrinks. For very long autonomous runs (days), session files can hit hundreds of MB.
 
 - **The summary costs one live turn.** The summary turn reads the whole live context (from cache) and its output tokens are billed like any turn. Each retry re-sends the same messages, so it is a cached turn too (a retry on a different model, e.g. after a pi-fallback-provider switch or a manual `/model` change, is a cold cache). A model that keeps calling tools instead of summarizing exhausts `MAX_SUMMARY_ATTEMPTS` and the rewind fails with a tool error.
@@ -247,6 +306,20 @@ Cache behavior on the bridge:
 - **Settle-time endings and later extensions.** `agent_before_settle` handlers run in load order. If an extension loaded after this one sets `continue` for the run, the rewind may already have ended with `the run ended before the summary`. On pi 1.3.0, `before_agent_start` also fires for runs started by an extension's `sendMessage`, and that ends a pending rewind as aborted like a new prompt does.
 
 - **Other extensions' `turn_end` drafts on the summary turn.** The rewind moves the branch inside its `turn_end` handler. Earlier handlers' `context_edit` drafts that target an entry the rewind abandoned are dropped (pi would otherwise reject the whole boundary list, the continuation included); a handler registered AFTER this extension that returns such a draft still makes pi discard the list, and the run ends on the summary turn with the rewind landed but unannounced.
+
+- **Rewind-driven compaction loses the withheld output.** The model sees only the notice; it must re-run the call after the rewind if it still needs the output. Withheld results and hidden attempts still show in full in the TUI and the JSONL (pi does not re-render on `context_edit`).
+
+- **Rewind-driven compaction: same model only.** An overflow is handled only when the failed reply's provider and model match the active model; with a virtual model selection (pi resolves the physical model internally) it is skipped and the run ends on the error, as without this extension.
+
+- **Rewind-driven compaction on pi < 1.3.0: z.ai's overflow message.** `@earendil-works/pi-ai` before 1.3.0 does not recognize z.ai's overflow error (`prompt exceeds max length`, the CN endpoint), so that overflow is not detected and ends the run on the error, as without this extension.
+
+- **The reserve-order warning reads pi's settings from disk.** The `session_start` warning (hint reserve below pi's `compaction.reserveTokens`), and rewind-driven compaction before the session is captured, read pi's settings from disk with the session's project trust. An SDK host that runs a session with in-memory settings, or different trust, can disagree with what they read; the disk source is also shared by sessions in one process (like the hint state).
+
+- **Rewind-driven compaction and later extensions.** At `turn_end` and `agent_before_settle` it stands down when an earlier handler already set `continue` (e.g. a fallback provider retrying on a larger model). An extension loaded after this one that also recovers runs after the drafts were returned.
+
+- **`codemode.mode: "only"`.** With `navigate_tree` reachable only from `codemode` scripts, a rewind is issued from a script whose first nested call is `navigate_tree` `rewind` (for example `await navigate_tree({ action: "rewind" })`). The same applies to voluntary rewinds: a script's first nested rewind is accepted whether or not a forced rewind is active. A script that makes no rewind counts as a failed forced attempt (`no rewind after 3 attempts`). Keep `navigate_tree` a direct tool (`codemode.mode: "on"`, pi's default) if you do not want rewinds to go through scripts.
+
+- **A restart during a forced rewind** leaves the forced-rewind message in context with no gate.
 
 - **Loading the extension monkey-patches `AgentSession.prototype.prompt` globally.** Every session in the host pi process picks up the patch on import, including sessions that never call `navigate_tree`. The patch is install-on-import and not reversible within a running pi process; restart pi to fully unload it.
 
@@ -263,7 +336,7 @@ pnpm run lint      # biome check extensions/
 pnpm run typecheck # tsc --noEmit
 ```
 
-Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`), `extensions/navigate-tree/index.ts` (action dispatch, schema shape, the in-band rewind: accepted result, solo/nested guards, instruction message, frozen request, hidden re-sends, every ending and its outcome entry, TUI renderers, tool-call gate, summary-turn completion, context-event projection, reflection bootstrap, `session_tree` emit — in `index.test.ts`), and `extensions/navigate-tree/summary-prompt.ts` (the byte-exact r5d prompt pin and the stored-summary shape — in `summary-prompt.test.ts`). The suite is fully offline: the summary turn is simulated by appending an assistant message and firing `turn_end`. Manual e2e validation against the current pi release is recommended for any pi version bump (the reflection bootstrap depends on `AgentSession.prototype.prompt` / `agent.state.messages` field shapes, and the same-run continuation on pi's `turn_end` ordering).
+Tests cover `extensions/navigate-tree/helpers.ts` (pure helpers in `helpers.test.ts`), `extensions/navigate-tree/index.ts` (action dispatch, schema shape, the in-band rewind: accepted result, solo/nested guards, instruction message, frozen request, hidden re-sends, every ending and its outcome entry, rewind-driven compaction (overflow signals, withholding, forced-rewind gate and attempts, final error, either-or with pi's compaction), TUI renderers, tool-call gate, summary-turn completion, context-event projection, reflection bootstrap, `session_tree` emit — in `index.test.ts`), and `extensions/navigate-tree/summary-prompt.ts` (the byte-exact r5d prompt pin and the stored-summary shape — in `summary-prompt.test.ts`). The suite is fully offline: the summary turn is simulated by appending an assistant message and firing `turn_end`. Manual e2e validation against the current pi release is recommended for any pi version bump (the reflection bootstrap depends on `AgentSession.prototype.prompt` / `agent.state.messages` field shapes, and the same-run continuation on pi's `turn_end` ordering).
 
 ### Live summary verification
 

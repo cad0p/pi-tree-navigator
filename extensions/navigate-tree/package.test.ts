@@ -1,5 +1,5 @@
 // Every runtime import of the shipped extension is a peer dependency (pi
-// provides it), and the dev copies pin the floor tests run against.
+// provides it), and the dev copies are pinned to the pi the tests run against.
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -46,7 +46,7 @@ describe("package.json dependencies", () => {
     assert.deepEqual(new Set(ranges), new Set([">=0.87.0"]));
   });
 
-  it("pi-tui dev copy is pinned to the version pi-coding-agent resolves to (the floor tests run against)", () => {
+  it("pi dev copies are pinned to one version (the one pi-coding-agent resolves to)", () => {
     const resolved = (name: string) =>
       (
         JSON.parse(
@@ -57,7 +57,14 @@ describe("package.json dependencies", () => {
         ) as { version: string }
       ).version;
     const agent = resolved("@earendil-works/pi-coding-agent");
-    assert.equal(pkg.devDependencies?.["@earendil-works/pi-tui"], agent);
-    assert.equal(resolved("@earendil-works/pi-tui"), agent);
+    for (const name of [
+      "@earendil-works/pi-agent-core",
+      "@earendil-works/pi-ai",
+      "@earendil-works/pi-coding-agent",
+      "@earendil-works/pi-tui",
+    ]) {
+      assert.equal(pkg.devDependencies?.[name], agent, name);
+      assert.equal(resolved(name), agent, name);
+    }
   });
 });
