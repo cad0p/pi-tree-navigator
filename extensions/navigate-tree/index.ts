@@ -2728,6 +2728,18 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // The session is going away (quit, reload, new, resume, fork): a forced
+  // rewind cannot outlive it (#101).
+  pi.on("session_shutdown", (_event, ctx) => {
+    try {
+      forcedRewinds.delete(
+        (ctx.sessionManager as SessionManager).getSessionId(),
+      );
+    } catch {
+      // Fail-open: session_start clears it too.
+    }
+  });
+
   // A compaction while pending (threshold or overflow recovery) runs before
   // the next request: end the rewind before that request goes out (#90, O7).
   pi.on("session_compact", (_event, ctx) => {

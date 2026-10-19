@@ -8096,6 +8096,28 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("session_shutdown (fix 8): the forced rewind is dropped with the session", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      assert.ok(fireToolCall(f.pi, f.ctx), "the gate is up");
+      const handlers = f.pi.onCalls.get("session_shutdown") ?? [];
+      assert.ok(
+        handlers.length > 0,
+        "a session_shutdown handler is registered",
+      );
+      for (const h of handlers) {
+        await h(
+          { type: "session_shutdown", reason: "quit" } as never,
+          f.ctx as never,
+        );
+      }
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "the gate is gone");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("S6: a second overflow during the forced rewind ends it", async () => {
     const f = await forcedSetup();
     try {
