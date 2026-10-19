@@ -8508,6 +8508,38 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("D10 (fix 9): one model's invalid pi reserve does not skip the others", async () => {
+    const f = await forcedSetup({
+      config: {
+        rewindHintReserveTokens: 10_000,
+        modelOverrides: {
+          "openai/bad": { rewindHintReserveTokens: 50_000 },
+          "openai/gpt-x": { rewindHintReserveTokens: 50_000 },
+        },
+      },
+      piSettings: {
+        compaction: {
+          enabled: false,
+          modelOverrides: {
+            "openai/bad": { reserveTokens: "x" },
+            "openai/gpt-x": { reserveTokens: 60_000 },
+          },
+        },
+      },
+    });
+    try {
+      assert.deepEqual(f.ctx.notifyCalls, [
+        [
+          buildReserveOrderWarning(10_000, 16_384, "claude/claude-sonnet-4-5"),
+          "warning",
+        ],
+        [buildReserveOrderWarning(50_000, 60_000, "openai/gpt-x"), "warning"],
+      ]);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("renders D8 as one error-styled row; the forced message keeps pi's default box", async () => {
     const f = await forcedSetup();
     try {

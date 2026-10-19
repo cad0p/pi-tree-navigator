@@ -3007,19 +3007,24 @@ export default function (pi: ExtensionAPI) {
       for (const key of keys) {
         const slash = key.indexOf("/");
         if (slash <= 0) continue;
-        const hint = resolveRewindHintReserve(
-          {
-            rewindHintReserveTokens,
-            rewindHintModelReserveTokens: hintByModel,
-          },
-          key,
-        );
-        const piReserve = settings.getCompactionReserveTokens({
-          provider: key.slice(0, slash),
-          id: key.slice(slash + 1),
-        });
-        if (hint !== null && hint < piReserve) {
-          warnings.push(buildReserveOrderWarning(hint, piReserve, key));
+        // Per key: one model's invalid setting does not skip the others.
+        try {
+          const hint = resolveRewindHintReserve(
+            {
+              rewindHintReserveTokens,
+              rewindHintModelReserveTokens: hintByModel,
+            },
+            key,
+          );
+          const piReserve = settings.getCompactionReserveTokens({
+            provider: key.slice(0, slash),
+            id: key.slice(slash + 1),
+          });
+          if (hint !== null && hint < piReserve) {
+            warnings.push(buildReserveOrderWarning(hint, piReserve, key));
+          }
+        } catch {
+          // Invalid pi setting for this model: pi reports it itself.
         }
       }
     } catch {
