@@ -225,7 +225,7 @@ After every rewind the extension emits `session_tree` with the payload pi's own 
 
 Cache behavior on the bridge:
 
-- **Summary turn.** The in-band summary is the paused Claude Code query receiving its tool result: a cache hit on the live session, no bridge-specific path.
+- **Summary turn.** The summary instruction message and its hidden re-sends (#90) are untested on history-mirroring providers.
 - **First turn after the rewind.** That turn is a bridge session rebuild, which per the bridge's README usually misses the prompt cache past the system prompt. It is a one-time write of the rewound chain (tens of k) instead of re-reading the full pre-rewind context on every turn.
 
 ## Limitations

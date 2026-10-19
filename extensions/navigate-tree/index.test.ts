@@ -22,7 +22,13 @@
  */
 
 import * as assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -7262,5 +7268,23 @@ describe("automatic start anchor (#55)", () => {
     } finally {
       cleanupConfigFixture(fixture);
     }
+  });
+});
+
+describe("README: history-mirroring providers (#90)", () => {
+  const readme = readFileSync(
+    new URL("../../README.md", import.meta.url),
+    "utf8",
+  );
+
+  it("does not claim the summary is the paused Claude Code query", () => {
+    assert.doesNotMatch(readme, /paused Claude Code query/);
+  });
+
+  it("says the #90 flow is untested on history-mirroring providers", () => {
+    assert.match(
+      readme,
+      /instruction message and its hidden re-sends \(#90\) are untested on history-mirroring providers/,
+    );
   });
 });
