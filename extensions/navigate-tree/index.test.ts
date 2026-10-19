@@ -8742,10 +8742,14 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
-  it("D11: nothing to withhold on a squeezed summary — still over, D8 (the D11 check runs first)", async () => {
+  it("D11: nothing to withhold on a squeezed summary — still over: D8, no #93 re-send (the D11 check runs first)", async () => {
     const f = await forcedSetup();
     try {
       await requestRewind(f, REWIND_ARGS, "tc-rewind", 200_000);
+      // Everything the rewind could withhold is already withheld, so the plan
+      // has nothing left and the tail stays over the target.
+      f.sm.appendContextEdit(f.r1, null);
+      f.sm.appendContextEdit(f.r2, null);
       const message = {
         ...assistantMessage([{ type: "text", text: "## Goal" }], "length", 0),
         usage: { ...usageOf(200_000), output: 100 },
@@ -8755,13 +8759,16 @@ Active anchors (root → leaf, % of 100k):
       assert.equal(
         turn.continue,
         false,
-        "no #93 re-send of a squeezed summary",
+        "D8 ends the rewind: a squeezed summary is not re-sent",
       );
       assert.ok(hiddenIds(f.sm).has(id));
+      assert.equal(outcomeEntries(f.sm).length, 1);
       assert.equal(
         outcomeEntries(f.sm)[0].reason,
         COMPACTION_FAILED_STILL_OVER,
       );
+      // #93's cut-off re-send would keep the rewind pending (calls blocked).
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
       assert.equal(
         forcedDrafts(turn).at(-1)?.content,
         buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
