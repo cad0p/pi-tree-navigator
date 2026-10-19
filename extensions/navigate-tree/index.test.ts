@@ -3757,6 +3757,57 @@ describe("rewind: reused tool-call ids (#90)", () => {
       );
       assert.equal(r[1].isError, true);
     });
+
+    it(`an attempt calling a tool with the rewind's id ${JSON.stringify(id)} is an attempt, not the rewind turn (matched by messageEntryId)`, async () => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f, REWIND_ARGS, id);
+      const { entryId, resultIds } = await toolCallAttempt(f, [id]);
+      const instructions = f.sm
+        .getBranch()
+        .filter(
+          (e) =>
+            e.type === "custom_message" &&
+            e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+        );
+      assert.equal(instructions.length, 1, "no second instruction");
+      for (const hidden of [entryId, ...resultIds]) {
+        assert.ok(hiddenIds(f.sm).has(hidden), "the attempt is hidden");
+      }
+      assert.equal(outcomeEntries(f.sm).length, 0);
+      assert.ok(fireToolCall(f.pi, f.ctx), "still pending, re-sent");
+    });
+
+    it(`the rewind turn's boundary skipped: a later turn calling ${JSON.stringify(id)} is not taken for it (matched by messageEntryId)`, async () => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      appendToolCallAssistant(f.sm, [
+        { id, name: TOOL_NAME, arguments: REWIND_ARGS },
+      ]);
+      const result = await f.tool.execute(
+        id,
+        REWIND_ARGS,
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      appendToolResult(f.sm, id, TOOL_NAME, result.content[0].text);
+      // pi never fired the rewind turn's turn_end.
+      const { entryId } = await toolCallAttempt(f, [id]);
+      assert.ok(
+        !f.pi.boundaryResults.some((r) =>
+          r.entries.some((d) => d.customType === SUMMARY_REQUEST_CUSTOM_TYPE),
+        ),
+        "no instruction for a turn that did not issue the rewind",
+      );
+      const outcome = outcomeEntries(f.sm);
+      assert.equal(outcome.length, 1);
+      assert.equal(
+        outcome[0].reason,
+        "the summary request could not be delivered",
+      );
+      assert.ok(hiddenIds(f.sm).has(entryId));
+    });
   }
 });
 
