@@ -1432,12 +1432,16 @@ export default function (pi: ExtensionAPI) {
   /**
    * Settle a committing ending (#90): drop the pending rewind, and when pi
    * did not commit its drafts (no matching outcome entry on the branch),
-   * apply the same ending outside a boundary.
+   * apply the same ending outside a boundary. Returns the status of an
+   * ending re-applied here, else `null`.
    */
-  function settleCommittingEnding(sm: SessionManager, sessionId: string) {
+  function settleCommittingEnding(
+    sm: SessionManager,
+    sessionId: string,
+  ): RewindOutcomeData["status"] | null {
     const pending = pendingRewinds.get(sessionId);
     const committing = pending?.committing;
-    if (!pending || !committing) return;
+    if (!pending || !committing) return null;
     pendingRewinds.delete(sessionId);
     let committed: boolean;
     try {
@@ -1449,7 +1453,7 @@ export default function (pi: ExtensionAPI) {
       // Cannot tell: never write a second outcome.
       committed = true;
     }
-    if (committed) return;
+    if (committed) return null;
     endOutsideBoundary(
       sm,
       pending,
@@ -1458,6 +1462,7 @@ export default function (pi: ExtensionAPI) {
       committing.text,
       committing.extraHidden,
     );
+    return committing.status;
   }
 
   /** `sessionId`'s pending rewind, after settling a committing ending. */
@@ -2055,7 +2060,18 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    const pending = livePending(sm, sessionId);
+    // A failed ending pi dropped (e.g. the exhausted attempts' turn_end)
+    // comes with `continue`, as it would have at its boundary (O6): the
+    // model reads the failure in the same run.
+    const reapplied = settleCommittingEnding(sm, sessionId);
+    if (
+      reapplied === "failed" &&
+      event.outcome !== "error" &&
+      event.outcome !== "aborted"
+    ) {
+      return { continue: true };
+    }
+    const pending = pendingRewinds.get(sessionId);
     if (!pending || event.outcome === "error" || event.continue) return;
     if (event.outcome === "aborted") {
       return {

@@ -3644,6 +3644,45 @@ describe("rewind: an ending dropped by pi (#90)", () => {
     assert.ok(hiddenIds(f.sm).has(entryId), "the aborted attempt is hidden");
   });
 
+  it("a dropped exhausted-attempts ending is re-applied at agent_before_settle with continue", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryTurn(f, "no goal 1", "stop", { commit: true });
+    await summaryTurn(f, "no goal 2", "stop", { commit: true });
+    // Attempt 3 exhausts the attempts; pi drops its turn_end list
+    // (another extension's invalid draft): entries [], continue false.
+    const third = await summaryTurn(f, "no goal 3", "stop", {
+      commit: false,
+    });
+    assert.equal(third.boundary.continue, true, "our ending asked to continue");
+    assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+    const result = await fireAgentBeforeSettle(f.pi, f.ctx);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "failed");
+    assert.ok(hiddenIds(f.sm).has(third.entryId), "attempt 3 is hidden");
+    assert.equal(
+      result.continue,
+      true,
+      "the model reads the failure in the same run",
+    );
+  });
+
+  it("a dropped failed ending re-applied at an aborted / errored settle does not continue", async () => {
+    for (const outcome of ["aborted", "error"] as const) {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      await summaryTurn(f, "no goal 1", "stop", { commit: true });
+      await summaryTurn(f, "no goal 2", "stop", { commit: true });
+      await summaryTurn(f, "no goal 3", "stop", { commit: false });
+      const result = await fireAgentBeforeSettle(f.pi, f.ctx, { outcome });
+      assert.equal(outcomeEntries(f.sm)[0].status, "failed");
+      assert.equal(result.continue, false, outcome);
+    }
+  });
+
   it("a committed ending is not re-applied", async () => {
     const f = setup();
     setupRewindable(f.sm, f.pi, { capture: true });
