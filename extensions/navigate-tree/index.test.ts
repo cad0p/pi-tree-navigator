@@ -74,8 +74,20 @@ import navigateTree, {
   wrapPlainLine,
 } from "./index.ts";
 import {
+  buildForcedRewindText,
   buildNoAnchorText,
+  buildReserveOrderWarning,
+  buildRewindCompactionFailedText,
   buildRewindHintText,
+  buildWithheldNoticeText,
+  COMPACTION_FAILED_ABORTED,
+  COMPACTION_FAILED_NO_ANCHOR,
+  COMPACTION_FAILED_NO_REWIND,
+  COMPACTION_FAILED_OVERFLOWED_AGAIN,
+  COMPACTION_FAILED_RUN_ENDED,
+  COMPACTION_FAILED_STILL_OVER,
+  FORCED_REWIND_BLOCK_REASON,
+  REWIND_COMPACTION_OFF_TEXT,
   REWIND_HINT_CUSTOM_TYPE,
 } from "./rewind-hint.ts";
 import {
@@ -794,10 +806,13 @@ async function requestRewind(
   f: { sm: SessionManager; pi: FakePi; ctx: FakeCtx; tool: CapturedTool },
   args: Record<string, unknown> = REWIND_ARGS,
   toolCallId = "tc-rewind",
+  totalTokens?: number,
 ) {
-  const call = appendToolCallAssistant(f.sm, [
-    { id: toolCallId, name: TOOL_NAME, arguments: args },
-  ]);
+  const call = appendToolCallAssistant(
+    f.sm,
+    [{ id: toolCallId, name: TOOL_NAME, arguments: args }],
+    totalTokens,
+  );
   const result = await f.tool.execute(
     toolCallId,
     args,
@@ -7482,5 +7497,800 @@ describe("README: history-mirroring providers (#90)", () => {
       readme,
       /instruction message and its hidden re-sends \(#90\) are untested on history-mirroring providers/,
     );
+  });
+});
+
+// =============================================================================
+// Rewind-driven compaction (#101)
+//
+// The overflow turns are simulated: the overflowed assistant is appended as
+// pi persists it, then the boundaries fire in pi's order (`turn_end`,
+// `agent_end`, `agent_before_settle`, `agent_settled`). Window 100k, hint
+// reserve 20k, pi's compaction off with its default reserve (16384), so the
+// target is 83 616 tokens.
+// =============================================================================
+
+describe("rewind-driven compaction (#101)", () => {
+  const WINDOW = 100_000;
+  const BIG = "x".repeat(48_000); // ~12k tokens
+  const theme = { fg: (color: string, text: string) => `<${color}>${text}` };
+
+  interface Forced {
+    fixture: ConfigFixture;
+    sm: SessionManager;
+    pi: FakePi;
+    ctx: FakeCtx;
+    tool: CapturedTool;
+    /** The batch: the issuing assistant and its two big results (r1, r2). */
+    issuerId: string;
+    r1: string;
+    r2: string;
+  }
+
+  async function forcedSetup(
+    opts: {
+      config?: Record<string, unknown>;
+      piSettings?: Record<string, unknown>;
+      anchor?: boolean;
+      issuerTokens?: number;
+    } = {},
+  ): Promise<Forced> {
+    const fixture = makeConfigFixture();
+    writeGlobalConfig(
+      fixture,
+      JSON.stringify(opts.config ?? { rewindHintReserveTokens: 20_000 }),
+    );
+    if (opts.piSettings) writePiSettings(fixture, opts.piSettings);
+    const f = setup({ contextWindow: WINDOW });
+    (f.ctx.model as { maxTokens?: number }).maxTokens = 64_000;
+    f.ctx.cwd = fixture.projectDir;
+    await runSessionStart(f.pi, f.ctx, fixture);
+    const t = appendTurn(f.sm, "u1", "a1", 5_000);
+    if (opts.anchor ?? true) f.pi.pi.setLabel(t.assistantId, "anchor:start");
+    appendTurn(f.sm, "u2", "a2", 20_000);
+    const issuer = appendToolCallAssistant(
+      f.sm,
+      [
+        { id: "r1", name: "read", arguments: { path: "a" } },
+        { id: "r2", name: "read", arguments: { path: "b" } },
+      ],
+      opts.issuerTokens ?? 60_000,
+    );
+    const r1 = appendToolResult(f.sm, "r1", "read", BIG);
+    const r2 = appendToolResult(f.sm, "r2", "read", BIG);
+    return { fixture, ...f, issuerId: issuer.id, r1, r2 };
+  }
+
+  function errorOverflow(sm: SessionManager, provider = "claude") {
+    const message = {
+      ...assistantMessage([], "error", 0),
+      provider,
+      errorMessage: "prompt is too long: 106000 tokens > 100000 maximum",
+    };
+    return { id: sm.appendMessage(message as never), message };
+  }
+
+  /** pi's order after an error turn: turn_end, agent_end, before_settle. */
+  async function runErrorEnd(f: Forced, message: unknown, cont = false) {
+    const turn = await fireTurnEndAll(f.pi, f.ctx, message);
+    for (const h of f.pi.onCalls.get("agent_end") ?? []) {
+      h({ type: "agent_end", messages: [message] } as never, f.ctx as never);
+    }
+    const settle = await fireAgentBeforeSettle(f.pi, f.ctx, {
+      outcome: "error",
+      continue: cont,
+    });
+    return { turn, settle };
+  }
+
+  function forcedDrafts(result: BoundaryResult) {
+    return result.entries.filter((d) => d.customType === REWIND_CUSTOM_TYPE);
+  }
+
+  function textAttempt(f: Forced, text = "I will rewind soon.") {
+    const message = assistantMessage([{ type: "text", text }], "stop", 100);
+    f.sm.appendMessage(message as never);
+    return fireTurnEndAll(f.pi, f.ctx, message);
+  }
+
+  const D5_ONE = `[navigate_tree] Context overflowed the window (100k): 1 tool result was withheld. Rewind now — only navigate_tree rewind is allowed until it lands.
+Active anchors (root → leaf, % of 100k):
+   5.0%  start`;
+
+  it("texts are byte-exact (D4, D5, D8, D9, D10, gate)", () => {
+    assert.equal(
+      buildWithheldNoticeText(19_000),
+      "[navigate_tree] Output withheld: adding it overflowed the context window (~19k tokens). The call ran; only its output was dropped. Rewind first, then re-run it if you still need the output.",
+    );
+    assert.equal(buildWithheldNoticeText(200), buildWithheldNoticeText(1_000));
+    assert.equal(
+      buildForcedRewindText(100_000, 2, "TABLE"),
+      "[navigate_tree] Context overflowed the window (100k): 2 tool results were withheld. Rewind now — only navigate_tree rewind is allowed until it lands.\nTABLE",
+    );
+    assert.match(
+      buildForcedRewindText(100_000, 0, "T"),
+      /: no tool results were withheld\. /,
+    );
+    assert.equal(
+      buildRewindCompactionFailedText(COMPACTION_FAILED_NO_REWIND),
+      "[navigate_tree] Context overflow recovery failed: no rewind after 3 attempts. The session is at the context limit; rewind manually with /tree, /compact, or start a new session.",
+    );
+    assert.equal(
+      REWIND_COMPACTION_OFF_TEXT,
+      "navigate_tree: the rewind hint and rewind-driven compaction are off because pi's auto-compaction is on. Disable compaction.enabled or remove rewindHintReserveTokens.",
+    );
+    assert.equal(
+      buildReserveOrderWarning(10_000, 16_384, "anthropic/claude-haiku-5-5"),
+      "rewindHintReserveTokens (10000) is below pi's compaction.reserveTokens (16384) for anthropic/claude-haiku-5-5: rewind-driven compaction may fire before the hint, giving the model no time to prepare and persist what matters to files.",
+    );
+    assert.equal(
+      FORCED_REWIND_BLOCK_REASON,
+      "navigate_tree: blocked: only rewind is allowed until the forced rewind lands.",
+    );
+  });
+
+  it("explicit error: nothing at turn_end, recovery at agent_before_settle in the same run", async () => {
+    const f = await forcedSetup();
+    try {
+      const err = errorOverflow(f.sm);
+      const { turn, settle } = await runErrorEnd(f, err.message);
+      assert.deepEqual(turn.entries, []);
+      assert.equal(settle.continue, true);
+      const edits = settle.entries.filter((d) => d.type === "context_edit");
+      assert.deepEqual(
+        edits.map((d) => [d.targetId, d.replacement === null]),
+        [
+          [err.id, true],
+          [f.r2, false],
+        ],
+        "the error is hidden, then only the newest result is withheld",
+      );
+      assert.deepEqual(edits[1].replacement, {
+        content: [
+          {
+            type: "text",
+            text: "[navigate_tree] Output withheld: adding it overflowed the context window (~12k tokens). The call ran; only its output was dropped. Rewind first, then re-run it if you still need the output.",
+          },
+        ],
+      });
+      const [d5] = forcedDrafts(settle);
+      assert.equal(d5.content, D5_ONE);
+      assert.equal(d5.display, true);
+      assert.deepEqual(d5.details, {
+        status: "forced",
+        withheld: 1,
+        contextWindow: WINDOW,
+      });
+      // The tool call stays; the result keeps its toolCallId.
+      const wire = fireContext(f.pi, f.ctx);
+      const r2 = wire.find((m) => m.toolCallId === "r2");
+      assert.ok(r2);
+      assert.match(JSON.stringify(r2.content), /Output withheld/);
+      assert.ok(!wire.some((m) => m.stopReason === "error"));
+      // No start anchor at the limit.
+      assert.equal(f.sm.getLabel(err.id), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("squeezed length: recovered at turn_end, the reply and its failed calls hidden", async () => {
+    const f = await forcedSetup();
+    try {
+      const message = {
+        ...assistantMessage(
+          [{ type: "toolCall", id: "w1", name: "write", arguments: {} }],
+          "length",
+          0,
+        ),
+        usage: { ...usageOf(99_000), output: 100 },
+      };
+      const id = f.sm.appendMessage(message as never);
+      const failed = appendToolResult(f.sm, "w1", "write", "truncated");
+      const turn = await fireTurnEndAll(f.pi, f.ctx, message, {
+        turnIndex: 1,
+      });
+      assert.equal(turn.continue, true);
+      const edits = turn.entries.filter((d) => d.type === "context_edit");
+      assert.deepEqual(
+        edits.map((d) => [d.targetId, d.replacement === null]),
+        [
+          [id, true],
+          [failed, true],
+          [f.r2, false],
+        ],
+      );
+      assert.equal(forcedDrafts(turn)[0].content, D5_ONE);
+      // Rewind-owned: no start anchor on the overflowed turn (X = 2).
+      assert.equal(f.sm.getLabel(id), undefined);
+      assert.equal(f.pi.sendMessageCalls.length, 0, "no hint");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("silent stop overflow: the reply stays visible, results withheld until the estimate fits", async () => {
+    const f = await forcedSetup();
+    try {
+      const message = {
+        ...assistantMessage([{ type: "text", text: "done" }], "stop", 0),
+        usage: { ...usageOf(105_000), input: 105_000 },
+      };
+      const id = f.sm.appendMessage(message as never);
+      const turn = await fireTurnEndAll(f.pi, f.ctx, message);
+      assert.equal(turn.continue, true);
+      const edits = turn.entries.filter((d) => d.type === "context_edit");
+      assert.deepEqual(
+        edits.map((d) => d.targetId),
+        [f.r2, f.r1],
+      );
+      assert.ok(!hiddenIds(f.sm).has(id));
+      assert.match(forcedDrafts(turn)[0].content, /: 2 tool results were/);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("does not trigger: another model, a non-overflow error, compaction on, another extension's continue", async () => {
+    // Another model.
+    {
+      const f = await forcedSetup();
+      try {
+        const err = errorOverflow(f.sm, "other");
+        const { settle } = await runErrorEnd(f, err.message);
+        assert.deepEqual(settle.entries, []);
+        assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    }
+    // A rate limit is not an overflow.
+    {
+      const f = await forcedSetup();
+      try {
+        const message = {
+          ...assistantMessage([], "error", 0),
+          errorMessage: "rate limit exceeded",
+        };
+        f.sm.appendMessage(message as never);
+        const { settle } = await runErrorEnd(f, message);
+        assert.deepEqual(settle.entries, []);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    }
+    // pi's compaction on (pi's default): pi owns the overflow.
+    {
+      const f = await forcedSetup({ piSettings: {} });
+      try {
+        const err = errorOverflow(f.sm);
+        const { settle } = await runErrorEnd(f, err.message);
+        assert.deepEqual(settle.entries, []);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    }
+    // No hint reserve: off.
+    {
+      const f = await forcedSetup({ config: {} });
+      try {
+        const err = errorOverflow(f.sm);
+        const { settle } = await runErrorEnd(f, err.message);
+        assert.deepEqual(settle.entries, []);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    }
+    // Another extension already continues (e.g. a fallback provider).
+    {
+      const f = await forcedSetup();
+      try {
+        const err = errorOverflow(f.sm);
+        const { settle } = await runErrorEnd(f, err.message, true);
+        assert.deepEqual(settle.entries, []);
+        assert.equal(settle.continue, true);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    }
+  });
+
+  it("S4: a per-model compaction reserve sets the target (nothing withheld under it)", async () => {
+    const f = await forcedSetup({
+      piSettings: {
+        compaction: {
+          enabled: false,
+          modelOverrides: {
+            "claude/claude-sonnet-4-5": { reserveTokens: 2_000 },
+          },
+        },
+      },
+    });
+    try {
+      const err = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, err.message);
+      assert.equal(settle.continue, true);
+      assert.match(
+        forcedDrafts(settle)[0].content,
+        /: no tool results were withheld\. /,
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("gate: only a direct rewind passes; blocked calls terminate the batch", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const blocked = {
+        block: true,
+        reason: FORCED_REWIND_BLOCK_REASON,
+        terminate: true,
+      };
+      assert.deepEqual(
+        fireToolCall(f.pi, f.ctx, "read", { path: "x" }),
+        blocked,
+      );
+      assert.deepEqual(
+        fireToolCall(f.pi, f.ctx, TOOL_NAME, { action: "list" }),
+        blocked,
+      );
+      assert.deepEqual(
+        fireToolCall(f.pi, f.ctx, TOOL_NAME, { action: "anchor", name: "x" }),
+        blocked,
+      );
+      assert.equal(
+        fireToolCall(f.pi, f.ctx, TOOL_NAME, { action: "rewind" }),
+        undefined,
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("attempts are hidden and re-sent; the third ends with D8 and lifts the gate", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const before = JSON.stringify(fireContext(f.pi, f.ctx));
+      const a1 = await textAttempt(f);
+      assert.equal(a1.continue, true);
+      assert.deepEqual(forcedDrafts(a1), []);
+      assert.equal(JSON.stringify(fireContext(f.pi, f.ctx)), before);
+      // A refused rewind is not an attempt and stays visible (D7).
+      const refusal = appendToolCallAssistant(f.sm, [
+        {
+          id: "bad",
+          name: TOOL_NAME,
+          arguments: { ...REWIND_ARGS, rewindTo: "nope" },
+        },
+      ]);
+      const refused = await f.tool.execute(
+        "bad",
+        { ...REWIND_ARGS, rewindTo: "nope" },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      appendToolResult(
+        f.sm,
+        "bad",
+        TOOL_NAME,
+        refused.content[0].text,
+        refused.details,
+      );
+      const r = await fireTurnEndAll(f.pi, f.ctx, refusal.message);
+      assert.deepEqual(r.entries, []);
+      assert.ok(!hiddenIds(f.sm).has(refusal.id));
+      const a2 = await textAttempt(f);
+      assert.equal(a2.continue, true);
+      const a3 = await textAttempt(f);
+      assert.equal(a3.continue, false);
+      assert.equal(
+        forcedDrafts(a3)[0].content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_NO_REWIND),
+      );
+      assert.deepEqual(forcedDrafts(a3)[0].details, {
+        status: "failed",
+        reason: COMPACTION_FAILED_NO_REWIND,
+      });
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate lifted");
+      await fireAgentSettled(f.pi, f.ctx);
+      assert.equal(f.pi.sendMessageCalls.length, 0, "no second D8 row");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("the run continuing after a D8 on a turn with tool calls never starts a second forced rewind", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await textAttempt(f);
+      await textAttempt(f);
+      // Attempt 3 calls a tool: the gate blocks it with `terminate`, so pi
+      // ends the batch; a queued steer could still continue the loop.
+      assert.equal(
+        (fireToolCall(f.pi, f.ctx) as { terminate?: boolean }).terminate,
+        true,
+      );
+      const a3 = await toolCallAttempt(f, ["tc-x"]);
+      assert.equal(a3.boundary.continue, false);
+      assert.equal(forcedDrafts(a3.boundary).length, 1);
+      // pi continues anyway (a steer): the next turn overflows again.
+      const message = {
+        ...assistantMessage([], "length", 0),
+        usage: { ...usageOf(99_000), output: 10 },
+      };
+      const id = f.sm.appendMessage(message as never);
+      const again = await fireTurnEndAll(f.pi, f.ctx, message, {
+        turnIndex: 5,
+      });
+      assert.deepEqual(again.entries, [], "no second D5, no second D8");
+      assert.equal(
+        f.sm.getLabel(id),
+        undefined,
+        "no start anchor at the limit",
+      );
+      // Settled: the next run gets a fresh forced rewind.
+      await fireAgentSettled(f.pi, f.ctx);
+      const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
+      assert.equal(settle.continue, true);
+      assert.equal(forcedDrafts(settle)[0].details.status, "forced");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("a landed rewind lifts the gate (D7); the next overflow is a fresh one (D15)", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await requestRewind(f);
+      const summary = await summaryTurn(f, SUMMARY_TEXT, "stop", {
+        commit: true,
+      });
+      assert.equal(summary.boundary.continue, true);
+      assert.equal(forcedDrafts(summary.boundary)[0].details.status, "done");
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("three failed summaries during a forced rewind: #93 ending plus D8, the run ends", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await requestRewind(f);
+      assert.deepEqual(fireToolCall(f.pi, f.ctx), {
+        block: true,
+        reason: SUMMARY_PENDING_BLOCK_REASON,
+        terminate: true,
+      });
+      await summaryTurn(f, "no summary", "stop", { commit: true });
+      await summaryTurn(f, "no summary", "stop", { commit: true });
+      const last = await summaryTurn(f, "no summary", "stop", { commit: true });
+      assert.equal(last.boundary.continue, false);
+      assert.equal(outcomeEntries(f.sm).length, 1);
+      assert.equal(
+        forcedDrafts(last.boundary).at(-1)?.content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_NO_REWIND),
+      );
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("S6: a second overflow during the forced rewind ends it", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const second = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, second.message);
+      assert.equal(settle.continue, false);
+      assert.equal(
+        forcedDrafts(settle)[0].content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_OVERFLOWED_AGAIN),
+      );
+      assert.ok(hiddenIds(f.sm).has(second.id));
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("S6 during the summary turn (D13): #93 failed ending plus D8", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await requestRewind(f);
+      const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
+      assert.equal(settle.continue, false);
+      assert.equal(
+        outcomeEntries(f.sm)[0].reason,
+        COMPACTION_FAILED_OVERFLOWED_AGAIN,
+      );
+      assert.equal(
+        forcedDrafts(settle).at(-1)?.content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_OVERFLOWED_AGAIN),
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D14: no anchor ends right away, and no start anchor lands on the overflow", async () => {
+    const f = await forcedSetup({ anchor: false });
+    try {
+      const err = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, err.message);
+      assert.equal(settle.continue, false);
+      assert.equal(
+        forcedDrafts(settle)[0].content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_NO_ANCHOR),
+      );
+      assert.ok(
+        !f.sm
+          .getBranch()
+          .some((e) => f.sm.getLabel(e.id) === START_ANCHOR_LABEL),
+      );
+      await fireAgentSettled(f.pi, f.ctx);
+      // The next run that does not overflow writes `start`.
+      appendTurn(f.sm, "u", "a", 100);
+      fireAgentEnd(f.pi, f.ctx);
+      assert.ok(
+        f.sm
+          .getBranch()
+          .some((e) => f.sm.getLabel(e.id) === START_ANCHOR_LABEL),
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D16: a run that settles mid-gate lifts it with one D8 row (aborted, or ended)", async () => {
+    for (const [aborted, reason] of [
+      [true, COMPACTION_FAILED_ABORTED],
+      [false, COMPACTION_FAILED_RUN_ENDED],
+    ] as const) {
+      const f = await forcedSetup();
+      try {
+        await runErrorEnd(f, errorOverflow(f.sm).message);
+        await fireAgentSettled(f.pi, f.ctx, aborted);
+        assert.deepEqual(f.pi.sendMessageCalls, [
+          [
+            {
+              customType: REWIND_CUSTOM_TYPE,
+              content: buildRewindCompactionFailedText(reason),
+              display: true,
+              details: { status: "failed", reason },
+            },
+          ],
+        ]);
+        assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    }
+  });
+
+  it("D11: a pending rewind's summary request overflows — withhold before the call, re-send", async () => {
+    const f = await forcedSetup();
+    try {
+      await requestRewind(f, REWIND_ARGS, "tc-rewind", 90_000);
+      const before = fireContext(f.pi, f.ctx).length;
+      const err = errorOverflow(f.sm);
+      const { settle } = await runErrorEnd(f, err.message);
+      assert.equal(settle.continue, true);
+      assert.deepEqual(
+        forcedDrafts(settle),
+        [],
+        "no D5: the request is re-sent",
+      );
+      const edits = settle.entries.filter((d) => d.type === "context_edit");
+      assert.deepEqual(
+        edits.map((d) => [d.targetId, d.replacement === null]),
+        [
+          [err.id, true],
+          [f.r2, false],
+        ],
+      );
+      const wire = fireContext(f.pi, f.ctx);
+      assert.equal(wire.length, before, "the frozen request, withheld");
+      assert.equal(wire.at(-1)?.customType, SUMMARY_REQUEST_CUSTOM_TYPE);
+      // The summary lands.
+      const done = await summaryTurn(f, SUMMARY_TEXT, "stop", { commit: true });
+      assert.equal(forcedDrafts(done.boundary)[0].details.status, "done");
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D11: nothing to withhold on a squeezed summary — #93 counts it as cut off", async () => {
+    const f = await forcedSetup();
+    try {
+      await requestRewind(f);
+      const message = {
+        ...assistantMessage([{ type: "text", text: "## Goal" }], "length", 0),
+        usage: { ...usageOf(40_000), output: 100 },
+      };
+      const id = f.sm.appendMessage(message as never);
+      const turn = await fireTurnEndAll(f.pi, f.ctx, message);
+      assert.equal(turn.continue, true);
+      assert.ok(hiddenIds(f.sm).has(id));
+      assert.deepEqual(fireToolCall(f.pi, f.ctx), {
+        block: true,
+        reason: SUMMARY_PENDING_BLOCK_REASON,
+      });
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D11: still over the limit after withholding — #93 failed ending plus D8", async () => {
+    const f = await forcedSetup();
+    try {
+      await requestRewind(f, REWIND_ARGS, "tc-rewind", 200_000);
+      const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
+      assert.equal(settle.continue, false);
+      assert.equal(
+        outcomeEntries(f.sm)[0].reason,
+        COMPACTION_FAILED_STILL_OVER,
+      );
+      assert.equal(
+        forcedDrafts(settle).at(-1)?.content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D17: the hint stays quiet during the forced rewind", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      f.ctx.setContextUsage(usageAt(95, WINDOW));
+      fireTurnEnd(f.pi, f.ctx);
+      assert.equal(f.pi.sendMessageCalls.length, 0);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D9: compaction on → TUI error once per crossing, no hint; headless silent; re-read per crossing", async () => {
+    const f = await forcedSetup({
+      piSettings: { compaction: { enabled: true } },
+    });
+    try {
+      f.ctx.setContextUsage(usageAt(90, WINDOW));
+      fireTurnEnd(f.pi, f.ctx);
+      fireTurnEnd(f.pi, f.ctx);
+      assert.deepEqual(f.ctx.notifyCalls, [
+        [REWIND_COMPACTION_OFF_TEXT, "error"],
+      ]);
+      assert.equal(f.pi.sendMessageCalls.length, 0);
+      // Settings change between crossings: the next crossing hints.
+      writePiSettings(f.fixture, { compaction: { enabled: false } });
+      f.ctx.setContextUsage(usageAt(10, WINDOW));
+      fireTurnEnd(f.pi, f.ctx);
+      f.ctx.setContextUsage(usageAt(90, WINDOW));
+      fireTurnEnd(f.pi, f.ctx);
+      assert.equal(f.pi.sendMessageCalls.length, 1);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+    const g = await forcedSetup({ piSettings: {} });
+    try {
+      g.ctx.hasUI = false;
+      g.ctx.setContextUsage(usageAt(90, WINDOW));
+      fireTurnEnd(g.pi, g.ctx);
+      assert.deepEqual(g.ctx.notifyCalls, []);
+      assert.equal(g.pi.sendMessageCalls.length, 0);
+    } finally {
+      cleanupConfigFixture(g.fixture);
+    }
+  });
+
+  it("D9: project settings count only when the project is trusted", async () => {
+    for (const trusted of [false, true]) {
+      const fixture = makeConfigFixture();
+      try {
+        writeGlobalConfig(
+          fixture,
+          JSON.stringify({ rewindHintReserveTokens: 20_000 }),
+        );
+        writeProjectPiSettings(fixture, { compaction: { enabled: true } });
+        const f = setup({ contextWindow: WINDOW });
+        f.ctx.cwd = fixture.projectDir;
+        f.ctx.isProjectTrusted = () => trusted;
+        await runSessionStart(f.pi, f.ctx, fixture);
+        anchorStart(f.sm, f.pi);
+        f.ctx.setContextUsage(usageAt(90, WINDOW));
+        fireTurnEnd(f.pi, f.ctx);
+        assert.equal(f.pi.sendMessageCalls.length, trusted ? 0 : 1);
+        assert.equal(f.ctx.notifyCalls.length, trusted ? 1 : 0);
+      } finally {
+        cleanupConfigFixture(fixture);
+      }
+    }
+  });
+
+  it("D10: warns per model when the hint reserve is below pi's, only with compaction off", async () => {
+    const f = await forcedSetup({
+      config: {
+        rewindHintReserveTokens: 10_000,
+        modelOverrides: { "openai/gpt-x": { rewindHintReserveTokens: 50_000 } },
+      },
+      piSettings: {
+        compaction: {
+          enabled: false,
+          modelOverrides: { "openai/gpt-x": { reserveTokens: 60_000 } },
+        },
+      },
+    });
+    try {
+      assert.deepEqual(f.ctx.notifyCalls, [
+        [
+          buildReserveOrderWarning(10_000, 16_384, "claude/claude-sonnet-4-5"),
+          "warning",
+        ],
+        [buildReserveOrderWarning(50_000, 60_000, "openai/gpt-x"), "warning"],
+      ]);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+    const g = await forcedSetup({
+      config: { rewindHintReserveTokens: 10_000 },
+      piSettings: {},
+    });
+    try {
+      assert.deepEqual(g.ctx.notifyCalls, [], "compaction on: D9's case");
+    } finally {
+      cleanupConfigFixture(g.fixture);
+    }
+  });
+
+  it("renders D8 as one error-styled row; the forced message keeps pi's default box", async () => {
+    const f = await forcedSetup();
+    try {
+      const renderer = f.pi.messageRenderers.get(REWIND_CUSTOM_TYPE) as (
+        ...a: unknown[]
+      ) => { render(w: number): string[] } | undefined;
+      assert.ok(renderer);
+      const text = buildRewindCompactionFailedText(COMPACTION_FAILED_NO_ANCHOR);
+      const row = renderer(
+        {
+          role: "custom",
+          customType: REWIND_CUSTOM_TYPE,
+          content: text,
+          display: true,
+          details: { status: "failed" },
+        },
+        { expanded: false, outputPad: 1 },
+        theme,
+      );
+      assert.deepEqual(row?.render(1000), [` <error>${text}`]);
+      assert.equal(
+        renderer(
+          {
+            role: "custom",
+            customType: REWIND_CUSTOM_TYPE,
+            content: "x",
+            display: true,
+            details: { status: "forced" },
+          },
+          { expanded: false, outputPad: 1 },
+          theme,
+        ),
+        undefined,
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
   });
 });
