@@ -694,6 +694,7 @@ async function fireAgentBeforeSettle(
     outcome?: "completed" | "aborted" | "error";
     continue?: boolean;
     entries?: BoundaryDraft[];
+    commit?: boolean;
   } = {},
 ): Promise<BoundaryResult> {
   const handlers = pi.onCalls.get("agent_before_settle") ?? [];
@@ -3552,6 +3553,70 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
   });
 });
 
+describe("rewind: an ending dropped by pi (#90)", () => {
+  // Another extension's invalid draft (e.g. a later handler's) makes pi drop
+  // the whole boundary list, our ending included (`commit: false`): it must
+  // be re-applied outside the boundary.
+
+  it("a dropped agent_before_settle ending is re-applied at the next request", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await fireAgentBeforeSettle(f.pi, f.ctx, { commit: false });
+    assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+    const sent = fireContext(f.pi, f.ctx);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(
+      outcome[0].text,
+      "Summarization failed: the run ended before the summary. Nothing was collapsed. Try again.",
+    );
+    const instruction = f.sm
+      .getBranch()
+      .find(
+        (e) =>
+          e.type === "custom_message" &&
+          e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+      );
+    assert.ok(instruction && hiddenIds(f.sm).has(instruction.id));
+    const result = sent.find(
+      (m) => m.role === "toolResult" && m.toolCallId === "tc-rewind",
+    );
+    assert.equal(result?.isError, true);
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined, "gate reopened");
+    // Not written twice.
+    fireContext(f.pi, f.ctx);
+    assert.equal(outcomeEntries(f.sm).length, 1);
+  });
+
+  it("a dropped turn_end ending is re-applied at agent_settled", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    const message = assistantMessage([], "aborted", 100);
+    const entryId = f.sm.appendMessage(message as never);
+    await fireTurnEndAll(f.pi, f.ctx, message, { commit: false });
+    assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+    await fireAgentSettled(f.pi, f.ctx, true);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+    assert.ok(hiddenIds(f.sm).has(entryId), "the aborted attempt is hidden");
+  });
+
+  it("a committed ending is not re-applied", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await fireAgentBeforeSettle(f.pi, f.ctx);
+    fireContext(f.pi, f.ctx);
+    await fireAgentSettled(f.pi, f.ctx);
+    assert.equal(outcomeEntries(f.sm).length, 1);
+    assert.equal(f.pi.appendEntryCalls.length, 0);
+  });
+});
+
 describe("rewind: reused tool-call ids (#90)", () => {
   // OpenAI-compatible servers may send "" or reuse ids: everything a
   // rewind keys on is its own entry ids, never the toolCallId alone.
@@ -3649,6 +3714,50 @@ describe("rewind: restart while pending (#90 O8)", () => {
       // Idempotent: the outcome resolves it.
       await runSessionStart(g.pi, f.ctx, fixture, "resume");
       assert.equal(outcomeEntries(f.sm).length, 1);
+    });
+  });
+
+  it("orphan hiding stops at the first user message", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      const attempt = await summaryTurn(f, "partial", "stop", {
+        commit: false,
+      });
+      const later = appendTurn(f.sm, "new prompt", "new reply", 100);
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      await runSessionStart(g.pi, f.ctx, fixture, "resume");
+      const hidden = hiddenIds(f.sm);
+      assert.ok(hidden.has(attempt.entryId));
+      assert.ok(!hidden.has(later.assistantId), "later work stays visible");
+    });
+  });
+
+  it("orphan hiding stops after MAX_SUMMARY_ATTEMPTS assistant turns", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f);
+      const ids: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        ids.push(
+          f.sm.appendMessage(
+            assistantMessage(
+              [{ type: "text", text: `t${i}` }],
+              "stop",
+              100,
+            ) as never,
+          ),
+        );
+      }
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      await runSessionStart(g.pi, f.ctx, fixture, "resume");
+      const hidden = hiddenIds(f.sm);
+      for (const id of ids.slice(0, 3)) assert.ok(hidden.has(id));
+      assert.ok(!hidden.has(ids[3]), "a 4th assistant turn was not an attempt");
     });
   });
 

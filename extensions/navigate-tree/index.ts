@@ -764,6 +764,20 @@ interface PendingRewind {
   lastCause?: SummaryFailureCause;
   /** The latest summary turn ended in a provider error (auto-retry pending). */
   lastTurnErrored?: boolean;
+  /**
+   * An ending returned as boundary drafts, not yet seen committed (#90): pi
+   * drops a boundary's whole list when any handler's draft is invalid, so
+   * the next event checks for the outcome entry and re-applies the ending
+   * outside a boundary when it is missing.
+   */
+  committing?: {
+    status: RewindOutcomeData["status"];
+    reason: string;
+    text: string;
+    extraHidden: readonly string[];
+    /** JSON of the outcome `data` the drafts carry. */
+    outcomeKey: string;
+  };
 }
 
 /** customType of the rewind continuation message (#80). */
@@ -1403,17 +1417,58 @@ export default function (pi: ExtensionAPI) {
     reason: string,
     extraHidden: readonly string[] = [],
   ): SessionBoundaryDraft[] {
+    const text = endingText(status, reason, pending);
+    const plan = planEnding(sm, pending, status, reason, text, extraHidden);
+    // Kept (as committing) until the outcome entry is seen on the branch.
+    pendingRewinds.set(sessionId, pending);
+    pending.committing = {
+      status,
+      reason,
+      text,
+      extraHidden,
+      outcomeKey: JSON.stringify(plan.data),
+    };
+    return endingDrafts(plan);
+  }
+
+  /**
+   * Settle a committing ending (#90): drop the pending rewind, and when pi
+   * did not commit its drafts (no matching outcome entry on the branch),
+   * apply the same ending outside a boundary.
+   */
+  function settleCommittingEnding(sm: SessionManager, sessionId: string) {
+    const pending = pendingRewinds.get(sessionId);
+    const committing = pending?.committing;
+    if (!pending || !committing) return;
     pendingRewinds.delete(sessionId);
-    return endingDrafts(
-      planEnding(
-        sm,
-        pending,
-        status,
-        reason,
-        endingText(status, reason, pending),
-        extraHidden,
-      ),
+    let committed: boolean;
+    try {
+      committed = sm.getBranch().some((e) => {
+        const data = readOutcomeData(e);
+        return data !== null && JSON.stringify(data) === committing.outcomeKey;
+      });
+    } catch {
+      // Cannot tell: never write a second outcome.
+      committed = true;
+    }
+    if (committed) return;
+    endOutsideBoundary(
+      sm,
+      pending,
+      committing.status,
+      committing.reason,
+      committing.text,
+      committing.extraHidden,
     );
+  }
+
+  /** `sessionId`'s pending rewind, after settling a committing ending. */
+  function livePending(
+    sm: SessionManager,
+    sessionId: string,
+  ): PendingRewind | undefined {
+    settleCommittingEnding(sm, sessionId);
+    return pendingRewinds.get(sessionId);
   }
 
   /**
@@ -1456,7 +1511,7 @@ export default function (pi: ExtensionAPI) {
     status: RewindOutcomeData["status"],
     reason: string,
   ): void {
-    const pending = pendingRewinds.get(sessionId);
+    const pending = livePending(sm, sessionId);
     if (!pending) return;
     pendingRewinds.delete(sessionId);
     endOutsideBoundary(
@@ -1472,7 +1527,8 @@ export default function (pi: ExtensionAPI) {
    * O8 (#90): at session start, end every rewind that died mid-flight — an
    * instruction on the active branch (after the newest compaction) with
    * neither its `branch:<newLabel>` completion label nor an outcome entry
-   * after it. Every assistant turn after such an instruction was an attempt
+   * after it. The assistant turns after such an instruction, up to
+   * MAX_SUMMARY_ATTEMPTS and before the next user message, were attempts
    * (tool calls were blocked), so those are hidden with it.
    */
   function resolveOrphanRewinds(sm: SessionManager): void {
@@ -1526,13 +1582,21 @@ export default function (pi: ExtensionAPI) {
         }
       });
       if (resolved) continue;
-      const attempts = later
-        .filter(
-          (e) =>
-            e.type === "message" &&
-            (e.message.role === "assistant" || e.message.role === "toolResult"),
-        )
-        .map((e) => e.id);
+      // The attempt window: at most MAX_SUMMARY_ATTEMPTS assistant turns
+      // (and their tool results), never past the first user message.
+      const attempts: string[] = [];
+      let assistants = 0;
+      for (const e of later) {
+        if (e.type !== "message") continue;
+        if (e.message.role === "user") break;
+        if (e.message.role === "assistant") {
+          if (assistants >= MAX_SUMMARY_ATTEMPTS) break;
+          assistants++;
+        } else if (e.message.role !== "toolResult") {
+          continue;
+        }
+        attempts.push(e.id);
+      }
       endOutsideBoundary(
         sm,
         {
@@ -1769,7 +1833,9 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return undefined;
     }
-    if (!pendingRewinds.has(sessionId)) return undefined;
+    if (!livePending(ctx.sessionManager as SessionManager, sessionId)) {
+      return undefined;
+    }
     return { block: true, reason: SUMMARY_PENDING_BLOCK_REASON };
   });
 
@@ -1785,7 +1851,7 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    const pending = pendingRewinds.get(sessionId);
+    const pending = livePending(sm, sessionId);
     if (!pending) return;
     if (event.message && typeof event.message === "object") {
       rewindTurns.add(event.message);
@@ -1956,7 +2022,8 @@ export default function (pi: ExtensionAPI) {
       // leaves the rewind pending: end it so the model hears about it.
       // Every step after the write is guarded, so the branch never lands
       // without its continuation.
-      if (!pendingRewinds.has(sessionId)) return;
+      const still = pendingRewinds.get(sessionId);
+      if (!still || still.committing) return;
       return deliver(
         endAtBoundary(
           sm,
@@ -1985,7 +2052,7 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    const pending = pendingRewinds.get(sessionId);
+    const pending = livePending(sm, sessionId);
     if (!pending || event.outcome === "error" || event.continue) return;
     if (event.outcome === "aborted") {
       return {
@@ -2195,6 +2262,8 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui;
     const sm = ctx.sessionManager as SessionManager;
     const sessionId = sm.getSessionId();
+    // A committing ending pi dropped is re-applied with its own reason.
+    settleCommittingEnding(sm, sessionId);
     pendingRewinds.delete(sessionId);
     // O8 (#90): a rewind that died mid-flight (restart, crash) left its
     // instruction in context with nothing waiting for it — end it.
@@ -2255,7 +2324,7 @@ export default function (pi: ExtensionAPI) {
     let sessionId: string | undefined;
     try {
       sessionId = sm.getSessionId();
-      pending = pendingRewinds.get(sessionId);
+      pending = livePending(sm, sessionId);
     } catch {
       pending = undefined;
     }
@@ -2514,7 +2583,7 @@ export default function (pi: ExtensionAPI) {
     // pi's auto-retry and `agent_before_settle`, which end it. While one is
     // pending the leaf may be an attempt about to be hidden: no start anchor.
     try {
-      if (pendingRewinds.has(sm.getSessionId())) return;
+      if (livePending(sm as SessionManager, sm.getSessionId())) return;
     } catch {
       return;
     }
