@@ -1935,7 +1935,16 @@ export default function (pi: ExtensionAPI) {
           ),
         ]
       : [];
-    if (message.stopReason === "aborted") {
+    // Esc while a blocked attempt's tools resolve: the assistant completed
+    // (`toolUse`) but the run was aborted. Esc while pending is an abort
+    // (O6), never a failed attempt.
+    let attemptAborted = message.stopReason === "aborted";
+    try {
+      attemptAborted ||= ctx.signal?.aborted === true;
+    } catch {
+      // Stale ctx: treat as not aborted.
+    }
+    if (attemptAborted) {
       return deliver(
         endAtBoundary(sm, sessionId, pending, "aborted", "aborted", turnIds),
         false,

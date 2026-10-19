@@ -3298,6 +3298,24 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
     assert.equal(outcomeEntries(f.sm).length, 0);
   });
 
+  it("Esc while a blocked attempt's tools resolve ends it aborted, not failed (O6)", async () => {
+    const f = await pending();
+    const controller = new AbortController();
+    controller.abort();
+    f.ctx.signal = controller.signal;
+    const { entryId, resultIds, boundary } = await toolCallAttempt(f);
+    f.ctx.signal = undefined;
+    assert.equal(boundary.continue, false);
+    const outcome = outcomeEntries(f.sm);
+    assert.equal(outcome.length, 1);
+    assert.equal(outcome[0].status, "aborted");
+    assert.equal(outcome[0].text, REWIND_ABORTED_TEXT);
+    for (const id of [entryId, ...resultIds]) {
+      assert.ok(hiddenIds(f.sm).has(id), "the aborted attempt is hidden");
+    }
+    assert.equal(fireToolCall(f.pi, f.ctx), undefined);
+  });
+
   it("agent_before_settle on an aborted outcome ends it aborted without continue", async () => {
     const f = await pending();
     const result = await fireAgentBeforeSettle(f.pi, f.ctx, {
