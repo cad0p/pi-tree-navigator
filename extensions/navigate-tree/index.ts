@@ -1486,6 +1486,10 @@ export default function (pi: ExtensionAPI) {
   // attempts, the completing turn): the hint and the auto start anchor skip
   // them, so neither lands on a rewind in progress or on a hidden attempt.
   const rewindTurns = new WeakSet<object>();
+  // Turns that overflowed the window (#101, D14): marked by the rewind handler,
+  // whether or not rewind-driven compaction is on, so the start anchor skips
+  // them.
+  const overflowedTurns = new WeakSet<object>();
 
   // A forced rewind (#101, rewind-driven compaction), keyed by session id:
   // set when the forced-rewind message goes out, deleted when the rewind
@@ -2258,6 +2262,7 @@ export default function (pi: ExtensionAPI) {
     // explicit error ends the loop and is handled at `agent_before_settle`.
     // Another extension's `continue` owns the turn.
     if (!event.continue && messageEntryId && overflowed(message, ctx.model)) {
+      overflowedTurns.add(message);
       const at = rewindCompactionTarget(sessionId, ctx.model);
       if (at) {
         rewindTurns.add(message);
@@ -3025,7 +3030,13 @@ export default function (pi: ExtensionAPI) {
       !!event.message &&
       typeof event.message === "object" &&
       rewindTurns.has(event.message);
-    if (sm && !rewindOwned) {
+    // An overflowed turn is never anchored (#101, D14): with pi compaction on,
+    // rewind-driven compaction stands down and does not mark it owned.
+    const overflowedTurn =
+      !!event.message &&
+      typeof event.message === "object" &&
+      overflowedTurns.has(event.message);
+    if (sm && !rewindOwned && !overflowedTurn) {
       writeStartAnchorIfNeeded(sm as SessionManager, event.turnIndex + 1);
     }
     // Per-session hint gate (#58): an in-process sibling session's

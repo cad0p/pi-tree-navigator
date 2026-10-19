@@ -7751,6 +7751,26 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("pi compaction on: the overflowed reply gets no start anchor (#101, D14)", async () => {
+    // Pi compaction is on: rewind-driven compaction stands down, so the
+    // overflowed turn is not rewind-owned. It must still not be anchored.
+    const f = await forcedSetup({
+      anchor: false,
+      piSettings: { compaction: { enabled: true } },
+    });
+    try {
+      const message = {
+        ...assistantMessage([{ type: "text", text: "done" }], "stop", 0),
+        usage: { ...usageOf(105_000), input: 105_000 },
+      };
+      const id = f.sm.appendMessage(message as never);
+      await fireTurnEndAll(f.pi, f.ctx, message, { turnIndex: 1 });
+      assert.equal(f.sm.getLabel(id), undefined);
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("silent stop overflow: the reply stays visible, results withheld until the estimate fits", async () => {
     const f = await forcedSetup();
     try {
