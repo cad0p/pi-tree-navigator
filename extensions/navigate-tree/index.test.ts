@@ -33,6 +33,7 @@ import {
   type ExtensionAPI,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   START_ANCHOR_DEFAULT_TURNS,
   START_ANCHOR_MAX_TURNS,
@@ -3804,6 +3805,79 @@ describe("rewind: TUI renderers (#90 O1 / O9)", () => {
     assert.deepEqual(wrapPlainLine("aaa bbb ccc", 7), ["aaa bbb", "ccc"]);
     assert.deepEqual(wrapPlainLine("abcdefghij", 4), ["abcd", "efgh", "ij"]);
     assert.deepEqual(wrapPlainLine("short", 10), ["short"]);
+  });
+
+  it("wrapPlainLine wraps by terminal cells: CJK, emoji and tabs never exceed the width", () => {
+    for (const text of [
+      "保持用户指令并继续工作，直到完成所有任务为止。".repeat(3),
+      "🚀🔥✅ emoji focus 🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪",
+      "\tTabbed\tfocus\twith\ttabs\teverywhere\t\t\t",
+    ]) {
+      for (const width of [1, 2, 3, 5, 8, 13]) {
+        for (const line of wrapPlainLine(text, width)) {
+          assert.ok(
+            visibleWidth(line) <= width,
+            `${JSON.stringify(line)} is ${visibleWidth(line)} cells > ${width}`,
+          );
+        }
+      }
+    }
+  });
+
+  it("renderers never emit a line wider than the terminal (pi-tui crashes on one)", async () => {
+    const ansi = {
+      fg: (_color: string, text: string) => `\x1b[31m${text}\x1b[39m`,
+    };
+    const f = setup();
+    setupRewindable(f.sm, f.pi);
+    await requestRewind(f, {
+      ...REWIND_ARGS,
+      newLabel: "cjk-end",
+      summaryFocus:
+        "保持用户指令并继续工作。🚀🔥✅🧪\tTabbed\tfocus\t保持用户指令并继续工作。",
+    });
+    const renderer = f.pi.messageRenderers.get(SUMMARY_REQUEST_CUSTOM_TYPE) as (
+      ...a: unknown[]
+    ) => { render(w: number): string[] };
+    const draft = summaryRequestDraftOf(f.pi);
+    const message = {
+      role: "custom",
+      customType: draft.customType,
+      content: draft.content,
+      display: true,
+      details: draft.details,
+      timestamp: 0,
+    };
+    const outcome = f.pi.entryRenderers.get(REWIND_OUTCOME_CUSTOM_TYPE) as (
+      ...a: unknown[]
+    ) => { render(w: number): string[] };
+    for (const width of [1, 2, 3, 7, 10, 17, 40]) {
+      const rendered = [
+        ...renderer(message, { expanded: true, outputPad: 1 }, ansi).render(
+          width,
+        ),
+        ...outcome(
+          {
+            type: "custom",
+            customType: REWIND_OUTCOME_CUSTOM_TYPE,
+            data: {
+              status: "failed",
+              reason: "the branch could not be written (磁盘已满 🚫\tdisk)",
+              rewindTo: "开始",
+              newLabel: "结束🚀",
+            },
+          },
+          { expanded: true },
+          ansi,
+        ).render(width),
+      ];
+      for (const line of rendered) {
+        assert.ok(
+          visibleWidth(line) <= width,
+          `${JSON.stringify(line)} is ${visibleWidth(line)} cells > ${width}`,
+        );
+      }
+    }
   });
 });
 

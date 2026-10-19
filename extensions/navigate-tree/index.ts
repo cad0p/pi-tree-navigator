@@ -62,6 +62,11 @@ import {
   type SessionManager,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
+import {
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   loadTreeNavigatorConfig,
@@ -905,8 +910,10 @@ export function buildRewindOutcomeRow(
 
 /**
  * Minimal TUI component (pi-tui's `Component` shape) rendering plain lines,
- * word-wrapped to the width and styled per line. Local on purpose: the
- * extension does not depend on `@earendil-works/pi-tui` (#90 review).
+ * word-wrapped to the width in terminal cells and styled per line. pi-tui
+ * throws on any rendered line wider than the terminal, so every line is
+ * measured and wrapped with pi-tui's own helpers (pi's extension loader
+ * aliases `@earendil-works/pi-tui` to its bundled copy at runtime).
  */
 class StyledLines {
   private readonly lines: string[];
@@ -925,7 +932,13 @@ class StyledLines {
     const out: string[] = [];
     for (const line of this.lines) {
       for (const piece of wrapPlainLine(line, inner)) {
-        out.push(pad + this.style(piece));
+        const row = pad + this.style(piece);
+        // Final guard: pi-tui throws on a line wider than the terminal.
+        out.push(
+          visibleWidth(row) <= width
+            ? row
+            : truncateToWidth(row, Math.max(0, width), ""),
+        );
       }
     }
     return out;
@@ -935,24 +948,20 @@ class StyledLines {
 }
 
 /**
- * Word-wrap one plain-text line to `width` code points (hard-break words
- * longer than the width). Code points, not cells: the rows built here are
- * ASCII plus single-cell punctuation (`·`, `→`, `…`).
+ * Word-wrap one plain-text line to `width` terminal cells (hard-break words
+ * longer than the width). Cells, not code points: `summaryFocus` and error
+ * reasons can carry wide characters (CJK, emoji) and tabs. Tabs are
+ * expanded first (pi-tui measures one as 3 cells); every piece is then
+ * truncated to the width as a final guard (a 2-cell character cannot fit a
+ * 1-cell width).
  */
 export function wrapPlainLine(line: string, width: number): string[] {
-  const chars = Array.from(line);
-  if (chars.length <= width) return [line];
-  const out: string[] = [];
-  let rest = chars;
-  while (rest.length > width) {
-    let cut = rest.lastIndexOf(" ", width);
-    if (cut <= 0) cut = width;
-    out.push(rest.slice(0, cut).join("").trimEnd());
-    rest = rest.slice(cut);
-    while (rest[0] === " ") rest = rest.slice(1);
-  }
-  if (rest.length > 0) out.push(rest.join(""));
-  return out;
+  const w = Math.max(1, Math.floor(width));
+  const text = line.replace(/\t/g, "   ");
+  if (visibleWidth(text) <= w) return [text];
+  return wrapTextWithAnsi(text, w).map((piece) =>
+    visibleWidth(piece) <= w ? piece : truncateToWidth(piece, w, ""),
+  );
 }
 
 /**
