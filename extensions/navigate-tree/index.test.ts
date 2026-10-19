@@ -4116,12 +4116,13 @@ describe("rewind: TUI renderers (#90 O1 / O9)", () => {
       "🚀🔥✅ emoji focus 🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪",
       "\tTabbed\tfocus\twith\ttabs\teverywhere\t\t\t",
     ]) {
-      for (const width of [1, 2, 3, 5, 8, 13]) {
+      for (const width of [1, 2, 3, 5, 8, 13, 400]) {
         for (const line of wrapPlainLine(text, width)) {
           assert.ok(
             visibleWidth(line) <= width,
             `${JSON.stringify(line)} is ${visibleWidth(line)} cells > ${width}`,
           );
+          assert.ok(!line.includes("\t"), `${JSON.stringify(line)} has a tab`);
         }
       }
     }
@@ -4154,7 +4155,7 @@ describe("rewind: TUI renderers (#90 O1 / O9)", () => {
     const outcome = f.pi.entryRenderers.get(REWIND_OUTCOME_CUSTOM_TYPE) as (
       ...a: unknown[]
     ) => { render(w: number): string[] };
-    for (const width of [1, 2, 3, 7, 10, 17, 40]) {
+    for (const width of [1, 2, 3, 7, 10, 17, 40, 400]) {
       const rendered = [
         ...renderer(message, { expanded: true, outputPad: 1 }, ansi).render(
           width,
@@ -4179,6 +4180,8 @@ describe("rewind: TUI renderers (#90 O1 / O9)", () => {
           visibleWidth(line) <= width,
           `${JSON.stringify(line)} is ${visibleWidth(line)} cells > ${width}`,
         );
+        // Tabs are expanded to spaces: no raw tab reaches a row.
+        assert.ok(!line.includes("\t"), `${JSON.stringify(line)} has a tab`);
       }
     }
   });
