@@ -3929,6 +3929,44 @@ describe("rewind: restart while pending (#90 O8)", () => {
     });
   });
 
+  it("a later rewind's outcome with the same toolCallId does not resolve an orphan (matched by instructionEntryId)", async () => {
+    await withSessionStart(async (fixture) => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      // Rewind 1 (id "X") dies mid-flight: no outcome is ever written.
+      await requestRewind(f, REWIND_ARGS, "X");
+      // A fresh instance (nothing pending) runs rewind 2, reusing "X", and
+      // ends it: its outcome lands after rewind 1's instruction.
+      const g = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(g.pi.pi);
+      g.tool = g.pi.registered[0];
+      await requestRewind(g, { ...REWIND_ARGS, newLabel: "end2" }, "X");
+      await fireAgentBeforeSettle(g.pi, g.ctx);
+      const instructions = f.sm
+        .getBranch()
+        .filter(
+          (e) =>
+            e.type === "custom_message" &&
+            e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+        );
+      assert.equal(instructions.length, 2);
+      assert.equal(outcomeEntries(f.sm).length, 1);
+      assert.equal(
+        outcomeEntries(f.sm)[0].instructionEntryId,
+        instructions[1].id,
+      );
+      // Restart: rewind 1 is still an orphan.
+      const h = { ...f, pi: makeFakePi(f.sm) };
+      navigateTree(h.pi.pi);
+      await runSessionStart(h.pi, f.ctx, fixture, "resume");
+      const outcomes = outcomeEntries(f.sm);
+      assert.equal(outcomes.length, 2, "rewind 1 is ended at restart");
+      assert.equal(outcomes[1].instructionEntryId, instructions[0].id);
+      assert.equal(outcomes[1].status, "aborted");
+      assert.ok(hiddenIds(f.sm).has(instructions[0].id));
+    });
+  });
+
   it("a failed rewind's outcome resolves its instruction", async () => {
     await withSessionStart(async (fixture) => {
       const f = setup();
