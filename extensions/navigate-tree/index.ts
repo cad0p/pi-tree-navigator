@@ -1531,8 +1531,8 @@ export default function (pi: ExtensionAPI) {
    * instruction on the active branch (after the newest compaction) with
    * neither its `branch:<newLabel>` completion label nor an outcome entry
    * after it. The assistant turns after such an instruction, up to
-   * MAX_SUMMARY_ATTEMPTS and before the next user message, were attempts
-   * (tool calls were blocked), so those are hidden with it.
+   * MAX_SUMMARY_ATTEMPTS (user messages, e.g. steers, skipped and kept),
+   * were attempts (tool calls were blocked), so those are hidden with it.
    */
   function resolveOrphanRewinds(sm: SessionManager): void {
     let branch: SessionEntry[];
@@ -1586,12 +1586,13 @@ export default function (pi: ExtensionAPI) {
       });
       if (resolved) continue;
       // The attempt window: at most MAX_SUMMARY_ATTEMPTS assistant turns
-      // (and their tool results), never past the first user message.
+      // (and their tool results). User messages are skipped, not a stop:
+      // steers typed while pending sit between the instruction and
+      // attempt 1, and stay visible.
       const attempts: string[] = [];
       let assistants = 0;
       for (const e of later) {
         if (e.type !== "message") continue;
-        if (e.message.role === "user") break;
         if (e.message.role === "assistant") {
           if (assistants >= MAX_SUMMARY_ATTEMPTS) break;
           assistants++;

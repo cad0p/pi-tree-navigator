@@ -3795,21 +3795,24 @@ describe("rewind: restart while pending (#90 O8)", () => {
     });
   });
 
-  it("orphan hiding stops at the first user message", async () => {
+  it("orphan hiding skips a steer typed while pending (it sits before attempt 1); the steer stays visible", async () => {
     await withSessionStart(async (fixture) => {
       const f = setup();
       setupRewindable(f.sm, f.pi, { capture: true });
       await requestRewind(f);
+      const steerId = f.sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "steer" }],
+      } as never);
       const attempt = await summaryTurn(f, "partial", "stop", {
         commit: false,
       });
-      const later = appendTurn(f.sm, "new prompt", "new reply", 100);
       const g = { ...f, pi: makeFakePi(f.sm) };
       navigateTree(g.pi.pi);
       await runSessionStart(g.pi, f.ctx, fixture, "resume");
       const hidden = hiddenIds(f.sm);
-      assert.ok(hidden.has(attempt.entryId));
-      assert.ok(!hidden.has(later.assistantId), "later work stays visible");
+      assert.ok(hidden.has(attempt.entryId), "attempt 1 after the steer");
+      assert.ok(!hidden.has(steerId), "the steer stays visible");
     });
   });
 
@@ -3820,6 +3823,11 @@ describe("rewind: restart while pending (#90 O8)", () => {
       await requestRewind(f);
       const ids: string[] = [];
       for (let i = 0; i < 4; i++) {
+        // User messages (steers) between turns do not end the window.
+        f.sm.appendMessage({
+          role: "user",
+          content: [{ type: "text", text: `steer ${i}` }],
+        } as never);
         ids.push(
           f.sm.appendMessage(
             assistantMessage(
