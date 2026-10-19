@@ -3552,6 +3552,71 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
   });
 });
 
+describe("rewind: reused tool-call ids (#90)", () => {
+  // OpenAI-compatible servers may send "" or reuse ids: everything a
+  // rewind keys on is its own entry ids, never the toolCallId alone.
+  for (const id of ["X", ""]) {
+    it(`two rewinds sharing toolCallId ${JSON.stringify(id)}: frozen view, rewrite and ending follow each rewind's own entries`, async () => {
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await requestRewind(f, REWIND_ARGS, id);
+      await fireAgentBeforeSettle(f.pi, f.ctx);
+      assert.equal(outcomeEntries(f.sm).length, 1);
+      appendTurn(f.sm, "u9", "a9", 30_000);
+      await requestRewind(f, { ...REWIND_ARGS, newLabel: "end2" }, id);
+      assert.ok(fireToolCall(f.pi, f.ctx), "the second rewind is pending");
+      const instructions = f.sm
+        .getBranch()
+        .filter(
+          (e) =>
+            e.type === "custom_message" &&
+            e.customType === SUMMARY_REQUEST_CUSTOM_TYPE,
+        );
+      assert.equal(instructions.length, 2);
+      const sent = fireContext(f.pi, f.ctx);
+      // Frozen at the SECOND instruction (the first one is hidden).
+      assert.equal(
+        (sent.at(-1) as { details?: { newLabel?: string } }).details?.newLabel,
+        "end2",
+      );
+      assert.ok(
+        sent.some((m) => JSON.stringify(m.content).includes('"a9"')),
+        "work after the first rewind is still sent",
+      );
+      const results = () =>
+        fireContext(f.pi, f.ctx).filter(
+          (m) => m.role === "toolResult" && m.toolCallId === id,
+        );
+      // Only the first (ended) rewind's result reads as failed.
+      let r = results();
+      assert.equal(r.length, 2);
+      assert.equal(r[0].isError, true);
+      assert.notEqual(r[1].isError, true);
+      assert.match(JSON.stringify(r[1].content), /accepted/);
+      // The second ends aborted: its own result and instruction only.
+      await fireAgentBeforeSettle(f.pi, f.ctx, { outcome: "aborted" });
+      const outcomes = outcomeEntries(f.sm);
+      assert.equal(outcomes.length, 2);
+      assert.notEqual(
+        outcomes[0].toolResultEntryId,
+        outcomes[1].toolResultEntryId,
+      );
+      assert.ok(hiddenIds(f.sm).has(instructions[1].id));
+      r = results();
+      assert.equal(r.length, 2);
+      assert.equal(
+        (r[0].content as Array<{ text: string }>)[0].text,
+        "Summarization failed: the run ended before the summary. Nothing was collapsed. Try again.",
+      );
+      assert.equal(
+        (r[1].content as Array<{ text: string }>)[0].text,
+        REWIND_ABORTED_TEXT,
+      );
+      assert.equal(r[1].isError, true);
+    });
+  }
+});
+
 describe("rewind: restart while pending (#90 O8)", () => {
   async function withSessionStart(
     run: (fixture: ConfigFixture) => Promise<void>,

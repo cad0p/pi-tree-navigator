@@ -326,52 +326,55 @@ export function buildContextMessages(
     };
     getBranch?(): SessionEntry[];
   },
-  pendingToolCallId?: string | null,
+  pendingInstructionEntryId?: string | null,
 ): ReturnType<typeof sessionEntryToContextMessages> {
-  let messages: AgentMessage[] | undefined;
+  let entries:
+    | Array<{ sourceEntry: SessionEntry | null; messages: AgentMessage[] }>
+    | undefined;
   try {
     if (typeof sm.buildSessionProjection === "function") {
       const projection = sm.buildSessionProjection();
-      let entries = projection.entries;
-      if (Array.isArray(entries)) {
-        // Frozen view (#90, O2): while a rewind waits for its summary, the
-        // request ends at its instruction, so every attempt re-sends the
-        // same messages — late input and hidden attempts never reach it.
-        if (pendingToolCallId) {
-          const at = entries.findIndex((e) =>
-            isSummaryRequestEntry(e.sourceEntry, pendingToolCallId),
-          );
-          if (at >= 0) entries = entries.slice(0, at + 1);
-        }
-        messages = entries.flatMap((e) => e.messages);
-      } else {
-        messages = projection.messages;
-      }
+      entries = Array.isArray(projection.entries)
+        ? projection.entries
+        : [{ sourceEntry: null, messages: projection.messages }];
     }
   } catch {
     // Fall through to the raw entry projection — pi rewrites the context
     // handlers' output at the wire boundary anyway.
   }
-  messages ??= sm
-    .buildContextEntries()
-    .flatMap((entry) => sessionEntryToContextMessages(entry));
+  entries ??= sm.buildContextEntries().map((entry) => ({
+    sourceEntry: entry,
+    messages: sessionEntryToContextMessages(entry),
+  }));
+  // Frozen view (#90, O2): while a rewind waits for its summary, the
+  // request ends at its instruction, so every attempt re-sends the same
+  // messages — late input and hidden attempts never reach it. Keyed by the
+  // instruction's entry id: tool-call ids can be "" or reused.
+  if (pendingInstructionEntryId) {
+    const at = entries.findIndex(
+      (e) => e.sourceEntry?.id === pendingInstructionEntryId,
+    );
+    if (at >= 0) entries = entries.slice(0, at + 1);
+  }
   // A failed / aborted rewind reads as a failed tool call (#90, O5): its
   // tool result's content is already replaced by a persisted `context_edit`,
   // but `isError` is not editable — set it on a clone, per request (never
-  // mutate the session's own message objects).
+  // mutate the session's own message objects). Keyed by the tool-result
+  // entry id the outcome recorded.
   const outcomes = collectRewindOutcomes(sm);
-  if (outcomes.size > 0) {
-    messages = messages.map((message) => {
-      if (message.role !== "toolResult") return message;
-      const text = outcomes.get(message.toolCallId);
-      if (text === undefined) return message;
-      return {
-        ...message,
-        content: [{ type: "text" as const, text }],
-        isError: true,
-      };
-    });
-  }
+  const messages = entries.flatMap((e) => {
+    const text = e.sourceEntry ? outcomes.get(e.sourceEntry.id) : undefined;
+    if (text === undefined) return e.messages;
+    return e.messages.map((message) =>
+      message.role === "toolResult"
+        ? {
+            ...message,
+            content: [{ type: "text" as const, text }],
+            isError: true,
+          }
+        : message,
+    );
+  });
   return messages.filter((message) => message.role !== "system");
 }
 
@@ -407,7 +410,10 @@ function readOutcomeData(entry: SessionEntry): RewindOutcomeData | null {
   return data as RewindOutcomeData;
 }
 
-/** Failed / aborted rewinds on the active branch: toolCallId → result text. */
+/**
+ * Failed / aborted rewinds on the active branch: tool-result entry id →
+ * result text.
+ */
 function collectRewindOutcomes(sm: {
   getBranch?(): SessionEntry[];
 }): Map<string, string> {
@@ -421,7 +427,9 @@ function collectRewindOutcomes(sm: {
   }
   for (const entry of branch) {
     const data = readOutcomeData(entry);
-    if (data) out.set(data.toolCallId, data.text);
+    if (data && typeof data.toolResultEntryId === "string") {
+      out.set(data.toolResultEntryId, data.text);
+    }
   }
   return out;
 }
@@ -746,6 +754,8 @@ interface PendingRewind {
   toolResultEntryId?: string;
   /** The rewind turn ended and the instruction draft was returned. */
   instructionSent?: boolean;
+  /** The instruction's entry, once it is seen committed on the branch. */
+  instructionEntryId?: string;
   /** Entries of failed attempts hidden so far (assistant + its results). */
   hiddenEntryIds: string[];
   /** Failed summary turns so far (tool call / no `## Goal` / cut off). */
@@ -897,6 +907,11 @@ export interface RewindOutcomeData {
   /** Entries hidden from model context by this rewind (audit). */
   hiddenIds: string[];
   toolResultEntryId: string | null;
+  /**
+   * The instruction this outcome ends (the O8 check matches on it; absent
+   * on entries written before it existed).
+   */
+  instructionEntryId?: string | null;
 }
 
 /** The outcome entry's TUI row (#90, O9). */
@@ -1047,20 +1062,76 @@ function findInFlightAssistantToolCalls(
   return null;
 }
 
-/** The rewind's tool-result entry on `branch`, by `toolCallId` (#90). */
+/**
+ * The rewind's tool-result entry on `branch` (#90), by position: the first
+ * result for `toolCallId` after the assistant that issued the rewind
+ * (`afterEntryId`), or the nearest one before its instruction
+ * (`beforeEntryId`). Never by `toolCallId` alone: OpenAI-compatible servers
+ * can send "" or reuse ids, so an older rewind's result may share it.
+ */
 function findToolResultEntryId(
   branch: readonly SessionEntry[],
   toolCallId: string,
+  at: { afterEntryId?: string; beforeEntryId?: string },
 ): string | undefined {
-  for (let i = branch.length - 1; i >= 0; i--) {
-    const entry = branch[i];
-    if (
-      entry.type === "message" &&
-      entry.message.role === "toolResult" &&
-      entry.message.toolCallId === toolCallId
-    ) {
-      return entry.id;
+  const isResult = (entry: SessionEntry | undefined) =>
+    entry?.type === "message" &&
+    entry.message.role === "toolResult" &&
+    entry.message.toolCallId === toolCallId;
+  if (at.afterEntryId !== undefined) {
+    const start = branch.findIndex((e) => e.id === at.afterEntryId);
+    if (start < 0) return undefined;
+    for (let i = start + 1; i < branch.length; i++) {
+      if (isResult(branch[i])) return branch[i].id;
     }
+    return undefined;
+  }
+  if (at.beforeEntryId !== undefined) {
+    const end = branch.findIndex((e) => e.id === at.beforeEntryId);
+    for (let i = end - 1; i >= 0; i--) {
+      if (isResult(branch[i])) return branch[i].id;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The pending rewind's committed instruction entry, or undefined (#90).
+ * Recorded on first sight: the boundary commits it after our handler
+ * returns, so its id is only known from the branch afterwards.
+ */
+function pendingInstructionEntryId(
+  branch: readonly SessionEntry[],
+  pending: PendingRewind,
+): string | undefined {
+  if (
+    pending.instructionEntryId &&
+    branch.some((e) => e.id === pending.instructionEntryId)
+  ) {
+    return pending.instructionEntryId;
+  }
+  const id = findInstructionEntryId(
+    branch,
+    pending.toolCallId,
+    pending.rewindEntryId,
+  );
+  if (id) pending.instructionEntryId = id;
+  return id;
+}
+
+/**
+ * The instruction entry of the rewind issued by `afterEntryId` (#90): the
+ * first summary request for `toolCallId` after it on `branch`.
+ */
+function findInstructionEntryId(
+  branch: readonly SessionEntry[],
+  toolCallId: string,
+  afterEntryId: string,
+): string | undefined {
+  const start = branch.findIndex((e) => e.id === afterEntryId);
+  if (start < 0) return undefined;
+  for (let i = start + 1; i < branch.length; i++) {
+    if (isSummaryRequestEntry(branch[i], toolCallId)) return branch[i].id;
   }
   return undefined;
 }
@@ -1092,6 +1163,10 @@ interface EndableRewind {
   newLabel: string;
   hiddenEntryIds: readonly string[];
   toolResultEntryId?: string;
+  /** The assistant that issued the rewind (a pending rewind). */
+  rewindEntryId?: string;
+  /** The instruction entry (an orphan, or a resolved pending rewind). */
+  instructionEntryId?: string;
 }
 
 /**
@@ -1117,14 +1192,17 @@ function planEnding(
   }
   const onBranch = new Set(branch.map((e) => e.id));
   const lastEdit = new Map<string, unknown>();
-  let instructionId: string | undefined;
   for (const entry of branch) {
     if (entry.type === "context_edit") {
       lastEdit.set(entry.targetId, entry.replacement);
-    } else if (isSummaryRequestEntry(entry, rewind.toolCallId)) {
-      instructionId = entry.id;
     }
   }
+  // Exact entries only (#90): tool-call ids can be "" or reused.
+  const instructionId =
+    rewind.instructionEntryId ??
+    (rewind.rewindEntryId !== undefined
+      ? findInstructionEntryId(branch, rewind.toolCallId, rewind.rewindEntryId)
+      : undefined);
   const hiddenIds: string[] = [];
   for (const id of [
     ...rewind.hiddenEntryIds,
@@ -1138,7 +1216,14 @@ function planEnding(
     .map((targetId) => ({ targetId, replacement: null }));
   let toolResultEntryId: string | undefined = rewind.toolResultEntryId;
   if (!toolResultEntryId || !onBranch.has(toolResultEntryId)) {
-    toolResultEntryId = findToolResultEntryId(branch, rewind.toolCallId);
+    toolResultEntryId =
+      rewind.rewindEntryId !== undefined
+        ? findToolResultEntryId(branch, rewind.toolCallId, {
+            afterEntryId: rewind.rewindEntryId,
+          })
+        : findToolResultEntryId(branch, rewind.toolCallId, {
+            beforeEntryId: instructionId,
+          });
   }
   if (toolResultEntryId) {
     edits.push({
@@ -1157,6 +1242,7 @@ function planEnding(
       newLabel: rewind.newLabel,
       hiddenIds,
       toolResultEntryId: toolResultEntryId ?? null,
+      instructionEntryId: instructionId ?? null,
     },
   };
 }
@@ -1421,7 +1507,18 @@ export default function (pi: ExtensionAPI) {
       const newLabel = String(details.newLabel ?? "");
       const later = branch.slice(i + 1);
       const resolved = later.some((e) => {
-        if (readOutcomeData(e)?.toolCallId === toolCallId) return true;
+        const data = readOutcomeData(e);
+        if (data) {
+          // By instruction entry id (tool-call ids can be "" or reused);
+          // by toolCallId only for outcomes written without it.
+          if (data.instructionEntryId === entry.id) return true;
+          if (
+            data.instructionEntryId === undefined &&
+            data.toolCallId === toolCallId
+          ) {
+            return true;
+          }
+        }
         try {
           return sm.getLabel(e.id) === BRANCH_LABEL_PREFIX + newLabel;
         } catch {
@@ -1443,6 +1540,7 @@ export default function (pi: ExtensionAPI) {
           rewindTo: String(details.rewindTo ?? ""),
           newLabel,
           hiddenEntryIds: [],
+          instructionEntryId: entry.id,
         },
         "aborted",
         "the session restarted",
@@ -1478,9 +1576,11 @@ export default function (pi: ExtensionAPI) {
     }
     const rewindTurnPassed =
       pending.instructionSent === true ||
-      findToolResultEntryId(branch, pending.toolCallId) !== undefined;
+      findToolResultEntryId(branch, pending.toolCallId, {
+        afterEntryId: pending.rewindEntryId,
+      }) !== undefined;
     if (!rewindTurnPassed) return null;
-    return branch.some((e) => isSummaryRequestEntry(e, pending.toolCallId))
+    return pendingInstructionEntryId(branch, pending) !== undefined
       ? null
       : "the summary request could not be delivered";
   }
@@ -1725,9 +1825,16 @@ export default function (pi: ExtensionAPI) {
     }
 
     // The turn that issued the rewind: answer it with the instruction.
-    if (
-      content.some((b) => b?.type === "toolCall" && b.id === pending.toolCallId)
-    ) {
+    // Matched by entry id when pi resolves it: a summary attempt may call a
+    // tool with the same ("" or reused) id as the rewind.
+    const isRewindTurn =
+      typeof event.messageEntryId === "string"
+        ? event.messageEntryId === pending.rewindEntryId
+        : !pending.instructionSent &&
+          content.some(
+            (b) => b?.type === "toolCall" && b.id === pending.toolCallId,
+          );
+    if (isRewindTurn) {
       pending.toolResultEntryId = resultIds.get(pending.toolCallId);
       let aborted = message.stopReason === "aborted";
       try {
@@ -2159,7 +2266,15 @@ export default function (pi: ExtensionAPI) {
         pending = undefined;
       }
     }
-    return { messages: buildContextMessages(sm, pending?.toolCallId) };
+    let instructionEntryId: string | undefined;
+    if (pending) {
+      try {
+        instructionEntryId = pendingInstructionEntryId(sm.getBranch(), pending);
+      } catch {
+        instructionEntryId = undefined;
+      }
+    }
+    return { messages: buildContextMessages(sm, instructionEntryId) };
   });
 
   // Anchor mandate (#31): a before_agent_start append lands at the END of
