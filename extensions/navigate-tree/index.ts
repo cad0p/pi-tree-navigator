@@ -1601,6 +1601,13 @@ export default function (pi: ExtensionAPI) {
     ];
   }
 
+  /** Esc during a forced rewind ends it with the D8 row (#101, D16). */
+  function abortedForced(sessionId: string): SessionBoundaryDraft[] {
+    return forcedActive(sessionId)
+      ? compactionFailed(sessionId, COMPACTION_FAILED_ABORTED)
+      : [];
+  }
+
   /** True while a forced rewind gates the session (#101, D6). */
   function forcedActive(sessionId: string): boolean {
     const record = forcedRewinds.get(sessionId);
@@ -2313,9 +2320,18 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // Stale ctx: treat as not aborted.
       }
-      // Esc: `agent_settled` ends it (D16). An error: pi's retry, or
-      // `agent_settled`.
-      if (aborted || message.stopReason === "error") return;
+      // Esc ends the gate here (D16): the attempt is hidden, one D8 row.
+      // An error: pi's retry, or `agent_settled`.
+      if (aborted) {
+        return deliverRaw(
+          [
+            ...hideDrafts(turnIds),
+            ...compactionFailed(sessionId, COMPACTION_FAILED_ABORTED),
+          ],
+          false,
+        );
+      }
+      if (message.stopReason === "error") return;
       // A refused `rewind` is not an attempt (D7): it stays visible.
       const refused = (event.toolResults ?? []).some((r) => {
         const result = r as { toolName?: string; details?: unknown };
@@ -2383,7 +2399,10 @@ export default function (pi: ExtensionAPI) {
       if (aborted) {
         // Esc before the instruction was committed (#90, O6).
         return deliver(
-          endAtBoundary(sm, sessionId, pending, "aborted", "aborted"),
+          [
+            ...endAtBoundary(sm, sessionId, pending, "aborted", "aborted"),
+            ...abortedForced(sessionId),
+          ],
           false,
         );
       }
@@ -2408,7 +2427,17 @@ export default function (pi: ExtensionAPI) {
     }
     if (attemptAborted) {
       return deliver(
-        endAtBoundary(sm, sessionId, pending, "aborted", "aborted", turnIds),
+        [
+          ...endAtBoundary(
+            sm,
+            sessionId,
+            pending,
+            "aborted",
+            "aborted",
+            turnIds,
+          ),
+          ...abortedForced(sessionId),
+        ],
         false,
       );
     }
@@ -2578,6 +2607,21 @@ export default function (pi: ExtensionAPI) {
       }
     }
     const pending = pendingRewinds.get(sessionId);
+    // Esc during a forced rewind (#101, D16): the D8 row, after a pending
+    // rewind's aborted ending.
+    if (event.outcome === "aborted" && forcedActive(sessionId)) {
+      const ending = pending
+        ? endAtBoundary(sm, sessionId, pending, "aborted", "aborted")
+        : [];
+      return {
+        entries: keepValidDrafts(sm, [
+          ...(event.entries ?? []),
+          ...ending,
+          ...abortedForced(sessionId),
+        ]),
+        continue: false,
+      };
+    }
     if (!pending || event.outcome === "error" || event.continue) return;
     if (event.outcome === "aborted") {
       return {

@@ -8163,6 +8163,67 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("D16: Esc on a forced attempt hides it and ends the gate with one D8 row (#101)", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      assert.notEqual(fireToolCall(f.pi, f.ctx), undefined, "the gate is up");
+      const message = assistantMessage(
+        [{ type: "text", text: "partial" }],
+        "aborted",
+        100,
+      );
+      const id = f.sm.appendMessage(message as never);
+      const turn = await fireTurnEndAll(f.pi, f.ctx, message);
+      assert.equal(turn.continue, false);
+      assert.ok(hiddenIds(f.sm).has(id), "the aborted attempt is hidden");
+      assert.deepEqual(
+        forcedDrafts(turn).map((d) => d.details),
+        [{ status: "failed", reason: COMPACTION_FAILED_ABORTED }],
+      );
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "the gate is lifted");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D16: Esc between turns (agent_before_settle, aborted) ends a forced rewind with one D8 row (#101)", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      const settle = await fireAgentBeforeSettle(f.pi, f.ctx, {
+        outcome: "aborted",
+      });
+      assert.equal(settle.continue, false);
+      assert.deepEqual(
+        forcedDrafts(settle).map((d) => d.details),
+        [{ status: "failed", reason: COMPACTION_FAILED_ABORTED }],
+      );
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "the gate is lifted");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
+  it("D16: Esc with a pending rewind keeps the aborted ending and adds one D8 row (#101)", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await requestRewind(f, REWIND_ARGS, "tc-rewind", 90_000);
+      const message = assistantMessage([], "aborted", 100);
+      f.sm.appendMessage(message as never);
+      const turn = await fireTurnEndAll(f.pi, f.ctx, message);
+      assert.equal(turn.continue, false);
+      assert.equal(outcomeEntries(f.sm)[0].status, "aborted");
+      assert.deepEqual(
+        forcedDrafts(turn).map((d) => d.details),
+        [{ status: "failed", reason: COMPACTION_FAILED_ABORTED }],
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("D11: a pending rewind's summary request overflows — withhold before the call, re-send", async () => {
     const f = await forcedSetup();
     try {
