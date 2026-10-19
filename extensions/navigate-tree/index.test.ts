@@ -8369,6 +8369,33 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("codemode (#103, F): agent_settled forgets a cut-off codemode call's nested entries", async () => {
+    const f = await forcedSetup();
+    try {
+      appendToolCallAssistant(f.sm, [
+        { id: "tc-code", name: "codemode", arguments: { code: CODE } },
+      ]);
+      assert.equal(
+        fireToolCall(f.pi, f.ctx, "codemode", { code: CODE }),
+        undefined,
+      );
+      // A nested read cut off by an abort: no tool_result follows.
+      assert.equal(
+        fireNested(f, "tc-code/1", "tc-code", "read", { path: "x" }),
+        undefined,
+      );
+      await fireAgentSettled(f.pi, f.ctx, true);
+      // Pi ids are unique, so reusing the parent id only shows the counts were
+      // cleared: a stale count would refuse this rewind as a sibling.
+      assert.equal(
+        fireNested(f, "tc-code/2", "tc-code", TOOL_NAME, REWIND_ARGS),
+        undefined,
+      );
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("codemode (#103, D): a nested rewind with a sibling nested call in its script is refused like a batch", async () => {
     const f = await forcedSetup();
     try {

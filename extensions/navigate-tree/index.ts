@@ -1538,6 +1538,13 @@ export default function (pi: ExtensionAPI) {
   // Codemode calls with a refused nested navigate_tree (#103, C): a refusal
   // counts as a direct one (D7), so turn_end does not count it as an attempt.
   const refusedNestedCallers = new Set<string>();
+  // Forgets every nested call (#103, F): an abort after `beforeToolCall`
+  // leaves a call with no tool_result, so its entries would outlive the run.
+  const clearNestedCalls = (): void => {
+    nestedCallCounts.clear();
+    nestedRewindCallers.clear();
+    refusedNestedCallers.clear();
+  };
 
   // Turns the rewind handler owned (the rewind call's turn, summary
   // attempts, the completing turn): the hint and the auto start anchor skip
@@ -2288,8 +2295,9 @@ export default function (pi: ExtensionAPI) {
     // must hold).
     const forced = forcedActive(sessionId);
     if (livePending(ctx.sessionManager as SessionManager, sessionId)) {
-      // A blocked call gets no tool_result, so its nested-rewind entry (#103)
-      // is retired here.
+      // A blocked call gets no tool_result (pi-agent-core agent-loop.js: an
+      // immediate result skips afterToolCall), so its nested-rewind entry
+      // (#103) is retired here.
       nestedRewindCallers.delete(event.toolCallId);
       return {
         block: true,
@@ -2763,6 +2771,8 @@ export default function (pi: ExtensionAPI) {
   // Fully settled with the rewind still pending: the run was aborted, or
   // the errored attempt's retry never came (#90, O6).
   pi.on("agent_settled", (event, ctx) => {
+    // Nothing is in flight once settled: drop any nested-call leftovers (#103, F).
+    clearNestedCalls();
     // Esc ended the run (#101, D16). The event flag exists on pi >= 1.1.0;
     // on older pi the reply Esc cut short says it (peer floor 0.87.0).
     let aborted = event.aborted === true;
@@ -2816,6 +2826,7 @@ export default function (pi: ExtensionAPI) {
   // The session is going away (quit, reload, new, resume, fork): a forced
   // rewind cannot outlive it (#101).
   pi.on("session_shutdown", (_event, ctx) => {
+    clearNestedCalls();
     try {
       forcedRewinds.delete(
         (ctx.sessionManager as SessionManager).getSessionId(),
