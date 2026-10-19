@@ -171,7 +171,7 @@ There is no limit after a landing: if the rewind freed too little and the contex
 { "compaction": { "enabled": false } }
 ```
 
-`anchor`, `list` and `rewind` keep working either way, and pi's own compaction (when on) works as before. pi's settings are read from disk with the session's project-trust decision, at each crossing and each overflow, so a `/settings` change applies at the next one.
+`anchor`, `list` and `rewind` keep working either way, and pi's own compaction (when on) works as before. pi's compaction settings are read from the session's live settings (the ones pi decides from) at each crossing and each overflow, so a `/settings` change applies at the next one. Before the session is captured (its first prompt) they are read from disk with the session's project-trust decision.
 
 **Headless sessions (subagents).** A headless session with the hint set and pi's compaction on (pi's default, or enabled by a project or agent) runs silently without the hint and without rewind-driven compaction: there is no UI for the error.
 
@@ -309,7 +309,9 @@ Cache behavior on the bridge:
 
 - **Rewind-driven compaction: same model only.** An overflow is handled only when the failed reply's provider and model match the active model; with a virtual model selection (pi resolves the physical model internally) it is skipped and the run ends on the error, as without this extension.
 
-- **Rewind-driven compaction reads pi's settings from disk.** An SDK host that runs a session with in-memory settings, or different trust, can disagree with what this extension reads; the settings source is also shared by sessions in one process (like the hint state).
+- **Rewind-driven compaction on pi < 1.3.0: z.ai's overflow message.** `@earendil-works/pi-ai` before 1.3.0 does not recognize z.ai's overflow error (`prompt exceeds max length`, the CN endpoint), so that overflow is not detected and ends the run on the error, as without this extension.
+
+- **The reserve-order warning reads pi's settings from disk.** The `session_start` warning (hint reserve below pi's `compaction.reserveTokens`), and rewind-driven compaction before the session is captured, read pi's settings from disk with the session's project trust. An SDK host that runs a session with in-memory settings, or different trust, can disagree with what they read; the disk source is also shared by sessions in one process (like the hint state).
 
 - **Rewind-driven compaction and later extensions.** At `turn_end` and `agent_before_settle` it stands down when an earlier handler already set `continue` (e.g. a fallback provider retrying on a larger model). An extension loaded after this one that also recovers runs after the drafts were returned.
 
