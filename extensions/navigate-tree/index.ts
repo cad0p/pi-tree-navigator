@@ -81,7 +81,10 @@ import {
   START_ANCHOR_DEFAULT_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
-import { estimateContextTokens } from "./context-tokens.ts";
+import {
+  estimateContextTokens,
+  splitContextEstimate,
+} from "./context-tokens.ts";
 import {
   type AnchorTableRow,
   BRANCH_LABEL_PREFIX,
@@ -785,6 +788,33 @@ interface WithholdPlan {
 }
 
 /**
+ * The provider's real size of the overflowed request (#101, A): input +
+ * cache read + cache write of a `length` or silent `stop` reply that carries
+ * usage. An explicit error, or no usage, gives `undefined`: the estimate is
+ * then used as is (ratio 1).
+ */
+function overflowRequestTokens(
+  sm: SessionManager,
+  entryId: string,
+): number | undefined {
+  const entry = sm.getEntry(entryId);
+  if (entry?.type !== "message" || entry.message.role !== "assistant") {
+    return undefined;
+  }
+  const reply = entry.message as {
+    stopReason?: string;
+    usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
+  };
+  if (reply.stopReason !== "length" && reply.stopReason !== "stop") {
+    return undefined;
+  }
+  const usage = reply.usage;
+  const total =
+    (usage?.input ?? 0) + (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
+  return total > 0 ? total : undefined;
+}
+
+/**
  * Withhold the tool results that overflowed (#101, D3): walk back from
  * `fromEntryId` (excluded) to the assistant that issued them, and replace
  * their content newest-first with the D4 notice until the estimate fits
@@ -792,6 +822,12 @@ interface WithholdPlan {
  * hidden or replaced is skipped. The estimate is the projection without
  * `hiddenIds` (sliced at `instructionEntryId`, the frozen request of a
  * pending rewind), minus what each notice saves.
+ *
+ * #101, A: `realTokens` (the overflowed request's provider count) scales the
+ * estimate's tail after the newest usage baseline by `ratio` =
+ * (real − baseline) / tail, clamped to at least 1; the planner then fits
+ * `baseline + ratio × tail` under `target`. Without `realTokens` the
+ * ratio is 1.
  */
 function planWithhold(
   sm: SessionManager,
@@ -799,6 +835,7 @@ function planWithhold(
   hiddenIds: readonly string[],
   target: number,
   instructionEntryId?: string,
+  realTokens?: number,
 ): WithholdPlan {
   const branch = sm.getBranch();
   const lastEdit = new Map<string, unknown>();
@@ -815,15 +852,21 @@ function planWithhold(
     );
     if (at >= 0) entries = entries.slice(0, at + 1);
   }
-  let estimate = estimateContextTokens(
+  const { baseline, tail: tailEstimate } = splitContextEstimate(
     entries
       .filter((e) => !hidden.has(e.sourceEntry.id))
       .flatMap((e) => e.messages)
       .filter((m) => m.role !== "system"),
   );
+  let tail = tailEstimate;
+  const ratio =
+    realTokens === undefined || tail <= 0
+      ? 1
+      : Math.max(1, (realTokens - baseline) / tail);
+  const estimate = () => baseline + ratio * tail;
   const drafts: SessionBoundaryDraft[] = [];
   const start = branch.findIndex((e) => e.id === fromEntryId);
-  for (let i = start - 1; i >= 0 && estimate > target; i--) {
+  for (let i = start - 1; i >= 0 && estimate() > target; i--) {
     const entry = branch[i];
     if (entry.type !== "message") continue;
     if (entry.message.role === "assistant") break;
@@ -833,14 +876,14 @@ function planWithhold(
     const original = estimateTokens(entry.message);
     const text = buildWithheldNoticeText(original);
     const content = [{ type: "text" as const, text }];
-    estimate -= original - estimateTokens({ ...entry.message, content });
+    tail -= original - estimateTokens({ ...entry.message, content });
     drafts.push({
       type: "context_edit",
       targetId: entry.id,
       replacement: { content },
     });
   }
-  return { drafts, withheld: drafts.length, fits: estimate <= target };
+  return { drafts, withheld: drafts.length, fits: estimate() <= target };
 }
 
 /** `context_edit` drafts hiding `ids` (a failed attempt, #90 O3). */
@@ -1673,6 +1716,7 @@ export default function (pi: ExtensionAPI) {
         failedIds,
         at.target,
         instructionEntryId,
+        overflowRequestTokens(sm, failedEntryId),
       );
       // D11 runs before #93's classification: a squeezed summary is
       // handled here, even with nothing to withhold.
@@ -1715,7 +1759,14 @@ export default function (pi: ExtensionAPI) {
         continue: false,
       };
     }
-    const plan = planWithhold(sm, failedEntryId, failedIds, at.target);
+    const plan = planWithhold(
+      sm,
+      failedEntryId,
+      failedIds,
+      at.target,
+      undefined,
+      overflowRequestTokens(sm, failedEntryId),
+    );
     forcedRewinds.set(sessionId, { attempts: 0 });
     hintTracker.markSpent();
     return {

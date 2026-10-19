@@ -139,7 +139,7 @@ It acts only on a real overflow, detected with pi's own checks (`isContextOverfl
 On an overflow, in the same run:
 
 1. The failed reply is hidden from the model (a provider error, or a cut-off reply and its failed tool calls; a silent overflow's complete reply stays).
-2. The newest tool results of the batch that caused it are replaced, one by one, until the estimate fits `contextWindow − compaction.reserveTokens` (pi's reserve for the active model, `compaction.modelOverrides` included). Each one reads: `[navigate_tree] Output withheld: adding it overflowed the context window (~19k tokens). The call ran; only its output was dropped. Rewind first, then re-run it if you still need the output.` User messages and other extensions' messages are never withheld.
+2. The newest tool results of the batch that caused it are replaced, one by one, until the estimate fits `contextWindow − compaction.reserveTokens` (pi's reserve for the active model, `compaction.modelOverrides` included). When the failed reply carries usage (a cut-off reply or a silent overflow), the estimate's tail is scaled by the provider's real count: ratio = (real input + cache read + cache write − newest usage) ÷ (estimated tail), never below 1. Each one reads: `[navigate_tree] Output withheld: adding it overflowed the context window (~19k tokens). The call ran; only its output was dropped. Rewind first, then re-run it if you still need the output.` User messages and other extensions' messages are never withheld.
 3. The model gets the forced-rewind message:
 
 ```text
@@ -294,6 +294,8 @@ Cache behavior on the bridge:
 - **Anchor early in the turn.** Whatever's in `agent.state.messages` *before* the `anchor` tool call stays in the kept chain. Everything after gets summarized. Anchor at the *start* of a stage for maximum context savings.
 
 - **Tiny rewinds are rejected by a minimum-savings floor.** A `rewind` whose measured savings falls below an internal floor (~4k tokens of apparent context freed) is refused with guidance listing the active anchors instead of executing — collapsing a near-empty segment burns a summary turn and can even grow live context once the summary and its continuation message land on the kept chain. This pairs with anchoring early: anchor at the start of a stage, then rewind only once real work has accumulated above the anchor.
+
+- **The estimate can undercount.** The chars/4 estimate ran about 1.45× low on a live run of 15 parallel reads. The real-usage ratio corrects this only when the overflowed reply carries usage (a cut-off reply or a silent overflow). An explicit provider context-length error has none, so its ratio is 1 and a miss falls through to the second-overflow path (D8).
 
 - **Abandoned branches grow the JSONL forever.** Each rewind preserves the abandoned subtree on disk. Session files get bigger over time even as live context shrinks. For very long autonomous runs (days), session files can hit hundreds of MB.
 

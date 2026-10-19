@@ -88,6 +88,34 @@ function validAssistantUsage(message: AgentMessage): Usage | undefined {
 }
 
 /**
+ * `estimateContextTokens` split at its baseline (#101, A): `baseline` is the
+ * newest valid assistant usage (0 with none) and `tail` the `estimateTokens`
+ * sum of the messages after it (all messages with none). The total is
+ * `baseline + tail`; the withholding planner scales `tail` alone, because
+ * the provider's real count can only disagree with the estimate there.
+ */
+export function splitContextEstimate(messages: AgentMessage[]): {
+  baseline: number;
+  tail: number;
+} {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const usage = validAssistantUsage(messages[i]);
+    if (!usage) continue;
+    let tail = 0;
+    for (let j = i + 1; j < messages.length; j++) {
+      tail += estimateTokens(messages[j]);
+    }
+    return { baseline: calculateContextTokens(usage), tail };
+  }
+
+  let tail = 0;
+  for (const message of messages) {
+    tail += estimateTokens(message);
+  }
+  return { baseline: 0, tail };
+}
+
+/**
  * Total estimated context tokens for `messages`.
  *
  * Uses the newest valid assistant usage as the baseline plus
@@ -97,19 +125,6 @@ function validAssistantUsage(message: AgentMessage): Usage | undefined {
  * known system-message / `safeJsonStringify` divergences.
  */
 export function estimateContextTokens(messages: AgentMessage[]): number {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const usage = validAssistantUsage(messages[i]);
-    if (!usage) continue;
-    let trailingTokens = 0;
-    for (let j = i + 1; j < messages.length; j++) {
-      trailingTokens += estimateTokens(messages[j]);
-    }
-    return calculateContextTokens(usage) + trailingTokens;
-  }
-
-  let estimated = 0;
-  for (const message of messages) {
-    estimated += estimateTokens(message);
-  }
-  return estimated;
+  const { baseline, tail } = splitContextEstimate(messages);
+  return baseline + tail;
 }

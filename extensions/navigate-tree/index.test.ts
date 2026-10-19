@@ -47,6 +47,7 @@ import {
   START_ANCHOR_MIN_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
+import { splitContextEstimate } from "./context-tokens.ts";
 import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTree, {
   __testHooks,
@@ -7804,6 +7805,107 @@ Active anchors (root → leaf, % of 100k):
     } finally {
       cleanupConfigFixture(f.fixture);
     }
+  });
+
+  /** The post-withhold estimate: the projection without hidden entries, tail scaled by `ratio`. */
+  function scaledEstimate(sm: SessionManager, ratio: number): number {
+    const hidden = hiddenIds(sm);
+    const messages = sm
+      .buildSessionProjection()
+      .entries.filter((e) => !hidden.has(e.sourceEntry.id))
+      .flatMap((e) => e.messages)
+      .filter((m) => m.role !== "system");
+    const { baseline, tail } = splitContextEstimate(messages);
+    return baseline + ratio * tail;
+  }
+
+  /**
+   * #101, A: the issuer's usage is the baseline (71k) and the two results are
+   * a 24k tail. The estimate (95k) withholds one result (83k fits 83.6k). The
+   * overflowed request's real input (107k = 71k + 1.5 x 24k) scales the tail
+   * by 1.5, so both results are withheld.
+   */
+  describe("real-usage ratio on the withheld tail (#101, A)", () => {
+    const TARGET = WINDOW - 16_384;
+
+    it("a real count 1.5x the estimate withholds more, and the scaled estimate fits", async () => {
+      const f = await forcedSetup({ issuerTokens: 71_000 });
+      try {
+        const message = {
+          ...assistantMessage([], "length", 0),
+          usage: { ...usageOf(107_000), input: 107_000 },
+        };
+        f.sm.appendMessage(message as never);
+        const turn = await fireTurnEndAll(f.pi, f.ctx, message, {
+          turnIndex: 1,
+        });
+        const edits = turn.entries.flatMap((d) =>
+          d.type === "context_edit" &&
+          d.targetId !== undefined &&
+          d.replacement != null
+            ? [{ targetId: d.targetId, replacement: d.replacement }]
+            : [],
+        );
+        assert.deepEqual(
+          edits.map((d) => d.targetId),
+          [f.r2, f.r1],
+        );
+        assert.match(forcedDrafts(turn)[0].content, /: 2 tool results were/);
+        for (const d of edits) {
+          f.sm.appendContextEdit(d.targetId, d.replacement as never);
+        }
+        assert.ok(scaledEstimate(f.sm, 1.5) <= TARGET);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("a real count below the estimate is clamped to ratio 1", async () => {
+      // Real 83k: the raw ratio is 0.5. Unclamped, the estimate would fit with
+      // no withholding at all; clamped, it stays at 95k and one result goes.
+      const f = await forcedSetup({ issuerTokens: 71_000 });
+      try {
+        const message = {
+          ...assistantMessage([], "length", 0),
+          usage: { ...usageOf(83_000), input: 83_000 },
+        };
+        f.sm.appendMessage(message as never);
+        const turn = await fireTurnEndAll(f.pi, f.ctx, message, {
+          turnIndex: 1,
+        });
+        const edits = turn.entries.filter(
+          (d) => d.type === "context_edit" && d.replacement !== null,
+        );
+        assert.deepEqual(
+          edits.map((d) => d.targetId),
+          [f.r2],
+        );
+        assert.equal(forcedDrafts(turn)[0].content, D5_ONE);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("no usage on the overflowed reply keeps the estimate (ratio 1)", async () => {
+      const f = await forcedSetup({ issuerTokens: 71_000 });
+      try {
+        const message = assistantMessage([], "length", 0);
+        f.sm.appendMessage(message as never);
+        const turn = await fireTurnEndAll(f.pi, f.ctx, message, {
+          turnIndex: 1,
+        });
+        const edits = turn.entries.filter(
+          (d) => d.type === "context_edit" && d.replacement !== null,
+        );
+        assert.deepEqual(
+          edits.map((d) => d.targetId),
+          [f.r2],
+        );
+        assert.equal(forcedDrafts(turn)[0].content, D5_ONE);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
   });
 
   it("does not trigger: another model, a non-overflow error, compaction on, another extension's continue", async () => {
