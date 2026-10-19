@@ -1789,13 +1789,13 @@ export default function (pi: ExtensionAPI) {
   /**
    * Settle a committing ending (#90): drop the pending rewind, and when pi
    * did not commit its drafts (no matching outcome entry on the branch),
-   * apply the same ending outside a boundary. Returns the status of an
-   * ending re-applied here, else `null`.
+   * apply the same ending outside a boundary. Returns the status and the
+   * D8 reason (#101, D7) of an ending re-applied here, else `null`.
    */
   function settleCommittingEnding(
     sm: SessionManager,
     sessionId: string,
-  ): RewindOutcomeData["status"] | null {
+  ): { status: RewindOutcomeData["status"]; reason: string } | null {
     const pending = pendingRewinds.get(sessionId);
     const committing = pending?.committing;
     if (!pending || !committing) return null;
@@ -1819,7 +1819,12 @@ export default function (pi: ExtensionAPI) {
       committing.text,
       committing.extraHidden,
     );
-    return committing.status;
+    const reason =
+      pending.lastCause &&
+      committing.reason === buildAttemptsExhaustedReason(pending.lastCause)
+        ? COMPACTION_FAILED_NO_REWIND
+        : committing.reason;
+    return { status: committing.status, reason };
   }
 
   /** `sessionId`'s pending rewind, after settling a committing ending. */
@@ -2523,10 +2528,21 @@ export default function (pi: ExtensionAPI) {
     // model reads the failure in the same run.
     const reapplied = settleCommittingEnding(sm, sessionId);
     if (
-      reapplied === "failed" &&
+      reapplied?.status === "failed" &&
       event.outcome !== "error" &&
       event.outcome !== "aborted"
     ) {
+      // A forced rewind's failed ending (#101, D8): the D8 gate, no
+      // `continue`, as `deliver()` gives it.
+      if (forcedRewinds.get(sessionId)?.ended) {
+        return {
+          entries: keepValidDrafts(sm, [
+            ...(event.entries ?? []),
+            ...compactionFailed(sessionId, reapplied.reason),
+          ]),
+          continue: false,
+        };
+      }
       return { continue: true };
     }
     // Rewind-driven compaction (#101, D2): an explicit overflow error ended

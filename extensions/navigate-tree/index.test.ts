@@ -8047,6 +8047,29 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
+  it("D8: a forced rewind's failed ending re-applied at agent_before_settle keeps the gate (#101)", async () => {
+    const f = await forcedSetup();
+    try {
+      await runErrorEnd(f, errorOverflow(f.sm).message);
+      await requestRewind(f);
+      await summaryTurn(f, "no summary", "stop", { commit: true });
+      await summaryTurn(f, "no summary", "stop", { commit: true });
+      // Attempt 3 exhausts the attempts; pi drops its turn_end list.
+      await summaryTurn(f, "no summary", "stop", { commit: false });
+      assert.equal(outcomeEntries(f.sm).length, 0, "pi dropped the list");
+      const settle = await fireAgentBeforeSettle(f.pi, f.ctx);
+      assert.equal(outcomeEntries(f.sm).length, 1, "the ending is re-applied");
+      assert.equal(settle.continue, false, "D8 gate, no continue");
+      assert.equal(
+        forcedDrafts(settle).at(-1)?.content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_NO_REWIND),
+      );
+      assert.equal(fireToolCall(f.pi, f.ctx), undefined, "the gate is lifted");
+    } finally {
+      cleanupConfigFixture(f.fixture);
+    }
+  });
+
   it("S6: a second overflow during the forced rewind ends it", async () => {
     const f = await forcedSetup();
     try {
