@@ -8084,7 +8084,7 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
-  it("the walk stops at a compaction: nothing above it is withheld, and a plan that still cannot fit ends with D8 (#101, #107)", async () => {
+  it("the walk stops where the projection does: nothing above the cut is withheld, and a plan that still cannot fit ends with D8 (#101, #107, #112)", async () => {
     const f = await forcedSetup({ issuerTokens: 60_000 });
     try {
       const next = f.sm.appendMessage({
@@ -8099,8 +8099,9 @@ Active anchors (root → leaf, % of 100k):
       );
       const r3 = appendToolResult(f.sm, "t3", "read", "ok");
       const err = errorOverflow(f.sm);
-      // The walk reaches r3, then hits the compaction: r1 and r2 are above it
-      // and are not in the projected context, so they must not be withheld.
+      // The walk crosses the compaction entry (an entry type is not a stop,
+      // #112) and reaches r3; r1 and r2 are above the cut and carry no
+      // position in the projection, so they are skipped, not withheld.
       const plan = __testHooks.planWithhold(f.sm, err.id, [], WINDOW - 16_384);
       assert.deepEqual(
         plan.drafts.flatMap((d) => ("targetId" in d ? [d.targetId] : [])),
@@ -10134,6 +10135,234 @@ Active anchors (root → leaf, % of 100k):
         });
       } finally {
         cleanupConfigFixture(fixture);
+      }
+    });
+
+    it("an entry with no position is skipped, not a stop (#112)", async () => {
+      // A failed summary attempt hides its own results as well as its reply
+      // (#90), so the newest tool result can carry no position while older
+      // ones must still be reachable. Stopping there instead of skipping would
+      // draft nothing at all.
+      const f = await backgroundReady();
+      try {
+        const anchor = appendTurn(f.sm, "u1", "a1", 5_000);
+        f.pi.pi.setLabel(anchor.assistantId, "anchor:start");
+        f.sm.branchWithSummary(anchor.assistantId, "## Goal\ncollapsed work");
+        const b = addBatch(f.sm);
+        const plan = __testHooks.planWithhold(
+          f.sm,
+          b.overflow.id,
+          [b.overflow.id, b.r2],
+          TARGET,
+          undefined,
+          120_000,
+        );
+        assert.deepEqual(
+          targets(plan),
+          [b.r1, f.o3],
+          "r2 is hidden, so the walk skips it and keeps going",
+        );
+        assert.equal(plan.fits, true);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    /**
+     * #112. The walk used to end on an entry TYPE — a compaction or a
+     * `branch_summary` — on the assumption that either is a context boundary.
+     * Neither is a reliable boundary, and the projection already is one:
+     *
+     * - a `branch_summary` is an ordinary message on the path, so the anchor's
+     *   kept background above it is still sent and still counted;
+     * - a `compaction` CUTS with `firstKeptEntryId`, which sits ABOVE the
+     *   compaction entry, so the kept range is projected too; pi also cuts at a
+     *   tool-call assistant while keeping that call's results.
+     *
+     * A live 400k session died on the first: five branch summaries put 153k
+     * tokens of tool results behind the newest one, and the 11k still reachable
+     * above it could not free the 26k the plan needed.
+     *
+     * Shapes here: two batches of big results as background — the earlier one
+     * (c1, behind its own assistant call) is what the compaction case CUTS, and
+     * the later one (o0..o3, behind a second call) is what it KEEPS — then a
+     * boundary, then a batch whose own two results are not enough: 90k baseline
+     * + a 24k tail (chars/4) against an 83 616 target, so the plan needs one
+     * background result after both fresh ones.
+     */
+    async function backgroundReady() {
+      const fixture = makeConfigFixture();
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 20_000 }),
+      );
+      const { sm, pi, ctx } = setup({ contextWindow: WINDOW });
+      (ctx.model as { maxTokens?: number }).maxTokens = 64_000;
+      ctx.cwd = fixture.projectDir;
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u0", "a0", 5_000);
+      // The cut candidate: a batch the compaction's cut removes entirely.
+      const cutCall = appendToolCallAssistant(
+        sm,
+        [{ id: "c1", name: "read" }],
+        5_000,
+      );
+      const c1 = appendToolResult(sm, "c1", "read", BIG);
+      // The kept batch, preceded by the assistant call pi can actually cut at:
+      // `isCutPointMessage` never returns true for a tool result, so a
+      // compaction's `firstKeptEntryId` is a call like this one, and its results
+      // (o0..o3) follow it into the projection.
+      const keptCall = appendToolCallAssistant(
+        sm,
+        [
+          { id: "o0", name: "read" },
+          { id: "o1", name: "read" },
+          { id: "o2", name: "read" },
+          { id: "o3", name: "read" },
+        ],
+        5_000,
+      );
+      const o0 = appendToolResult(sm, "o0", "read", BIG);
+      const o1 = appendToolResult(sm, "o1", "read", BIG);
+      const o2 = appendToolResult(sm, "o2", "read", BIG);
+      const o3 = appendToolResult(sm, "o3", "read", BIG);
+      return {
+        fixture,
+        sm,
+        pi,
+        ctx,
+        cutCallId: cutCall.id,
+        keptCallId: keptCall.id,
+        c1,
+        o0,
+        o1,
+        o2,
+        o3,
+      };
+    }
+
+    /** The post-boundary work plus the batch that overflows. */
+    function addBatch(sm: SessionManager) {
+      appendTurn(sm, "u2", "a2", 20_000);
+      const issuer = appendToolCallAssistant(
+        sm,
+        [
+          { id: "r1", name: "read" },
+          { id: "r2", name: "read" },
+        ],
+        90_000,
+      );
+      const r1 = appendToolResult(sm, "r1", "read", BIG);
+      const r2 = appendToolResult(sm, "r2", "read", BIG);
+      const overflow = lengthOverflow(sm, 120_000);
+      return { issuerId: issuer.id, r1, r2, overflow };
+    }
+
+    const targets = (plan: ReturnType<typeof planFor>) =>
+      plan.drafts.map((d) => (d.type === "context_edit" ? d.targetId : ""));
+
+    it("the walk crosses a branch_summary and withholds the kept background (#112)", async () => {
+      const f = await backgroundReady();
+      try {
+        const anchor = appendTurn(f.sm, "u1", "a1", 5_000);
+        f.pi.pi.setLabel(anchor.assistantId, "anchor:start");
+        f.sm.branchWithSummary(anchor.assistantId, "## Goal\ncollapsed work");
+        const b = addBatch(f.sm);
+        const plan = planFor(f.sm, b.overflow.id, 120_000);
+        assert.deepEqual(
+          targets(plan),
+          [b.r2, b.r1, f.o3],
+          "newest first, across the summary: both fresh results, then the newest background result",
+        );
+        assert.equal(plan.withheld, 3);
+        assert.equal(plan.fits, true, "the background closes the last 12k");
+        assert.ok(plan.estimateTokens <= TARGET);
+        const { turn } = await runErrorEnd(
+          { pi: f.pi, ctx: f.ctx },
+          b.overflow.message,
+        );
+        assert.equal(turn.continue, true, "the forced rewind starts");
+        assert.match(
+          forcedDrafts(turn)[0].content,
+          /: 3 tool results were withheld\./,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("the walk crosses more than one branch_summary (#112)", async () => {
+      // Five summaries is the live shape; two is enough to kill the "cross only
+      // the newest one" non-fix, which the rest of the suite lets through.
+      const f = await backgroundReady();
+      try {
+        const a1 = appendTurn(f.sm, "u1", "a1", 5_000);
+        f.pi.pi.setLabel(a1.assistantId, "anchor:start");
+        f.sm.branchWithSummary(a1.assistantId, "## Goal\nfirst segment");
+        const a2 = appendTurn(f.sm, "u2", "a2", 5_000);
+        f.sm.branchWithSummary(a2.assistantId, "## Goal\nsecond segment");
+        const b = addBatch(f.sm);
+        const plan = planFor(f.sm, b.overflow.id, 120_000);
+        assert.deepEqual(
+          targets(plan),
+          [b.r2, b.r1, f.o3],
+          "both summaries crossed, newest result first",
+        );
+        assert.equal(plan.fits, true);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("a compaction's kept region stays withholdable, and what it cut is skipped (#112)", async () => {
+      const f = await backgroundReady();
+      try {
+        // pi cuts at an assistant call, keeping that call's results: the kept
+        // region here is the kept batch (o0..o3) and the cut region is the
+        // earlier batch (c1 and its call).
+        f.sm.appendCompaction("compacted", f.keptCallId, 1_000);
+        const b = addBatch(f.sm);
+        const projected = new Set(
+          f.sm.buildSessionProjection().entries.map((e) => e.sourceEntry.id),
+        );
+        assert.equal(projected.has(f.o0), true, "the kept batch is projected");
+        assert.equal(
+          projected.has(f.c1),
+          false,
+          "the batch the cut removed is not",
+        );
+        assert.equal(
+          projected.has(f.cutCallId),
+          false,
+          "nor is the assistant call that issued it",
+        );
+        const plan = planFor(f.sm, b.overflow.id, 120_000);
+        assert.deepEqual(
+          targets(plan),
+          [b.r2, b.r1, f.o3],
+          "the walk crosses the compaction into its kept region",
+        );
+        assert.equal(plan.fits, true);
+        // The guard's own assertion: at a target the walk can only chase by
+        // consuming the whole kept region, the cut result must still never be
+        // drafted. Without the position guard the walk reaches c1 and reports
+        // a false fit.
+        const deep = __testHooks.planWithhold(
+          f.sm,
+          b.overflow.id,
+          [b.overflow.id],
+          40_000,
+          undefined,
+          120_000,
+        );
+        assert.deepEqual(
+          targets(deep),
+          [b.r2, b.r1, f.o3, f.o2, f.o1, f.o0],
+          "every kept result, newest first, and never the cut one",
+        );
+        assert.equal(deep.fits, false, "the kept region runs out before 40k");
+      } finally {
+        cleanupConfigFixture(f.fixture);
       }
     });
 

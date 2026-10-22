@@ -1028,8 +1028,16 @@ function overflowRequestTokens(
  * Withhold the tool results that overflowed (#101, D3): walk back from
  * `fromEntryId` (excluded) through every older turn, and replace their
  * content newest-first with the D4 notice until the estimate fits `target`.
- * The walk stops at a compaction or branch summary (a context boundary: what
- * is above it is not projected). User and custom messages are never
+ * The boundary is the PROJECTION, not an entry type: an entry the projection
+ * does not carry has no position and is skipped, so a result pi cut off with a
+ * compaction is never touched, while one a compaction KEPT
+ * (`firstKeptEntryId` is above the compaction entry and its range is still
+ * projected) stays withholdable. No entry type ends the walk — a
+ * `branch_summary` is an ordinary message on the path and the anchor's kept
+ * background above it is still sent and still counted (#112), and pi cuts a
+ * compaction at a tool-call assistant while keeping that call's results
+ * (`compaction.js`, `findProjectedCutPoint`), so the kept region above a
+ * compaction is projected too. User and custom messages are never
  * withheld; a navigate_tree result, a result already hidden or replaced, and
  * a result not in the projection are skipped. The estimate is the projection without
  * `hiddenIds` (sliced at `instructionEntryId`, the frozen request of a
@@ -1123,17 +1131,19 @@ function planWithhold(
   const drafts: SessionBoundaryDraft[] = [];
   const start = branch.findIndex((e) => e.id === fromEntryId);
   // Newest first, across turns: the failed attempt's own batch is not always
-  // enough (#101, walk fix). A compaction or branch summary is a context
-  // boundary: nothing above it is in the projected context.
+  // enough (#101, walk fix). Nothing here ends the walk on an entry type: the
+  // projection is the boundary (see the docblock), so a branch_summary and a
+  // compaction's kept region are both crossed, and only entries the projection
+  // dropped are skipped by the `positions` guard below. #112: a live 400k
+  // session could not recover while a branch_summary ended the walk — five of
+  // them put 153k of tool results behind the newest one, and the 11k reachable
+  // above it could not free the 26k the plan needed.
   for (
     let i = start - 1;
     i >= 0 && (estimate() > target || clampEstimate() > target);
     i--
   ) {
     const entry = branch[i];
-    if (entry.type === "compaction" || entry.type === "branch_summary") {
-      break;
-    }
     if (entry.type !== "message" || entry.message.role !== "toolResult") {
       continue;
     }
