@@ -10137,6 +10137,129 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
+    /**
+     * #112. The walk used to stop at a `branch_summary`, on the assumption that
+     * it is a context boundary. It is not: pi's `buildContextEntries` cuts only
+     * at a `compaction`, so the anchor's kept background above a summary is
+     * still sent and still counted. A live 400k session died on this: five
+     * branch summaries, 153k tokens of tool results behind the newest one, and
+     * only 11k still reachable above it against a 26k shortfall.
+     *
+     * Shape here: three big results BEFORE the anchor (the kept background),
+     * a `branch_summary` forked from the anchor, then a batch whose own two
+     * results are not enough. 90k baseline + a 24k tail (chars/4) against an
+     * 83 616 target: both fresh results go, the plan still needs ~6k, and only
+     * the background can give it.
+     */
+    async function backgroundAcrossSummary(boundary: "summary" | "compaction") {
+      const fixture = makeConfigFixture();
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 20_000 }),
+      );
+      const { sm, pi, ctx } = setup({ contextWindow: WINDOW });
+      (ctx.model as { maxTokens?: number }).maxTokens = 64_000;
+      ctx.cwd = fixture.projectDir;
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u0", "a0", 5_000);
+      appendToolCallAssistant(
+        sm,
+        [
+          { id: "o1", name: "read" },
+          { id: "o2", name: "read" },
+          { id: "o3", name: "read" },
+        ],
+        5_000,
+      );
+      const o1 = appendToolResult(sm, "o1", "read", BIG);
+      const o2 = appendToolResult(sm, "o2", "read", BIG);
+      const o3 = appendToolResult(sm, "o3", "read", BIG);
+      const anchor = appendTurn(sm, "u1", "a1", 5_000);
+      pi.pi.setLabel(anchor.assistantId, "anchor:start");
+      if (boundary === "summary") {
+        sm.branchWithSummary(anchor.assistantId, "## Goal\ncollapsed work");
+      } else {
+        // A compaction cuts the projection at `firstKeptEntryId`, which is
+        // what makes the background unreachable rather than skipped.
+        sm.appendCompaction("compacted", anchor.assistantId, 1_000);
+      }
+      appendTurn(sm, "u2", "a2", 20_000);
+      const issuer = appendToolCallAssistant(
+        sm,
+        [
+          { id: "r1", name: "read" },
+          { id: "r2", name: "read" },
+        ],
+        90_000,
+      );
+      const r1 = appendToolResult(sm, "r1", "read", BIG);
+      const r2 = appendToolResult(sm, "r2", "read", BIG);
+      const overflow = lengthOverflow(sm, 120_000);
+      return {
+        fixture,
+        sm,
+        pi,
+        ctx,
+        issuerId: issuer.id,
+        r1,
+        r2,
+        o1,
+        o2,
+        o3,
+        overflow,
+      };
+    }
+
+    it("the walk crosses a branch_summary and withholds the kept background (#112)", async () => {
+      const f = await backgroundAcrossSummary("summary");
+      try {
+        const plan = planFor(f.sm, f.overflow.id, 120_000);
+        assert.deepEqual(
+          plan.drafts.map((d) => (d.type === "context_edit" ? d.targetId : "")),
+          [f.r2, f.r1, f.o3],
+          "newest first, across the summary: both fresh results, then the newest background result",
+        );
+        assert.equal(plan.withheld, 3);
+        assert.equal(plan.fits, true, "the background closes the last 6k");
+        assert.ok(plan.estimateTokens <= TARGET);
+        const { turn } = await runErrorEnd(
+          { pi: f.pi, ctx: f.ctx },
+          f.overflow.message,
+        );
+        assert.equal(turn.continue, true, "the forced rewind starts");
+        assert.match(
+          forcedDrafts(turn)[0].content,
+          /: 3 tool results were withheld\./,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("a compaction is still a boundary: nothing above it is projected or withheld (#112)", async () => {
+      const f = await backgroundAcrossSummary("compaction");
+      try {
+        const plan = planFor(f.sm, f.overflow.id, 120_000);
+        assert.deepEqual(
+          plan.drafts.map((d) => (d.type === "context_edit" ? d.targetId : "")),
+          [f.r2, f.r1],
+          "only the fresh results: the compaction cut the background out of the projection",
+        );
+        assert.equal(plan.fits, false, "90k of baseline cannot fit 83 616");
+        const { turn } = await runErrorEnd(
+          { pi: f.pi, ctx: f.ctx },
+          f.overflow.message,
+        );
+        assert.equal(turn.continue, false, "the run ends");
+        assert.equal(
+          forcedDrafts(turn)[0].content,
+          buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
     it("the fallback skips an aborted or errored assistant, like pi's usage predicate", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 5_000);

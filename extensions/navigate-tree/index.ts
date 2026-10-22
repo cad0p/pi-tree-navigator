@@ -1028,8 +1028,11 @@ function overflowRequestTokens(
  * Withhold the tool results that overflowed (#101, D3): walk back from
  * `fromEntryId` (excluded) through every older turn, and replace their
  * content newest-first with the D4 notice until the estimate fits `target`.
- * The walk stops at a compaction or branch summary (a context boundary: what
- * is above it is not projected). User and custom messages are never
+ * The walk stops at a compaction: pi's `buildContextEntries` keeps the
+ * compaction's `firstKeptEntryId` and everything after it, so nothing above is
+ * projected. A `branch_summary` is NOT such a boundary — it is an ordinary
+ * message on the path and the anchor's kept background above it is still sent
+ * and still counted — so the walk crosses it (#112). User and custom messages are never
  * withheld; a navigate_tree result, a result already hidden or replaced, and
  * a result not in the projection are skipped. The estimate is the projection without
  * `hiddenIds` (sliced at `instructionEntryId`, the frozen request of a
@@ -1123,15 +1126,19 @@ function planWithhold(
   const drafts: SessionBoundaryDraft[] = [];
   const start = branch.findIndex((e) => e.id === fromEntryId);
   // Newest first, across turns: the failed attempt's own batch is not always
-  // enough (#101, walk fix). A compaction or branch summary is a context
-  // boundary: nothing above it is in the projected context.
+  // enough (#101, walk fix). Only a compaction is a context boundary (see the
+  // docblock): a branch_summary is a message on the path, and everything above
+  // it is still in the context and still counted, so the walk crosses it. A
+  // live 400k session could not recover until it did: five branch summaries put
+  // 153k of tool results behind the newest one, and the 11k still reachable
+  // above it could not free the 26k the plan needed (#112).
   for (
     let i = start - 1;
     i >= 0 && (estimate() > target || clampEstimate() > target);
     i--
   ) {
     const entry = branch[i];
-    if (entry.type === "compaction" || entry.type === "branch_summary") {
+    if (entry.type === "compaction") {
       break;
     }
     if (entry.type !== "message" || entry.message.role !== "toolResult") {
