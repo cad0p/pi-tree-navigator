@@ -13,7 +13,10 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
-import { estimateContextTokens } from "./context-tokens.ts";
+import {
+  estimateContextTokens,
+  piEstimateMessageTokens,
+} from "./context-tokens.ts";
 
 // -----------------------------------------------------------------------------
 // Fixtures — chars/4 means every token value below is an exact multiple of 4
@@ -199,5 +202,158 @@ describe("estimateContextTokens", () => {
       userWithImage(400), // trailing 1300
     ];
     assert.equal(estimateContextTokens(chain), 500 + 1300);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// pi-ai's own estimator (#107, round 3)
+// -----------------------------------------------------------------------------
+
+/**
+ * pi-ai's real `estimateMessageTokens`. The package root does not export it
+ * and the exports map blocks subpaths, so resolve the file beside the entry
+ * (the same way the index tests reach `estimateContextTokens`).
+ */
+async function piAiEstimateMessageTokens(message: unknown): Promise<number> {
+  const entry = import.meta.resolve("@earendil-works/pi-ai");
+  const { estimateMessageTokens } = await import(
+    new URL("./utils/estimate.js", entry).href
+  );
+  return estimateMessageTokens(message) as number;
+}
+
+describe("piEstimateMessageTokens", () => {
+  const toolResult = (chars: number): AgentMessage =>
+    ({
+      role: "toolResult",
+      toolCallId: "tc-1",
+      toolName: "read",
+      content: [{ type: "text", text: text(chars) }],
+      isError: false,
+      timestamp: 1,
+    }) as unknown as AgentMessage;
+
+  const system = (
+    opts: {
+      content?: number;
+      sections?: Record<string, string | null>;
+      toolsAdded?: unknown[];
+      toolsRemoved?: unknown[];
+    } = {},
+  ): AgentMessage =>
+    ({
+      role: "system",
+      content: [{ type: "text", text: text(opts.content ?? 0) }],
+      sections: opts.sections,
+      toolsAdded: opts.toolsAdded,
+      toolsRemoved: opts.toolsRemoved,
+      timestamp: 1,
+    }) as unknown as AgentMessage;
+
+  const assistantBlocks = (blocks: unknown[]): AgentMessage =>
+    ({
+      role: "assistant",
+      content: blocks,
+      api: "anthropic",
+      provider: "test",
+      model: "test",
+      stopReason: "endTurn",
+      timestamp: 1,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    }) as unknown as AgentMessage;
+
+  it("matches pi-ai byte for byte on every message shape", async () => {
+    const shapes: Array<[string, AgentMessage]> = [
+      ["user text", user(400)],
+      ["user string content", { role: "user", content: text(400) } as never],
+      ["user text + image", userWithImage(400)],
+      ["empty user", { role: "user", content: [] } as never],
+      ["toolResult", toolResult(400)],
+      ["assistant text", assistantBlocks([{ type: "text", text: text(400) }])],
+      [
+        "assistant text + thinking",
+        assistantBlocks([
+          { type: "text", text: text(400) },
+          { type: "thinking", thinking: text(200) },
+        ]),
+      ],
+      [
+        "assistant tool call",
+        assistantBlocks([
+          {
+            type: "toolCall",
+            id: "c1",
+            name: "read",
+            arguments: { path: "a" },
+          },
+        ]),
+      ],
+      ["empty assistant", assistantBlocks([])],
+      ["system content", system({ content: 400 })],
+      [
+        "system sections",
+        system({ content: 400, sections: { appended: text(400), gone: null } }),
+      ],
+      [
+        "system tool deltas",
+        system({
+          content: 400,
+          toolsAdded: [{ name: "navigate_tree", description: text(200) }],
+          toolsRemoved: [{ name: "gone", description: text(100) }],
+        }),
+      ],
+      ["system empty", system()],
+    ];
+    for (const [name, message] of shapes) {
+      assert.equal(
+        piEstimateMessageTokens(message),
+        await piAiEstimateMessageTokens(message),
+        name,
+      );
+    }
+  });
+
+  it("pins the constants: chars/3.5 rounded up, 4800 chars per image", () => {
+    assert.equal(piEstimateMessageTokens(user(400)), 115); // 400 / 3.5
+    assert.equal(piEstimateMessageTokens(user(7)), 2); // 7 / 3.5 = 2 exactly
+    assert.equal(piEstimateMessageTokens(user(4)), 2); // 1.14 -> 2
+    // 400 text + 4800 image chars = 5200 -> 1486.
+    assert.equal(piEstimateMessageTokens(userWithImage(400)), 1_486);
+    assert.equal(piEstimateMessageTokens(assistantBlocks([])), 0);
+    // A tool call counts its name and its JSON arguments, not its id.
+    assert.equal(
+      piEstimateMessageTokens(
+        assistantBlocks([
+          { type: "toolCall", id: "c1", name: "ab", arguments: { x: 1 } },
+        ]),
+      ),
+      Math.ceil((2 + JSON.stringify({ x: 1 }).length) / 3.5),
+    );
+  });
+
+  it("is 4/3.5 above pi-compaction's chars/4 estimate — the clamp gap (#107)", () => {
+    const big = toolResult(48_000);
+    assert.equal(estimateTokens(big), 12_000); // chars/4, the planner's tail
+    assert.equal(piEstimateMessageTokens(big), 13_715); // chars/3.5, pi's clamp
+    assert.equal(piEstimateMessageTokens(big), Math.ceil(48_000 / 3.5));
+  });
+
+  it("unserializable tool arguments degrade instead of throwing (pi's safeJsonStringify)", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const message = assistantBlocks([
+      { type: "toolCall", id: "c1", name: "x", arguments: circular },
+    ]);
+    assert.equal(
+      piEstimateMessageTokens(message),
+      Math.ceil((1 + "[unserializable]".length) / 3.5),
+    );
   });
 });

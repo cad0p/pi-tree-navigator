@@ -84,6 +84,7 @@ import {
 import {
   estimateContextTokens,
   newestUsageIndex,
+  piEstimateMessageTokens,
   splitContextEstimate,
 } from "./context-tokens.ts";
 import {
@@ -349,7 +350,12 @@ export function buildContextMessages(
     getBranch?(): SessionEntry[];
   },
   pendingInstructionEntryId?: string | null,
+  usageOverride?: { tokens: number; entryId?: string },
 ): ReturnType<typeof sessionEntryToContextMessages> {
+  // `usageOverride.tokens` is a whole-context PREFIX, not a total (#107):
+  // pi's `estimateContextTokens` adds its own char estimate for every
+  // message after the assistant that carries the usage, so handing it a
+  // total would count the tail twice and clamp `max_tokens` towards 0.
   let entries:
     | Array<{ sourceEntry: SessionEntry | null; messages: AgentMessage[] }>
     | undefined;
@@ -392,6 +398,19 @@ export function buildContextMessages(
   // then falls back to an older exact usage or chars/3.5. Assistants before the
   // target, and after the edit, keep their exact usage.
   const stale = staleUsageFlags(entries);
+  // #107: pi's clamp reads the newest non-zero assistant usage, and stale ones
+  // are zeroed below — so the post-withhold PREFIX must land on the assistant
+  // whose usage is the plan's baseline: the planner's entry by id, NOT the
+  // newest stale one, which another extension's later `context_edit` can push
+  // the target onto (shrinking a usage that was exact). The prefix alone:
+  // pi's `estimateContextTokens` re-adds every message after this assistant
+  // (chars/3.5), so the plan's total would count the tail twice.
+  const tokens = usageOverride?.tokens;
+  const overrideAt =
+    tokens === undefined
+      ? -1
+      : overrideTargetIndex(entries, usageOverride?.entryId);
+  let at = 0;
   const messages = entries.flatMap((e, i) => {
     const text = e.sourceEntry ? outcomes.get(e.sourceEntry.id) : undefined;
     const withOutcome =
@@ -406,7 +425,13 @@ export function buildContextMessages(
                 }
               : message,
           );
-    return stale[i] ? withOutcome.map(dropStaleUsage) : withOutcome;
+    const start = at;
+    const projected = stale[i] ? withOutcome.map(dropStaleUsage) : withOutcome;
+    at += projected.length;
+    if (tokens === undefined || overrideAt < 0) return projected;
+    return projected.map((message, j) =>
+      start + j === overrideAt ? withContextTokens(message, tokens) : message,
+    );
   });
   return messages.filter((message) => message.role !== "system");
 }
@@ -456,6 +481,83 @@ function dropStaleUsage(message: AgentMessage): AgentMessage {
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 0,
+    },
+  };
+}
+
+/**
+ * The message index the calibrated size goes on (#107). The planner's entry
+ * id is the target: its newest assistant usage is the plan's baseline, so the
+ * override replaces exactly the number it was computed from. "Newest stale"
+ * would drift onto a later assistant that an unrelated `context_edit` made
+ * stale — shrinking a usage that was measured with the withheld content
+ * already gone.
+ *
+ * The entry is absent from the D11 frozen view (the request ends at the
+ * pending instruction, so the failed attempt that supplied the baseline was
+ * sliced off) — then the newest assistant usage in the view is the one pi's
+ * clamp will actually read, and it carries the calibrated size instead.
+ */
+function overrideTargetIndex(
+  entries: Array<{
+    sourceEntry: SessionEntry | null;
+    messages: AgentMessage[];
+  }>,
+  entryId?: string,
+): number {
+  let index = 0;
+  for (const e of entries) {
+    if (entryId !== undefined && e.sourceEntry?.id === entryId) {
+      const found = newestAssistantUsageIndex(e.messages, index);
+      if (found >= 0) return found;
+    }
+    index += e.messages.length;
+  }
+  return newestAssistantUsageIndex(entries.flatMap((e) => e.messages));
+}
+
+/**
+ * Index of the newest assistant message pi's clamp would anchor on in
+ * `messages`, offset by `start`, or -1 with none (#107). pi's
+ * `getLastAssistantUsageInfo` ignores a reply whose `stopReason` is
+ * `"aborted"` or `"error"` entirely, so an override written there is
+ * invisible: the fallback skips them and targets the next visible one.
+ * Zero-usage assistants are NOT skipped here — the override is what makes
+ * their total non-zero, and it is applied after the stale-usage zeroing.
+ */
+function newestAssistantUsageIndex(
+  messages: readonly AgentMessage[],
+  start = 0,
+): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== "assistant" || !message.usage) continue;
+    const stopReason = (message as { stopReason?: string }).stopReason;
+    if (stopReason === "aborted" || stopReason === "error") continue;
+    return start + i;
+  }
+  return -1;
+}
+
+/**
+ * `message` with the post-withhold prefix in its usage (#107) — the prefix
+ * only, because pi's clamp adds the messages after it on its own. A clone:
+ * the session's own message objects are never mutated.
+ */
+function withContextTokens(
+  message: AgentMessage,
+  tokens: number,
+): AgentMessage {
+  if (message.role !== "assistant" || !message.usage) return message;
+  return {
+    ...message,
+    usage: {
+      ...message.usage,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: Math.max(0, Math.round(tokens)),
     },
   };
 }
@@ -586,6 +688,25 @@ function countBackgroundMessages(
     if (entry.sourceEntry.id === target) break;
   }
   return count;
+}
+
+/**
+ * The size pi's output clamp will see for one projected message (#107, round
+ * 3): pi-ai's chars/3.5 `estimateMessageTokens` over the WIRE message, i.e.
+ * after pi's own `convertToLlm` has turned a non-LLM agent message (a custom
+ * message, a branch or compaction summary, a bash execution) into the user
+ * message it actually sends. The clamp's available output is
+ * `contextWindow - estimateContextTokens(wire) - 4096`, and pi-ai's
+ * `estimateContextTokens` sums THIS estimator over every message after the
+ * assistant usage it anchors on — so a plan only promises output room if this
+ * view fits too (see `planWithhold`).
+ */
+function piClampTokens(message: AgentMessage): number {
+  let tokens = 0;
+  for (const converted of convertToLlm([message])) {
+    tokens += piEstimateMessageTokens(converted);
+  }
+  return tokens;
 }
 
 function refreshAgentMessages(sm: SessionManager): boolean {
@@ -846,6 +967,34 @@ interface WithholdPlan {
   drafts: SessionBoundaryDraft[];
   withheld: number;
   fits: boolean;
+  /**
+   * The plan's whole post-withhold CALIBRATED estimate — `baseline + ratio ×
+   * tail`, one of the two bases of `fits` (#101, A; #107 round 3 adds the
+   * clamp view). **Never write this into a usage**: pi's
+   * `estimateContextTokens` adds its own char estimate for every message
+   * after the assistant carrying the usage, so a whole-context total would
+   * count the tail twice (#107).
+   */
+  estimateTokens: number;
+  /**
+   * The post-withhold PREFIX (#107) — `estimateTokens` minus the tail, i.e.
+   * the plan's baseline usage less the unscaled savings of the results
+   * withheld before that assistant. This is the only plan number a usage may
+   * carry: pi re-adds the messages after the baseline itself, so its total
+   * lands on `estimateTokens` instead of overshooting by the whole tail.
+   *
+   * `undefined` when the plan had no real count (`realTokens`, #101 A): the
+   * estimate is then uncalibrated, and #101's own fallback — zero the stale
+   * usages and let pi pick an older exact one — is better than a chars-based
+   * prefix.
+   */
+  baselineTokens?: number;
+  /**
+   * The entry whose assistant usage is that prefix (#107): the override must
+   * land on it by id, not on whatever is newest later. `undefined` with
+   * `baselineTokens`.
+   */
+  overrideEntryId?: string;
 }
 
 /**
@@ -891,6 +1040,25 @@ function overflowRequestTokens(
  * (real − baseline) / tail, clamped to at least 1; the planner then fits
  * `baseline + ratio × tail` under `target`. Without `realTokens` the
  * ratio is 1.
+ *
+ * #107: the plan reports that total (`estimateTokens`, the fit basis) and the
+ * post-savings `baseline` (`baselineTokens`, the prefix the tail is added
+ * to). Only the prefix may reach a usage: pi's clamp adds the messages after
+ * the baseline again.
+ *
+ * #107, round 3: the calibrated view alone is not what pi clamps on. pi sizes
+ * `max_tokens` from pi-ai's `estimateContextTokens` — chars/3.5 — over the wire
+ * this plan hands back, while `ratio` calibrates a chars/4 tail. The plan
+ * therefore tracks a second, CLAMP view (`piTail`, see `piClampTokens`) and
+ * withholds until BOTH fit `target`: at `target = window - reserveTokens` the
+ * clamp then leaves `reserveTokens - 4096` of output room, which is exactly
+ * what a forced turn needs (a live 40k/12000 run had a 31,530-token request
+ * inside the 34,000 target and was still clamped to 1 output token).
+ *
+ * The clamp view is a slight UNDER-estimate of pi's number: it counts the
+ * projection, and the runner re-attaches the system head that pi's estimate
+ * also counts. That head is why the clamp's margin is `reserveTokens - 4096`
+ * and not the whole reserve.
  */
 function planWithhold(
   sm: SessionManager,
@@ -918,6 +1086,9 @@ function planWithhold(
   // The messages the estimate counts, and each entry's first position in them
   // (#101, walk fix): an entry outside this list is not in the context.
   const messages: AgentMessage[] = [];
+  // The entry that owns each message, so the baseline's owner can be recovered
+  // once the anchor is known (#107).
+  const owners: string[] = [];
   const positions = new Map<string, number>();
   for (const e of entries) {
     if (hidden.has(e.sourceEntry.id)) continue;
@@ -927,23 +1098,38 @@ function planWithhold(
         positions.set(e.sourceEntry.id, messages.length);
       }
       messages.push(m);
+      owners.push(e.sourceEntry.id);
     }
   }
   const anchor = newestUsageIndex(messages);
   const split = splitContextEstimate(messages);
   let baseline = split.baseline;
   let tail = split.tail;
+  // #107, round 3: the CLAMP view. After the override, pi anchors on the
+  // baseline assistant (the written prefix) and adds pi-ai's chars/3.5
+  // estimate for every message after it. Track it alongside the calibrated
+  // view: the chars/4 tail is 14% smaller, which is how a "fits" plan still
+  // clamped the forced turn to one token.
+  let piTail = 0;
+  for (let j = anchor + 1; j < messages.length; j++) {
+    piTail += piClampTokens(messages[j]);
+  }
   const ratio =
     realTokens === undefined || tail <= 0
       ? 1
       : Math.max(1, (realTokens - baseline) / tail);
   const estimate = () => baseline + ratio * tail;
+  const clampEstimate = () => baseline + piTail;
   const drafts: SessionBoundaryDraft[] = [];
   const start = branch.findIndex((e) => e.id === fromEntryId);
   // Newest first, across turns: the failed attempt's own batch is not always
   // enough (#101, walk fix). A compaction or branch summary is a context
   // boundary: nothing above it is in the projected context.
-  for (let i = start - 1; i >= 0 && estimate() > target; i--) {
+  for (
+    let i = start - 1;
+    i >= 0 && (estimate() > target || clampEstimate() > target);
+    i--
+  ) {
     const entry = branch[i];
     if (entry.type === "compaction" || entry.type === "branch_summary") {
       break;
@@ -963,15 +1149,21 @@ function planWithhold(
     const text = buildWithheldNoticeText(original);
     const content = [{ type: "text" as const, text }];
     const saving = original - estimateTokens({ ...entry.message, content });
+    // The same saving in the clamp view's own units (#107, round 3).
+    const clampSaving =
+      piClampTokens(entry.message) -
+      piClampTokens({ ...entry.message, content } as AgentMessage);
     // A result before the newest usage is already in its real count, so its
     // saving comes off the baseline, as the unscaled estimate (it under-credits
     // a dense result, which only withholds more). It must not go on the tail:
     // the ratio would scale a negative tail into a false fit. A result after
-    // the usage is in the tail, which the ratio scales as before.
+    // the usage is in the tail, which the ratio scales as before. The clamp
+    // view reads the same written baseline, so only its tail moves here.
     if (at < anchor) {
       baseline -= saving;
     } else {
       tail -= saving;
+      piTail -= clampSaving;
     }
     drafts.push({
       type: "context_edit",
@@ -979,7 +1171,24 @@ function planWithhold(
       replacement: { content },
     });
   }
-  return { drafts, withheld: drafts.length, fits: estimate() <= target };
+  // #107: the prefix, floored: a zero or negative prefix is not a usable
+  // usage (pi skips a zero baseline and would fall back to an older one).
+  const prefix = Math.round(baseline);
+  const overridable = realTokens !== undefined && prefix > 0 && anchor >= 0;
+  return {
+    drafts,
+    withheld: drafts.length,
+    // Both views must fit: the calibrated one is what the provider's real
+    // count says, the clamp view is what pi's `max_tokens` arithmetic uses.
+    fits: estimate() <= target && clampEstimate() <= target,
+    estimateTokens: Math.round(estimate()),
+    // Only a plan with a real count overrides the wire: without one, #101's
+    // zeroing and pi's own fallback stay in charge (the plan's fallback item).
+    baselineTokens: overridable ? prefix : undefined,
+    // The assistant whose real usage is the baseline the estimate was built
+    // from: the one the override must replace (#107).
+    overrideEntryId: overridable ? owners[anchor] : undefined,
+  };
 }
 
 /** `context_edit` drafts hiding `ids` (a failed attempt, #90 O3). */
@@ -1656,10 +1865,9 @@ export default function (pi: ExtensionAPI) {
   // lands. A final error (D8) inside a run marks it `ended` instead (the gate
   // lifts, no second forced rewind in the same run, no start anchor) and
   // `agent_settled` deletes it.
-  const forcedRewinds = new Map<
-    string,
-    { attempts: number; ended?: boolean }
-  >();
+  const forcedRewinds = new Map<string, ForcedRewind>();
+  // Read by tests through `__testHooks.forcedRecord` (#107).
+  forcedRewindsByExtension.set(pi, forcedRewinds);
 
   // Where pi's settings are read from (#101, S4): the session's cwd, agent
   // dir and project trust, set at `session_start`. `null` = cannot tell.
@@ -1747,6 +1955,9 @@ export default function (pi: ExtensionAPI) {
   ): SessionBoundaryDraft[] {
     const record = forcedRewinds.get(sessionId) ?? { attempts: 0 };
     record.ended = true;
+    // #107: the override is only in force while the forced rewind is pending.
+    delete record.baselineTokens;
+    delete record.overrideEntryId;
     forcedRewinds.set(sessionId, record);
     return [
       rewindMessageDraft(buildRewindCompactionFailedText(reason), {
@@ -1843,7 +2054,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
       pending.hiddenEntryIds.push(...failedIds);
-      forcedRewinds.set(sessionId, { attempts: 0 });
+      forcedRewinds.set(sessionId, {
+        attempts: 0,
+        baselineTokens: plan.baselineTokens,
+        overrideEntryId: plan.overrideEntryId,
+      });
       hintTracker.markSpent();
       return {
         drafts: [...hideDrafts(failedIds), ...plan.drafts],
@@ -1873,7 +2088,27 @@ export default function (pi: ExtensionAPI) {
       undefined,
       overflowRequestTokens(sm, failedEntryId),
     );
-    forcedRewinds.set(sessionId, { attempts: 0 });
+    // #107, round 3: the fresh path honours `!fits` like D11 does. A forced
+    // message that cannot fit buys one more request with less than
+    // `reserveTokens - 4096` of output room — in the live arm-B shape, the
+    // single token that starts D8 anyway. End it here with the D8 row
+    // instead, keeping the hide of the failed attempt. The reason is
+    // `STILL_OVER`, not `OVERFLOWED_AGAIN`: no forced rewind ever started,
+    // so nothing overflowed "again".
+    if (!plan.fits) {
+      return {
+        drafts: [
+          ...hideDrafts(failedIds),
+          ...compactionFailed(sessionId, COMPACTION_FAILED_STILL_OVER),
+        ],
+        continue: false,
+      };
+    }
+    forcedRewinds.set(sessionId, {
+      attempts: 0,
+      baselineTokens: plan.baselineTokens,
+      overrideEntryId: plan.overrideEntryId,
+    });
     hintTracker.markSpent();
     return {
       drafts: [
@@ -3261,7 +3496,28 @@ export default function (pi: ExtensionAPI) {
         instructionEntryId = undefined;
       }
     }
-    return { messages: buildContextMessages(sm, instructionEntryId) };
+    // #107: hand pi the planner's post-withhold PREFIX, so the forced summary
+    // turn is not sized from a usage measured before the withholding. The
+    // prefix, never the plan's total: pi's own `estimateContextTokens` adds a
+    // char estimate for every message after the assistant carrying the usage,
+    // so a whole-context total here counts the withheld tail twice and starves
+    // the turn it was meant to rescue.
+    // An ended record (D8) is out of force whatever it still holds: the same
+    // run must not re-send the number it just gave up on.
+    const forced =
+      sessionId === undefined ? undefined : forcedRewinds.get(sessionId);
+    return {
+      messages: buildContextMessages(
+        sm,
+        instructionEntryId,
+        forced && !forced.ended && forced.baselineTokens !== undefined
+          ? {
+              tokens: forced.baselineTokens,
+              entryId: forced.overrideEntryId,
+            }
+          : undefined,
+      ),
+    };
   });
 
   // Anchor mandate (#31): a before_agent_start append lands at the END of
@@ -3891,6 +4147,34 @@ Operations (set \`action\`):
 }
 
 /**
+ * A forced rewind's record (#101, rewind-driven compaction): the attempts
+ * spent, whether a final error (D8) ended it, and the plan's post-withhold
+ * prefix with the entry it replaces (#107).
+ */
+interface ForcedRewind {
+  attempts: number;
+  ended?: boolean;
+  /**
+   * The plan's post-withhold PREFIX (#107) — never its whole-context total:
+   * pi adds every message after the baseline assistant again. Absent when
+   * the plan had no real count, which leaves #101's zeroing in charge.
+   */
+  baselineTokens?: number;
+  /** The entry the prefix replaces (#107). */
+  overrideEntryId?: string;
+}
+
+/**
+ * The live `forcedRewinds` map of each extension instance, for
+ * `__testHooks.forcedRecord`: a D8 cleanup is reported by no event, so a
+ * test reads the record itself. Weak, so it changes no lifetime.
+ */
+const forcedRewindsByExtension = new WeakMap<
+  object,
+  Map<string, ForcedRewind>
+>();
+
+/**
  * Non-stable testing-only hooks. **Do NOT import in production code.**
  *
  * The `__` prefix and individual member names are subject to change in any
@@ -3934,6 +4218,37 @@ export const __testHooks = {
   captureSession,
   countBackgroundMessages,
   findInFlightAssistantToolCalls,
+  planWithhold,
+  /**
+   * A copy of one extension instance's forced-rewind record (#107). The D8
+   * cleanup reports nothing an event can see, so the test reads it here.
+   * `extension` is the `ExtensionAPI` the factory was called with.
+   */
+  forcedRecord(
+    extension: unknown,
+    sessionId: string,
+  ): ForcedRewind | undefined {
+    const record = forcedRewindsByExtension
+      .get(extension as object)
+      ?.get(sessionId);
+    return record ? { ...record } : undefined;
+  },
+  /**
+   * Overwrite one extension instance's forced-rewind record (#107). A D8
+   * ending drops the plan's numbers, so the `!ended` read on the `context`
+   * handler can only be pinned alone by injecting a record that still carries
+   * them — the wire must ignore it either way.
+   */
+  setForcedRecord(
+    extension: unknown,
+    sessionId: string,
+    record: ForcedRewind | undefined,
+  ): void {
+    const records = forcedRewindsByExtension.get(extension as object);
+    if (!records) return;
+    if (record === undefined) records.delete(sessionId);
+    else records.set(sessionId, { ...record });
+  },
   /** Read-only view of captured-session ref count for reaping assertions. */
   sessionRefCount(): number {
     return sessionInstances.length;
