@@ -10138,6 +10138,36 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
+    it("an entry with no position is skipped, not a stop (#112)", async () => {
+      // A failed summary attempt hides its own results as well as its reply
+      // (#90), so the newest tool result can carry no position while older
+      // ones must still be reachable. Stopping there instead of skipping would
+      // draft nothing at all.
+      const f = await backgroundReady();
+      try {
+        const anchor = appendTurn(f.sm, "u1", "a1", 5_000);
+        f.pi.pi.setLabel(anchor.assistantId, "anchor:start");
+        f.sm.branchWithSummary(anchor.assistantId, "## Goal\ncollapsed work");
+        const b = addBatch(f.sm);
+        const plan = __testHooks.planWithhold(
+          f.sm,
+          b.overflow.id,
+          [b.overflow.id, b.r2],
+          TARGET,
+          undefined,
+          120_000,
+        );
+        assert.deepEqual(
+          targets(plan),
+          [b.r1, f.o3],
+          "r2 is hidden, so the walk skips it and keeps going",
+        );
+        assert.equal(plan.fits, true);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
     /**
      * #112. The walk used to end on an entry TYPE — a compaction or a
      * `branch_summary` — on the assumption that either is a context boundary.
@@ -10300,6 +10330,11 @@ Active anchors (root → leaf, % of 100k):
           projected.has(f.c1),
           false,
           "the batch the cut removed is not",
+        );
+        assert.equal(
+          projected.has(f.cutCallId),
+          false,
+          "nor is the assistant call that issued it",
         );
         const plan = planFor(f.sm, b.overflow.id, 120_000);
         assert.deepEqual(
