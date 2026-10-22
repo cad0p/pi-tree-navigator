@@ -349,6 +349,7 @@ export function buildContextMessages(
     getBranch?(): SessionEntry[];
   },
   pendingInstructionEntryId?: string | null,
+  usageOverride?: number,
 ): ReturnType<typeof sessionEntryToContextMessages> {
   let entries:
     | Array<{ sourceEntry: SessionEntry | null; messages: AgentMessage[] }>
@@ -392,6 +393,14 @@ export function buildContextMessages(
   // then falls back to an older exact usage or chars/3.5. Assistants before the
   // target, and after the edit, keep their exact usage.
   const stale = staleUsageFlags(entries);
+  // #107: pi's clamp reads the newest non-zero assistant usage, and stale ones
+  // are zeroed below — so the calibrated post-withhold size goes on the newest
+  // stale assistant, the usage it will actually read.
+  const overrideAt =
+    usageOverride === undefined
+      ? -1
+      : newestStaleAssistantIndex(entries, stale);
+  let at = 0;
   const messages = entries.flatMap((e, i) => {
     const text = e.sourceEntry ? outcomes.get(e.sourceEntry.id) : undefined;
     const withOutcome =
@@ -406,7 +415,15 @@ export function buildContextMessages(
                 }
               : message,
           );
-    return stale[i] ? withOutcome.map(dropStaleUsage) : withOutcome;
+    const start = at;
+    const projected = stale[i] ? withOutcome.map(dropStaleUsage) : withOutcome;
+    at += projected.length;
+    if (usageOverride === undefined || overrideAt < 0) return projected;
+    return projected.map((message, j) =>
+      start + j === overrideAt
+        ? withContextTokens(message, usageOverride)
+        : message,
+    );
   });
   return messages.filter((message) => message.role !== "system");
 }
@@ -456,6 +473,54 @@ function dropStaleUsage(message: AgentMessage): AgentMessage {
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 0,
+    },
+  };
+}
+
+/**
+ * Position of the newest assistant message from a stale entry (#107), or -1
+ * with none. That is the usage pi's output clamp would read after the stale
+ * ones are zeroed, so it carries the planner's calibrated post-withhold size.
+ */
+function newestStaleAssistantIndex(
+  entries: Array<{
+    sourceEntry: SessionEntry | null;
+    messages: AgentMessage[];
+  }>,
+  stale: readonly boolean[],
+): number {
+  let index = 0;
+  let found = -1;
+  for (const [i, e] of entries.entries()) {
+    for (const message of e.messages) {
+      if (stale[i] && message.role === "assistant" && message.usage) {
+        found = index;
+      }
+      index += 1;
+    }
+  }
+  return found;
+}
+
+/**
+ * `message` with the calibrated post-withhold size in its usage (#107), the
+ * number pi's clamp sizes the reply from. A clone: the session's own message
+ * objects are never mutated.
+ */
+function withContextTokens(
+  message: AgentMessage,
+  tokens: number,
+): AgentMessage {
+  if (message.role !== "assistant" || !message.usage) return message;
+  return {
+    ...message,
+    usage: {
+      ...message.usage,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: Math.max(0, Math.round(tokens)),
     },
   };
 }
@@ -846,6 +911,8 @@ interface WithholdPlan {
   drafts: SessionBoundaryDraft[];
   withheld: number;
   fits: boolean;
+  /** The calibrated post-withhold estimate (#107): pi's clamp basis. */
+  projectedTokens: number;
 }
 
 /**
@@ -979,7 +1046,12 @@ function planWithhold(
       replacement: { content },
     });
   }
-  return { drafts, withheld: drafts.length, fits: estimate() <= target };
+  return {
+    drafts,
+    withheld: drafts.length,
+    fits: estimate() <= target,
+    projectedTokens: Math.round(estimate()),
+  };
 }
 
 /** `context_edit` drafts hiding `ids` (a failed attempt, #90 O3). */
@@ -1658,7 +1730,7 @@ export default function (pi: ExtensionAPI) {
   // `agent_settled` deletes it.
   const forcedRewinds = new Map<
     string,
-    { attempts: number; ended?: boolean }
+    { attempts: number; ended?: boolean; projectedTokens?: number }
   >();
 
   // Where pi's settings are read from (#101, S4): the session's cwd, agent
@@ -1747,6 +1819,8 @@ export default function (pi: ExtensionAPI) {
   ): SessionBoundaryDraft[] {
     const record = forcedRewinds.get(sessionId) ?? { attempts: 0 };
     record.ended = true;
+    // #107: the override is only in force while the forced rewind is pending.
+    delete record.projectedTokens;
     forcedRewinds.set(sessionId, record);
     return [
       rewindMessageDraft(buildRewindCompactionFailedText(reason), {
@@ -1843,7 +1917,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
       pending.hiddenEntryIds.push(...failedIds);
-      forcedRewinds.set(sessionId, { attempts: 0 });
+      forcedRewinds.set(sessionId, {
+        attempts: 0,
+        projectedTokens: plan.projectedTokens,
+      });
       hintTracker.markSpent();
       return {
         drafts: [...hideDrafts(failedIds), ...plan.drafts],
@@ -1873,7 +1950,10 @@ export default function (pi: ExtensionAPI) {
       undefined,
       overflowRequestTokens(sm, failedEntryId),
     );
-    forcedRewinds.set(sessionId, { attempts: 0 });
+    forcedRewinds.set(sessionId, {
+      attempts: 0,
+      projectedTokens: plan.projectedTokens,
+    });
     hintTracker.markSpent();
     return {
       drafts: [
@@ -3261,7 +3341,17 @@ export default function (pi: ExtensionAPI) {
         instructionEntryId = undefined;
       }
     }
-    return { messages: buildContextMessages(sm, instructionEntryId) };
+    // #107: hand pi the planner's calibrated post-withhold size, so the forced
+    // summary turn is not sized from a usage measured before the withholding.
+    const forced =
+      sessionId === undefined ? undefined : forcedRewinds.get(sessionId);
+    return {
+      messages: buildContextMessages(
+        sm,
+        instructionEntryId,
+        forced?.projectedTokens,
+      ),
+    };
   });
 
   // Anchor mandate (#31): a before_agent_start append lands at the END of
@@ -3934,6 +4024,7 @@ export const __testHooks = {
   captureSession,
   countBackgroundMessages,
   findInFlightAssistantToolCalls,
+  planWithhold,
   /** Read-only view of captured-session ref count for reaping assertions. */
   sessionRefCount(): number {
     return sessionInstances.length;

@@ -9322,4 +9322,185 @@ Active anchors (root → leaf, % of 100k):
       cleanupConfigFixture(f.fixture);
     }
   });
+
+  /**
+   * #107: the forced summary turn's output room. The plan's calibrated
+   * post-withhold size rides on the newest stale assistant, because pi's
+   * `estimateContextTokens` anchors on the newest non-zero assistant usage.
+   */
+  describe("forced summary turn output room (#107)", () => {
+    function assistantUsages(
+      messages: Array<Record<string, unknown>>,
+    ): number[] {
+      return messages.flatMap((m) =>
+        m.role === "assistant"
+          ? [(m.usage as { totalTokens: number }).totalTokens]
+          : [],
+      );
+    }
+
+    function sessionAssistantUsages(sm: SessionManager): number[] {
+      return assistantUsages(sm.buildSessionContext().messages as never);
+    }
+
+    /**
+     * forcedSetup plus two turns before the overflow: T1's results are
+     * withheld, so A2 and A3 — produced after they existed, before the edits
+     * applied — are both stale, and A3 (99.3k) is the newest of them.
+     */
+    async function forcedStaleSetup() {
+      const f = await forcedSetup();
+      appendToolCallAssistant(
+        f.sm,
+        [{ id: "m1", name: "read", arguments: { path: "c" } }],
+        70_000,
+      );
+      appendToolResult(f.sm, "m1", "read", "mid");
+      appendToolCallAssistant(
+        f.sm,
+        [{ id: "t3", name: "read", arguments: { path: "d" } }],
+        99_300,
+      );
+      appendToolResult(f.sm, "t3", "read", BIG);
+      return f;
+    }
+
+    it("a forced record's projectedTokens lands on the newest stale assistant; older stale ones are zeroed", async () => {
+      const f = await forcedStaleSetup();
+      try {
+        const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
+        assert.equal(settle.continue, true);
+        const wire = fireContext(f.pi, f.ctx);
+        const usages = assistantUsages(wire);
+        assert.deepEqual(
+          usages.slice(0, 4),
+          [5_000, 20_000, 60_000, 0],
+          "exact usages stay; the older stale assistant is zeroed",
+        );
+        const override = usages[4];
+        assert.ok(
+          override > 0 && override < 99_300,
+          `the newest stale assistant carries the calibrated size, got ${override}`,
+        );
+        assert.ok(
+          override <= WINDOW - 16_384,
+          "the planner's size fits the withhold target",
+        );
+        assert.deepEqual(
+          sessionAssistantUsages(f.sm),
+          [5_000, 20_000, 60_000, 70_000, 99_300],
+          "the session's own messages are untouched",
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("pi-ai's real estimate on that output leaves real output room (window - estimate - 4096 >= 4k)", async () => {
+      const f = await forcedStaleSetup();
+      try {
+        await runErrorEnd(f, errorOverflow(f.sm).message);
+        const wire = fireContext(f.pi, f.ctx);
+        // What pi-ai sees: the agent loop's `convertToLlm` turns custom
+        // messages into user messages, and pi stamps every persisted message
+        // (the fixtures' user messages carry no timestamp).
+        const at = Date.now();
+        const llm = wire.map((m) => ({
+          ...(m.role === "custom"
+            ? {
+                role: "user",
+                content: [{ type: "text", text: m.content as string }],
+              }
+            : m),
+          timestamp: at,
+        }));
+        const estimate = await piAiEstimateContextTokens(llm);
+        assert.equal(estimate.usageTokens, assistantUsages(wire)[4]);
+        assert.equal(
+          estimate.tokens,
+          estimate.usageTokens + estimate.trailingTokens,
+        );
+        assert.ok(
+          estimate.usageTokens > 50_000,
+          `the clamp anchors on the calibrated size, got ${estimate.usageTokens}`,
+        );
+        assert.ok(
+          estimate.trailingTokens > 0,
+          "the forced message is trailing",
+        );
+        const budget = WINDOW - estimate.tokens - 4096;
+        assert.ok(
+          budget >= 4_096,
+          `the forced turn must have output room, got ${budget}`,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    /** One withheld target, two assistants produced between it and its edit. */
+    function staleContext() {
+      const { sm } = setup();
+      appendTurn(sm, "u1", "a1", 10);
+      const result = appendToolResult(sm, "c1", "read", "x".repeat(40_000));
+      appendTurn(sm, "u2", "a2", 90_000);
+      appendTurn(sm, "u3", "a3", 95_000);
+      sm.appendContextEdit(result, {
+        content: [{ type: "text", text: "[navigate_tree] Output withheld" }],
+      } as never);
+      return { sm, result };
+    }
+
+    it("no projectedTokens: every stale assistant stays zeroed", () => {
+      const { sm } = staleContext();
+      const projected = __testHooks.buildContextMessages(sm);
+      assert.deepEqual(assistantUsages(projected as never), [10, 0, 0]);
+      assert.deepEqual(sessionAssistantUsages(sm), [10, 90_000, 95_000]);
+    });
+
+    it("no context_edits: the projection is unchanged, even with an override", () => {
+      const { sm } = setup();
+      appendTurn(sm, "u1", "a1", 100);
+      appendTurn(sm, "u2", "a2", 90_000);
+      const plain = __testHooks.buildContextMessages(sm);
+      assert.deepEqual(
+        __testHooks.buildContextMessages(sm, undefined, 40_000),
+        plain,
+      );
+      assert.deepEqual(assistantUsages(plain as never), [100, 90_000]);
+    });
+
+    it("planWithhold's projectedTokens decreases as results are withheld and lands at or below the target", () => {
+      const { sm } = setup();
+      appendTurn(sm, "u1", "a1", 5_000);
+      appendToolCallAssistant(
+        sm,
+        [
+          { id: "r1", name: "read", arguments: { path: "a" } },
+          { id: "r2", name: "read", arguments: { path: "b" } },
+          { id: "r3", name: "read", arguments: { path: "c" } },
+        ],
+        60_000,
+      );
+      appendToolResult(sm, "r1", "read", BIG);
+      appendToolResult(sm, "r2", "read", BIG);
+      appendToolResult(sm, "r3", "read", BIG);
+      const errId = sm.appendMessage(
+        assistantMessage([], "length", 0) as never,
+      );
+      // 60k baseline + 36k of results: one result off (84k) fits a loose
+      // target, two (72k) a tight one.
+      const loose = __testHooks.planWithhold(sm, errId, [], 85_000);
+      const tight = __testHooks.planWithhold(sm, errId, [], 73_000);
+      assert.equal(loose.withheld, 1);
+      assert.equal(tight.withheld, 2);
+      assert.ok(loose.fits && tight.fits);
+      assert.ok(loose.projectedTokens <= 85_000);
+      assert.ok(tight.projectedTokens <= 73_000);
+      assert.ok(
+        tight.projectedTokens < loose.projectedTokens,
+        `more withheld, smaller projected: ${tight.projectedTokens} < ${loose.projectedTokens}`,
+      );
+    });
+  });
 });
