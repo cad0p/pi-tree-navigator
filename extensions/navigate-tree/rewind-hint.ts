@@ -54,14 +54,6 @@ export class RewindHintTracker {
   }
 }
 
-/** `12.3k` / `1.0M`; negative (an overrun window) clamps to `0.0k`. */
-function formatTokensK(tokens: number): string {
-  const t = Math.max(0, tokens);
-  // 999_950+ would round to `1000.0k`.
-  if (t >= 999_950) return `${(t / 1_000_000).toFixed(1)}M`;
-  return `${(t / 1000).toFixed(1)}k`;
-}
-
 /**
  * The agent-facing hint (#84). Dynamic trigger + ask, plus the active anchors
  * (`anchorTable`, pre-rendered by the caller with `formatAnchorTable`, #101
@@ -70,15 +62,18 @@ function formatTokensK(tokens: number): string {
  * static how-to (persist first; don't rewind while a decision is pending)
  * lives in the tool's `promptGuidelines`, per the 2026-09-13
  * guidance-placement rule.
+ *
+ * The copy carries the percentage only (#114): a printed "N tokens left"
+ * reads to the model as "I am running out of tokens" and it stalls instead
+ * of rewinding. The trigger still uses `tokensLeft` against the reserve;
+ * only the rendered message omits the count.
  */
 export function buildRewindHintText(
   percent: number,
-  tokensLeft: number,
-  reserve: number,
   contextWindow: number,
   anchorTable: string,
 ): string {
-  return `[${TOOL_NAME} hint] Context is at ${percent.toFixed(1)}% of ${formatWindow(contextWindow)} — ${formatTokensK(tokensLeft)} tokens left, within the ${formatTokensK(reserve)} reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\n${anchorTable}`;
+  return `[${TOOL_NAME} hint] Context is at ${percent.toFixed(1)}% of ${formatWindow(contextWindow)}. Persist what matters to files now, then rewind to the oldest appropriate anchor.\n${anchorTable}`;
 }
 
 /** The TUI-only warning shown when a crossing has no anchor to rewind to. */

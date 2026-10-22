@@ -3719,8 +3719,6 @@ export default function (pi: ExtensionAPI) {
     if (anchors.names.length > 0) {
       const text = buildRewindHintText(
         usage.percent,
-        tokensLeft,
-        reserve,
         usage.contextWindow,
         anchors.text,
       );

@@ -82,12 +82,10 @@ describe("buildRewindHintText", () => {
     assert.equal(
       buildRewindHintText(
         98.6,
-        1_400,
-        20_000,
         100_000,
         "Active anchors (root → leaf, % of 100k):\n  20.9%  start",
       ),
-      "[navigate_tree hint] Context is at 98.6% of 100k — 1.4k tokens left, within the 20.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 100k):\n  20.9%  start",
+      "[navigate_tree hint] Context is at 98.6% of 100k. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 100k):\n  20.9%  start",
     );
   });
 
@@ -95,67 +93,35 @@ describe("buildRewindHintText", () => {
     assert.equal(
       buildRewindHintText(
         95.2,
-        48_000,
-        50_000,
         1_000_000,
         "Active anchors (root → leaf, % of 1.0M):\n   4.1%  start\n  12.0%  context-gathered",
       ),
-      "[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   4.1%  start\n  12.0%  context-gathered",
+      "[navigate_tree hint] Context is at 95.2% of 1.0M. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   4.1%  start\n  12.0%  context-gathered",
     );
   });
 
-  it("renders tokens at or above 1M in M (the max reserve)", () => {
-    assert.match(
-      buildRewindHintText(50, 500_000, 1_000_000, 1_000_000, "'a' 1.0%"),
-      /— 500\.0k tokens left, within the 1\.0M reserve\./,
-    );
-    assert.match(
-      buildRewindHintText(10, 1_350_000, 1_000_000, 1_500_000, "'a' 1.0%"),
-      /— 1\.4M tokens left, within the 1\.0M reserve\./,
-    );
-    // Values that would round to `1000.0k` switch to M.
-    assert.match(
-      buildRewindHintText(5, 999_960, 999_950, 1_000_000, "'a' 1.0%"),
-      /— 1\.0M tokens left, within the 1\.0M reserve\./,
-    );
-    assert.match(
-      buildRewindHintText(5, 999_949, 999_949, 1_000_000, "'a' 1.0%"),
-      /— 999\.9k tokens left, within the 999\.9k reserve\./,
-    );
-  });
-
-  it("clamps an overrun window to 0.0k tokens left", () => {
-    assert.match(
-      buildRewindHintText(
-        170.1,
-        -70_100,
-        20_000,
-        100_000,
-        "Active anchors (root → leaf, % of 100k):\n  20.9%  start",
-      ),
-      /at 170\.1% of 100k — 0\.0k tokens left/,
-    );
+  it("never prints a tokens-left or reserve clause (#114)", () => {
+    const text = buildRewindHintText(99.9, 1_000_000, "'a' 1.0%");
+    assert.doesNotMatch(text, /tokens left/);
+    assert.doesNotMatch(text, /reserve/);
+    assert.doesNotMatch(text, /—/);
   });
 
   it("starts with the TOOL_NAME-derived header (rename-desync pin)", () => {
     assert.ok(
-      buildRewindHintText(
-        91.2,
-        88_000,
-        100_000,
-        1_000_000,
-        "'a' 1.0%",
-      ).startsWith(`[${TOOL_NAME} hint] `),
+      buildRewindHintText(91.2, 1_000_000, "'a' 1.0%").startsWith(
+        `[${TOOL_NAME} hint] `,
+      ),
     );
   });
 
   it("renders the percent with one decimal (toFixed(1))", () => {
     assert.match(
-      buildRewindHintText(90, 100_000, 100_000, 1_000_000, "'a' 1.0%"),
+      buildRewindHintText(90, 1_000_000, "'a' 1.0%"),
       /at 90\.0% of 1\.0M/,
     );
     assert.match(
-      buildRewindHintText(89.94, 100_600, 200_000, 1_000_000, "'a' 1.0%"),
+      buildRewindHintText(89.94, 1_000_000, "'a' 1.0%"),
       /at 89\.9%/,
     );
   });
