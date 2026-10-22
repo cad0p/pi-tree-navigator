@@ -9381,7 +9381,7 @@ Active anchors (root → leaf, % of 100k):
         const override = usages[4];
         assert.ok(
           override > 0 && override < 99_300,
-          `the newest stale assistant carries the calibrated size, got ${override}`,
+          `the planner's entry (\`overrideEntryId\`) carries the calibrated size, got ${override}`,
         );
         assert.ok(
           override <= WINDOW - 16_384,
@@ -9465,7 +9465,7 @@ Active anchors (root → leaf, % of 100k):
         assert.equal(usages.length, 4);
         assert.ok(
           usages[3] > 0 && usages[3] < 99_000,
-          `the newest usage carries the calibrated size, got ${usages[3]}`,
+          `the planner's entry — the newest usage, the F1 fallback — carries the calibrated size, got ${usages[3]}`,
         );
         const at = Date.now();
         const llm = wire.map((m) => ({
@@ -9591,6 +9591,81 @@ Active anchors (root → leaf, % of 100k):
         tight.projectedTokens < loose.projectedTokens,
         `more withheld, smaller projected: ${tight.projectedTokens} < ${loose.projectedTokens}`,
       );
+    });
+
+    /**
+     * The D8 scope. A forced rewind that ends with the final error hands pi no
+     * override: `compactionFailed` drops the plan's numbers from the record,
+     * and the read refuses an ended record. The two are redundant — either
+     * alone keeps the wire clean — so each is pinned: the record's contents
+     * here, and the wire, which fails if an ended record still holding the
+     * numbers is trusted.
+     */
+    it("a forced rewind ended by D8 hands no override and drops the plan's numbers", async () => {
+      const f = await forcedSetup();
+      try {
+        const sessionId = f.sm.getSessionId();
+        await runErrorEnd(f, errorOverflow(f.sm).message);
+        const planned = __testHooks.forcedRecord(f.pi.pi, sessionId);
+        assert.ok(planned, "the forced rewind is pending");
+        const { projectedTokens, overrideEntryId } = planned;
+        assert.ok(
+          projectedTokens !== undefined && overrideEntryId !== undefined,
+          `a pending record carries the plan's numbers: ${JSON.stringify(planned)}`,
+        );
+        const pending = assistantUsages(fireContext(f.pi, f.ctx));
+        assert.ok(
+          pending.includes(projectedTokens),
+          `the pending record's size is in force: ${pending.join()}`,
+        );
+        // S6: a second overflow ends the rewind with D8, in the same run.
+        const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
+        assert.equal(settle.continue, false);
+        const ended = __testHooks.forcedRecord(f.pi.pi, sessionId);
+        assert.equal(ended?.ended, true, "D8 marks the record ended");
+        assert.equal(
+          ended?.projectedTokens,
+          undefined,
+          "D8 drops the calibrated size from the record",
+        );
+        assert.equal(
+          ended?.overrideEntryId,
+          undefined,
+          "D8 drops the baseline entry from the record",
+        );
+        // No pending rewind either: the view is not frozen, and no assistant
+        // is re-sized from a plan the run already gave up on.
+        const sessionUsages = sessionAssistantUsages(f.sm);
+        const wire = assistantUsages(fireContext(f.pi, f.ctx));
+        assert.deepEqual(
+          wire,
+          assistantUsages(__testHooks.buildContextMessages(f.sm) as never),
+          "an ended record adds no override: each assistant keeps its own usage",
+        );
+        assert.ok(
+          !wire.includes(projectedTokens),
+          `no assistant carries the projected size: ${wire.join()}`,
+        );
+        assert.deepEqual(
+          sessionAssistantUsages(f.sm),
+          sessionUsages,
+          "the session's own messages are untouched",
+        );
+        const sent = f.pi.sendMessageCalls.length;
+        await fireAgentSettled(f.pi, f.ctx);
+        assert.equal(
+          __testHooks.forcedRecord(f.pi.pi, sessionId),
+          undefined,
+          "agent_settled clears the ended record",
+        );
+        assert.equal(
+          f.pi.sendMessageCalls.length,
+          sent,
+          "an ended record does not report itself a second time",
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
     });
   });
 });

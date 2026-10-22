@@ -1763,16 +1763,9 @@ export default function (pi: ExtensionAPI) {
   // lands. A final error (D8) inside a run marks it `ended` instead (the gate
   // lifts, no second forced rewind in the same run, no start anchor) and
   // `agent_settled` deletes it.
-  const forcedRewinds = new Map<
-    string,
-    {
-      attempts: number;
-      ended?: boolean;
-      projectedTokens?: number;
-      /** The entry the projected size replaces (#107). */
-      overrideEntryId?: string;
-    }
-  >();
+  const forcedRewinds = new Map<string, ForcedRewind>();
+  // Read by tests through `__testHooks.forcedRecord` (#107).
+  forcedRewindsByExtension.set(pi, forcedRewinds);
 
   // Where pi's settings are read from (#101, S4): the session's cwd, agent
   // dir and project trust, set at `session_start`. `null` = cannot tell.
@@ -3387,18 +3380,20 @@ export default function (pi: ExtensionAPI) {
     }
     // #107: hand pi the planner's calibrated post-withhold size, so the forced
     // summary turn is not sized from a usage measured before the withholding.
+    // An ended record (D8) is out of force whatever it still holds: the same
+    // run must not re-send the size it just gave up on.
     const forced =
       sessionId === undefined ? undefined : forcedRewinds.get(sessionId);
     return {
       messages: buildContextMessages(
         sm,
         instructionEntryId,
-        forced?.projectedTokens === undefined
-          ? undefined
-          : {
+        forced && !forced.ended && forced.projectedTokens !== undefined
+          ? {
               tokens: forced.projectedTokens,
               entryId: forced.overrideEntryId,
-            },
+            }
+          : undefined,
       ),
     };
   });
@@ -4030,6 +4025,29 @@ Operations (set \`action\`):
 }
 
 /**
+ * A forced rewind's record (#101, rewind-driven compaction): the attempts
+ * spent, whether a final error (D8) ended it, and the plan's calibrated
+ * post-withhold size with the entry it replaces (#107).
+ */
+interface ForcedRewind {
+  attempts: number;
+  ended?: boolean;
+  projectedTokens?: number;
+  /** The entry the projected size replaces (#107). */
+  overrideEntryId?: string;
+}
+
+/**
+ * The live `forcedRewinds` map of each extension instance, for
+ * `__testHooks.forcedRecord`: a D8 cleanup is reported by no event, so a
+ * test reads the record itself. Weak, so it changes no lifetime.
+ */
+const forcedRewindsByExtension = new WeakMap<
+  object,
+  Map<string, ForcedRewind>
+>();
+
+/**
  * Non-stable testing-only hooks. **Do NOT import in production code.**
  *
  * The `__` prefix and individual member names are subject to change in any
@@ -4074,6 +4092,20 @@ export const __testHooks = {
   countBackgroundMessages,
   findInFlightAssistantToolCalls,
   planWithhold,
+  /**
+   * A copy of one extension instance's forced-rewind record (#107). The D8
+   * cleanup reports nothing an event can see, so the test reads it here.
+   * `extension` is the `ExtensionAPI` the factory was called with.
+   */
+  forcedRecord(
+    extension: unknown,
+    sessionId: string,
+  ): ForcedRewind | undefined {
+    const record = forcedRewindsByExtension
+      .get(extension as object)
+      ?.get(sessionId);
+    return record ? { ...record } : undefined;
+  },
   /** Read-only view of captured-session ref count for reaping assertions. */
   sessionRefCount(): number {
     return sessionInstances.length;
