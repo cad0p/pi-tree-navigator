@@ -10329,7 +10329,6 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
-
     it("the fallback skips an aborted or errored assistant, like pi's usage predicate", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 5_000);
