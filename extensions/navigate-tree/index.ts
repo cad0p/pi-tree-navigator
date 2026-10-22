@@ -349,7 +349,7 @@ export function buildContextMessages(
     getBranch?(): SessionEntry[];
   },
   pendingInstructionEntryId?: string | null,
-  usageOverride?: number,
+  usageOverride?: { tokens: number; entryId?: string },
 ): ReturnType<typeof sessionEntryToContextMessages> {
   let entries:
     | Array<{ sourceEntry: SessionEntry | null; messages: AgentMessage[] }>
@@ -394,12 +394,15 @@ export function buildContextMessages(
   // target, and after the edit, keep their exact usage.
   const stale = staleUsageFlags(entries);
   // #107: pi's clamp reads the newest non-zero assistant usage, and stale ones
-  // are zeroed below — so the calibrated post-withhold size goes on the newest
-  // stale assistant, the usage it will actually read.
+  // are zeroed below — so the calibrated post-withhold size must land on the
+  // assistant whose usage is the plan's baseline: the planner's entry by id,
+  // NOT the newest stale one, which another extension's later `context_edit`
+  // can push the target onto (shrinking a usage that was exact).
+  const tokens = usageOverride?.tokens;
   const overrideAt =
-    usageOverride === undefined
+    tokens === undefined
       ? -1
-      : newestStaleAssistantIndex(entries, stale);
+      : overrideTargetIndex(entries, usageOverride?.entryId);
   let at = 0;
   const messages = entries.flatMap((e, i) => {
     const text = e.sourceEntry ? outcomes.get(e.sourceEntry.id) : undefined;
@@ -418,11 +421,9 @@ export function buildContextMessages(
     const start = at;
     const projected = stale[i] ? withOutcome.map(dropStaleUsage) : withOutcome;
     at += projected.length;
-    if (usageOverride === undefined || overrideAt < 0) return projected;
+    if (tokens === undefined || overrideAt < 0) return projected;
     return projected.map((message, j) =>
-      start + j === overrideAt
-        ? withContextTokens(message, usageOverride)
-        : message,
+      start + j === overrideAt ? withContextTokens(message, tokens) : message,
     );
   });
   return messages.filter((message) => message.role !== "system");
@@ -478,28 +479,50 @@ function dropStaleUsage(message: AgentMessage): AgentMessage {
 }
 
 /**
- * Position of the newest assistant message from a stale entry (#107), or -1
- * with none. That is the usage pi's output clamp would read after the stale
- * ones are zeroed, so it carries the planner's calibrated post-withhold size.
+ * The message index the calibrated size goes on (#107). The planner's entry
+ * id is the target: its newest assistant usage is the plan's baseline, so the
+ * override replaces exactly the number it was computed from. "Newest stale"
+ * would drift onto a later assistant that an unrelated `context_edit` made
+ * stale — shrinking a usage that was measured with the withheld content
+ * already gone.
+ *
+ * The entry is absent from the D11 frozen view (the request ends at the
+ * pending instruction, so the failed attempt that supplied the baseline was
+ * sliced off) — then the newest assistant usage in the view is the one pi's
+ * clamp will actually read, and it carries the calibrated size instead.
  */
-function newestStaleAssistantIndex(
+function overrideTargetIndex(
   entries: Array<{
     sourceEntry: SessionEntry | null;
     messages: AgentMessage[];
   }>,
-  stale: readonly boolean[],
+  entryId?: string,
 ): number {
   let index = 0;
-  let found = -1;
-  for (const [i, e] of entries.entries()) {
-    for (const message of e.messages) {
-      if (stale[i] && message.role === "assistant" && message.usage) {
-        found = index;
-      }
-      index += 1;
+  for (const e of entries) {
+    if (entryId !== undefined && e.sourceEntry?.id === entryId) {
+      const found = newestAssistantUsageIndex(e.messages, index);
+      if (found >= 0) return found;
     }
+    index += e.messages.length;
   }
-  return found;
+  return newestAssistantUsageIndex(entries.flatMap((e) => e.messages));
+}
+
+/**
+ * Index of the newest assistant message carrying a usage in `messages`,
+ * offset by `start`, or -1 with none (#107). Zeroed stale usages still count:
+ * the override is applied after them, and pi reads the newest one.
+ */
+function newestAssistantUsageIndex(
+  messages: readonly AgentMessage[],
+  start = 0,
+): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === "assistant" && message.usage) return start + i;
+  }
+  return -1;
 }
 
 /**
@@ -913,6 +936,11 @@ interface WithholdPlan {
   fits: boolean;
   /** The calibrated post-withhold estimate (#107): pi's clamp basis. */
   projectedTokens: number;
+  /**
+   * The entry whose assistant usage is that estimate's baseline (#107): the
+   * override must land on it by id, not on whatever is newest later.
+   */
+  overrideEntryId?: string;
 }
 
 /**
@@ -985,6 +1013,9 @@ function planWithhold(
   // The messages the estimate counts, and each entry's first position in them
   // (#101, walk fix): an entry outside this list is not in the context.
   const messages: AgentMessage[] = [];
+  // The entry that owns each message, so the baseline's owner can be recovered
+  // once the anchor is known (#107).
+  const owners: string[] = [];
   const positions = new Map<string, number>();
   for (const e of entries) {
     if (hidden.has(e.sourceEntry.id)) continue;
@@ -994,6 +1025,7 @@ function planWithhold(
         positions.set(e.sourceEntry.id, messages.length);
       }
       messages.push(m);
+      owners.push(e.sourceEntry.id);
     }
   }
   const anchor = newestUsageIndex(messages);
@@ -1051,6 +1083,9 @@ function planWithhold(
     withheld: drafts.length,
     fits: estimate() <= target,
     projectedTokens: Math.round(estimate()),
+    // The assistant whose real usage is the baseline the estimate was built
+    // from: the one the override must replace (#107).
+    overrideEntryId: anchor >= 0 ? owners[anchor] : undefined,
   };
 }
 
@@ -1730,7 +1765,13 @@ export default function (pi: ExtensionAPI) {
   // `agent_settled` deletes it.
   const forcedRewinds = new Map<
     string,
-    { attempts: number; ended?: boolean; projectedTokens?: number }
+    {
+      attempts: number;
+      ended?: boolean;
+      projectedTokens?: number;
+      /** The entry the projected size replaces (#107). */
+      overrideEntryId?: string;
+    }
   >();
 
   // Where pi's settings are read from (#101, S4): the session's cwd, agent
@@ -1821,6 +1862,7 @@ export default function (pi: ExtensionAPI) {
     record.ended = true;
     // #107: the override is only in force while the forced rewind is pending.
     delete record.projectedTokens;
+    delete record.overrideEntryId;
     forcedRewinds.set(sessionId, record);
     return [
       rewindMessageDraft(buildRewindCompactionFailedText(reason), {
@@ -1920,6 +1962,7 @@ export default function (pi: ExtensionAPI) {
       forcedRewinds.set(sessionId, {
         attempts: 0,
         projectedTokens: plan.projectedTokens,
+        overrideEntryId: plan.overrideEntryId,
       });
       hintTracker.markSpent();
       return {
@@ -1953,6 +1996,7 @@ export default function (pi: ExtensionAPI) {
     forcedRewinds.set(sessionId, {
       attempts: 0,
       projectedTokens: plan.projectedTokens,
+      overrideEntryId: plan.overrideEntryId,
     });
     hintTracker.markSpent();
     return {
@@ -3349,7 +3393,12 @@ export default function (pi: ExtensionAPI) {
       messages: buildContextMessages(
         sm,
         instructionEntryId,
-        forced?.projectedTokens,
+        forced?.projectedTokens === undefined
+          ? undefined
+          : {
+              tokens: forced.projectedTokens,
+              entryId: forced.overrideEntryId,
+            },
       ),
     };
   });

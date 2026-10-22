@@ -9325,7 +9325,8 @@ Active anchors (root → leaf, % of 100k):
 
   /**
    * #107: the forced summary turn's output room. The plan's calibrated
-   * post-withhold size rides on the newest stale assistant, because pi's
+   * post-withhold size rides on the assistant whose usage is the plan's
+   * baseline — the planner's entry, by id — because pi's
    * `estimateContextTokens` anchors on the newest non-zero assistant usage.
    */
   describe("forced summary turn output room (#107)", () => {
@@ -9365,7 +9366,7 @@ Active anchors (root → leaf, % of 100k):
       return f;
     }
 
-    it("a forced record's projectedTokens lands on the newest stale assistant; older stale ones are zeroed", async () => {
+    it("a forced record's projectedTokens lands on the planner's entry; older stale ones are zeroed", async () => {
       const f = await forcedStaleSetup();
       try {
         const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
@@ -9438,6 +9439,56 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
+    it("the D11 frozen view — no context_edit in the request — still gets it, with usable output room (F1)", async () => {
+      const f = await forcedSetup();
+      try {
+        // 99k: the rewind call's own usage overflows once the summary
+        // instruction is appended. Everything the plan can withhold (r1, r2)
+        // sits before it, so the plan's baseline is that usage.
+        await requestRewind(f, REWIND_ARGS, "tc-rewind", 99_000);
+        const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
+        assert.equal(settle.continue, true);
+        const wire = fireContext(f.pi, f.ctx);
+        assert.equal(
+          wire.at(-1)?.customType,
+          SUMMARY_REQUEST_CUSTOM_TYPE,
+          "the frozen request ends at its instruction",
+        );
+        const usages = assistantUsages(wire);
+        assert.deepEqual(usages.slice(0, 3), [5_000, 20_000, 60_000]);
+        // No stale flag in this view — its context_edits land after the
+        // instruction, so the slice drops them. The override must still land.
+        assert.ok(
+          usages.every((u) => u > 0),
+          `no assistant is zeroed in the frozen view: ${usages.join()}`,
+        );
+        assert.equal(usages.length, 4);
+        assert.ok(
+          usages[3] > 0 && usages[3] < 99_000,
+          `the newest usage carries the calibrated size, got ${usages[3]}`,
+        );
+        const at = Date.now();
+        const llm = wire.map((m) => ({
+          ...(m.role === "custom"
+            ? {
+                role: "user",
+                content: [{ type: "text", text: m.content as string }],
+              }
+            : m),
+          timestamp: at,
+        }));
+        const estimate = await piAiEstimateContextTokens(llm);
+        assert.equal(estimate.usageTokens, usages[3]);
+        const budget = WINDOW - estimate.tokens - 4096;
+        assert.ok(
+          budget >= 4_096,
+          `the re-sent summary must have output room, got ${budget}`,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
     /** One withheld target, two assistants produced between it and its edit. */
     function staleContext() {
       const { sm } = setup();
@@ -9458,22 +9509,55 @@ Active anchors (root → leaf, % of 100k):
       assert.deepEqual(sessionAssistantUsages(sm), [10, 90_000, 95_000]);
     });
 
-    it("no context_edits: the projection is unchanged, even with an override", () => {
+    it("no context_edits: an entry id outside the view falls back to the newest usage in it (F1)", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 100);
       appendTurn(sm, "u2", "a2", 90_000);
       const plain = __testHooks.buildContextMessages(sm);
-      assert.deepEqual(
-        __testHooks.buildContextMessages(sm, undefined, 40_000),
-        plain,
-      );
       assert.deepEqual(assistantUsages(plain as never), [100, 90_000]);
+      const overridden = __testHooks.buildContextMessages(sm, undefined, {
+        tokens: 40_000,
+        entryId: "not-in-this-view",
+      });
+      assert.deepEqual(assistantUsages(overridden as never), [100, 40_000]);
+    });
+
+    it("an override scoped to a later assistant does not move off the given entry (F2)", () => {
+      const { sm } = setup();
+      appendTurn(sm, "u1", "a1", 5_000);
+      const older = appendToolResult(sm, "old", "read", "y".repeat(4_000));
+      appendTurn(sm, "u2", "a2", 20_000);
+      const planner = appendTurn(sm, "u3", "a3", 60_000);
+      appendTurn(sm, "u4", "a4", 92_000);
+      // Another context-editing extension hides an older entry while the
+      // forced record is pending: a3 and the newer, exact a4 turn stale.
+      sm.appendContextEdit(older, null);
+      const plain = assistantUsages(
+        __testHooks.buildContextMessages(sm) as never,
+      );
+      assert.deepEqual(plain, [5_000, 0, 0, 0], "stale ones are zeroed");
+      const scoped = assistantUsages(
+        __testHooks.buildContextMessages(sm, undefined, {
+          tokens: 75_490,
+          entryId: planner.assistantId,
+        }) as never,
+      );
+      assert.deepEqual(
+        scoped,
+        [5_000, 0, 75_490, 0],
+        "the calibrated size stays on the planner's entry",
+      );
+      assert.deepEqual(
+        scoped.filter((_, i) => i !== 2),
+        plain.filter((_, i) => i !== 2),
+        "no other assistant's usage shrinks",
+      );
     });
 
     it("planWithhold's projectedTokens decreases as results are withheld and lands at or below the target", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 5_000);
-      appendToolCallAssistant(
+      const issuer = appendToolCallAssistant(
         sm,
         [
           { id: "r1", name: "read", arguments: { path: "a" } },
@@ -9497,6 +9581,12 @@ Active anchors (root → leaf, % of 100k):
       assert.ok(loose.fits && tight.fits);
       assert.ok(loose.projectedTokens <= 85_000);
       assert.ok(tight.projectedTokens <= 73_000);
+      assert.equal(
+        loose.overrideEntryId,
+        issuer.id,
+        "the 60k baseline's entry owns the override",
+      );
+      assert.equal(tight.overrideEntryId, issuer.id);
       assert.ok(
         tight.projectedTokens < loose.projectedTokens,
         `more withheld, smaller projected: ${tight.projectedTokens} < ${loose.projectedTokens}`,
