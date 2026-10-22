@@ -177,7 +177,7 @@ There is no limit after a landing: if the rewind freed too little and the contex
 
 **Reserve ordering.** The hint must fire before rewind-driven compaction's target: `rewindHintReserveTokens` ≥ the active model's `compaction.reserveTokens` (`compaction.modelOverrides["<provider>/<modelId>"].reserveTokens`, else `compaction.reserveTokens`, default 16384). Size it well above that to leave room for the persist and summary turns. With compaction off, session start warns per model when it is below (both still run), e.g.: `rewindHintReserveTokens (10000) is below pi's compaction.reserveTokens (16384) for anthropic/claude-haiku-5-5: rewind-driven compaction may fire before the hint, giving the model no time to prepare and persist what matters to files.`
 
-**Room for the forced turns.** The target `contextWindow − compaction.reserveTokens` must hold the forced message, the rewind call, the summary instruction and the summary, thinking included. At high thinking levels size pi's reserve per model, e.g.:
+**Room for the forced turns.** The target `contextWindow − compaction.reserveTokens` must hold the forced message, the rewind call, the summary instruction and the summary, thinking included. Since pi 1.4 this reserve no longer caps pi's own summarization output (pi uses the model's output limit), so it is only *our* recovery target — which is what it always was here: the summary itself is an in-band turn (#93), sized like any other reply. At high thinking levels size pi's reserve per model, e.g.:
 
 ```json
 { "compaction": { "modelOverrides": { "anthropic/claude-haiku-5-5": { "reserveTokens": 30000 } } } }
