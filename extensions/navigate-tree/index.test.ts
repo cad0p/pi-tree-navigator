@@ -9324,12 +9324,20 @@ Active anchors (root → leaf, % of 100k):
   });
 
   /**
-   * #107: the forced summary turn's output room. The plan's calibrated
-   * post-withhold size rides on the assistant whose usage is the plan's
-   * baseline — the planner's entry, by id — because pi's
-   * `estimateContextTokens` anchors on the newest non-zero assistant usage.
+   * #107: the forced summary turn's output room. What rides on the planner's
+   * baseline assistant is the post-withhold PREFIX, never the plan's whole
+   * total: pi's `estimateContextTokens` anchors on the newest non-zero
+   * assistant usage and then adds its own chars/3.5 estimate for every
+   * message after it, so a total there counts the withheld tail twice.
+   *
+   * Only a plan with a real count (`overflowRequestTokens`, #101 A) may replace a
+   * usage at all: without one the estimate is uncalibrated and #101's own
+   * fallback — zero the stale usages, let pi pick an older exact one — stays
+   * in charge.
    */
   describe("forced summary turn output room (#107)", () => {
+    const TARGET = WINDOW - 16_384;
+
     function assistantUsages(
       messages: Array<Record<string, unknown>>,
     ): number[] {
@@ -9342,6 +9350,60 @@ Active anchors (root → leaf, % of 100k):
 
     function sessionAssistantUsages(sm: SessionManager): number[] {
       return assistantUsages(sm.buildSessionContext().messages as never);
+    }
+
+    /**
+     * A `length` overflow carrying the provider's real count in the parts,
+     * as `overflowRequestTokens` reads it (#101, A) — the only shape that
+     * gives the planner a real number to work from (#107).
+     */
+    function lengthOverflow(sm: SessionManager, real: number) {
+      const message = {
+        ...assistantMessage([], "length", 0),
+        usage: { ...usageOf(real), input: real },
+      };
+      return { id: sm.appendMessage(message as never), message };
+    }
+
+    /**
+     * The plan the boundary will make, from the same state it sees. The
+     * failed attempt is already hidden (`failedIds`), which is what the
+     * boundary passes.
+     */
+    function planFor(
+      sm: SessionManager,
+      failedId: string,
+      real?: number,
+      instructionEntryId?: string,
+    ) {
+      return __testHooks.planWithhold(
+        sm,
+        failedId,
+        [failedId],
+        TARGET,
+        instructionEntryId,
+        real,
+      );
+    }
+
+    /**
+     * pi-ai's own estimate on the `context` wire, as the agent loop sends it:
+     * `convertToLlm` turns custom messages into user messages, and pi stamps
+     * every persisted message (the fixtures' user messages carry no
+     * timestamp).
+     */
+    async function piEstimate(wire: Array<Record<string, unknown>>) {
+      const at = Date.now();
+      const llm = wire.map((m) => ({
+        ...(m.role === "custom"
+          ? {
+              role: "user",
+              content: [{ type: "text", text: m.content as string }],
+            }
+          : m),
+        timestamp: at,
+      }));
+      return piAiEstimateContextTokens(llm);
     }
 
     /**
@@ -9366,11 +9428,13 @@ Active anchors (root → leaf, % of 100k):
       return f;
     }
 
-    it("a forced record's projectedTokens lands on the planner's entry; older stale ones are zeroed", async () => {
+    it("the prefix lands on the planner's entry; older stale ones are zeroed", async () => {
       const f = await forcedStaleSetup();
       try {
-        const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
-        assert.equal(settle.continue, true);
+        const overflow = lengthOverflow(f.sm, 111_000);
+        const plan = planFor(f.sm, overflow.id, 111_000);
+        const { turn } = await runErrorEnd(f, overflow.message);
+        assert.equal(turn.continue, true, "the forced rewind starts");
         const wire = fireContext(f.pi, f.ctx);
         const usages = assistantUsages(wire);
         assert.deepEqual(
@@ -9378,14 +9442,22 @@ Active anchors (root → leaf, % of 100k):
           [5_000, 20_000, 60_000, 0],
           "exact usages stay; the older stale assistant is zeroed",
         );
-        const override = usages[4];
         assert.ok(
-          override > 0 && override < 99_300,
-          `the planner's entry (\`overrideEntryId\`) carries the calibrated size, got ${override}`,
+          plan.baselineTokens !== undefined && plan.estimateTokens > 0,
+          "a real count yields both plan numbers",
         );
         assert.ok(
-          override <= WINDOW - 16_384,
-          "the planner's size fits the withhold target",
+          plan.baselineTokens < plan.estimateTokens,
+          "the prefix is not the whole post-withhold total",
+        );
+        assert.equal(
+          usages[4],
+          plan.baselineTokens,
+          "the planner's entry (`overrideEntryId`) carries the prefix",
+        );
+        assert.ok(
+          usages[4] > 0 && usages[4] < 99_300,
+          `the prefix is below the stale usage it replaces, got ${usages[4]}`,
         );
         assert.deepEqual(
           sessionAssistantUsages(f.sm),
@@ -9397,42 +9469,137 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
-    it("pi-ai's real estimate on that output leaves real output room (window - estimate - 4096 >= 4k)", async () => {
+    it("pi-ai's final estimate lands on the plan's total, leaving the intended room", async () => {
       const f = await forcedStaleSetup();
       try {
-        await runErrorEnd(f, errorOverflow(f.sm).message);
+        const overflow = lengthOverflow(f.sm, 111_000);
+        const plan = planFor(f.sm, overflow.id, 111_000);
+        await runErrorEnd(f, overflow.message);
         const wire = fireContext(f.pi, f.ctx);
-        // What pi-ai sees: the agent loop's `convertToLlm` turns custom
-        // messages into user messages, and pi stamps every persisted message
-        // (the fixtures' user messages carry no timestamp).
-        const at = Date.now();
-        const llm = wire.map((m) => ({
-          ...(m.role === "custom"
-            ? {
-                role: "user",
-                content: [{ type: "text", text: m.content as string }],
-              }
-            : m),
-          timestamp: at,
-        }));
-        const estimate = await piAiEstimateContextTokens(llm);
-        assert.equal(estimate.usageTokens, assistantUsages(wire)[4]);
+        const estimate = await piEstimate(wire);
+        assert.equal(
+          estimate.usageTokens,
+          plan.baselineTokens,
+          "the wire carries the prefix",
+        );
         assert.equal(
           estimate.tokens,
           estimate.usageTokens + estimate.trailingTokens,
         );
         assert.ok(
-          estimate.usageTokens > 50_000,
-          `the clamp anchors on the calibrated size, got ${estimate.usageTokens}`,
-        );
-        assert.ok(
           estimate.trailingTokens > 0,
-          "the forced message is trailing",
+          "pi re-adds the messages after the baseline itself",
+        );
+        // The double count is gone: prefix + pi's own tail is the plan's own
+        // total, up to the chars/3.5-vs-chars/4 gap and the forced message
+        // (which the plan ran before).
+        const delta = Math.abs(estimate.tokens - plan.estimateTokens);
+        assert.ok(
+          delta <= plan.estimateTokens * 0.02,
+          `pi's final estimate ${estimate.tokens} lands on the planner's ${plan.estimateTokens} (delta ${delta})`,
         );
         const budget = WINDOW - estimate.tokens - 4096;
         assert.ok(
           budget >= 4_096,
           `the forced turn must have output room, got ${budget}`,
+        );
+        assert.ok(
+          budget <= WINDOW - plan.estimateTokens - 4096,
+          `never more room than the planner fitted: ${budget} <= ${WINDOW - plan.estimateTokens - 4096}`,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("a big message the walk cannot withhold no longer costs the output room (double count)", async () => {
+      // The pi-api finding: a 80k-char user message after the newest usage is
+      // not a tool result, so the walk cannot touch it; it has to come off the
+      // *baseline* instead (r1, r2 = 12k each are before A3's 84k usage).
+      const f = await forcedSetup();
+      try {
+        appendTurn(f.sm, "u3", "a3", 84_000);
+        f.sm.appendMessage({
+          role: "user",
+          content: [{ type: "text", text: "p".repeat(80_000) }],
+        } as never);
+        const overflow = lengthOverflow(f.sm, 90_000);
+        const plan = planFor(f.sm, overflow.id, 90_000);
+        assert.equal(
+          plan.withheld,
+          2,
+          "both results go, so the walk does everything it can",
+        );
+        assert.ok(plan.fits, "the plan fits the withhold target");
+        assert.ok(
+          plan.baselineTokens !== undefined && plan.baselineTokens < 61_000,
+          `both results come off the prefix, got ${plan.baselineTokens}`,
+        );
+        const { turn } = await runErrorEnd(f, overflow.message);
+        assert.equal(turn.continue, true, "the forced rewind starts");
+        const wire = fireContext(f.pi, f.ctx);
+        const usages = assistantUsages(wire);
+        assert.equal(
+          usages.at(-1),
+          plan.baselineTokens,
+          "the wire carries the prefix, not the plan's total",
+        );
+        assert.ok(
+          (usages.at(-1) ?? 0) < 84_000,
+          "and not the stale 84k usage it replaces",
+        );
+        const estimate = await piEstimate(wire);
+        assert.equal(estimate.usageTokens, plan.baselineTokens);
+        const budget = WINDOW - estimate.tokens - 4096;
+        const intended = WINDOW - plan.estimateTokens - 4096;
+        assert.ok(
+          budget > 1,
+          `the forced turn must not be starved, got ${budget}`,
+        );
+        assert.ok(budget >= 4_096, `a workable output budget, got ${budget}`);
+        assert.ok(
+          budget <= intended,
+          `pi's chars/3.5 tail never buys more room than the planner fitted: ${budget} <= ${intended}`,
+        );
+        assert.ok(
+          intended - budget < 4_096,
+          `the intended room (${intended}) less pi's tail gap, got ${budget}`,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("no real count: the record stores no override and #101's zeroing stays", async () => {
+      // The plan's fallback item: an explicit-error overflow carries no
+      // provider count, so the plan's estimate is uncalibrated and must not
+      // replace a usage — the wire is #101's projection, byte for byte.
+      const f = await forcedStaleSetup();
+      try {
+        const err = errorOverflow(f.sm);
+        const plan = planFor(f.sm, err.id);
+        assert.equal(
+          plan.baselineTokens,
+          undefined,
+          "no real count, no prefix",
+        );
+        assert.equal(plan.overrideEntryId, undefined);
+        const { settle } = await runErrorEnd(f, err.message);
+        assert.equal(settle.continue, true);
+        const record = __testHooks.forcedRecord(f.pi.pi, f.sm.getSessionId());
+        assert.ok(record && !record.ended, "the forced rewind is pending");
+        assert.equal(record.baselineTokens, undefined);
+        assert.equal(record.overrideEntryId, undefined);
+        const wire = assistantUsages(fireContext(f.pi, f.ctx));
+        assert.deepEqual(
+          wire,
+          [5_000, 20_000, 60_000, 0, 0],
+          "the stale assistants stay zeroed: no chars-based number is written",
+        );
+        assert.deepEqual(
+          wire,
+          assistantUsages(__testHooks.buildContextMessages(f.sm) as never),
+          "the forced record changes nothing on the wire",
         );
       } finally {
         cleanupConfigFixture(f.fixture);
@@ -9446,8 +9613,9 @@ Active anchors (root → leaf, % of 100k):
         // instruction is appended. Everything the plan can withhold (r1, r2)
         // sits before it, so the plan's baseline is that usage.
         await requestRewind(f, REWIND_ARGS, "tc-rewind", 99_000);
-        const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
-        assert.equal(settle.continue, true);
+        const overflow = lengthOverflow(f.sm, 99_000);
+        const { turn } = await runErrorEnd(f, overflow.message);
+        assert.equal(turn.continue, true, "the frozen request is re-sent");
         const wire = fireContext(f.pi, f.ctx);
         assert.equal(
           wire.at(-1)?.customType,
@@ -9465,19 +9633,9 @@ Active anchors (root → leaf, % of 100k):
         assert.equal(usages.length, 4);
         assert.ok(
           usages[3] > 0 && usages[3] < 99_000,
-          `the planner's entry — the newest usage, the F1 fallback — carries the calibrated size, got ${usages[3]}`,
+          `the planner's entry — the newest usage, the F1 fallback — carries the prefix, got ${usages[3]}`,
         );
-        const at = Date.now();
-        const llm = wire.map((m) => ({
-          ...(m.role === "custom"
-            ? {
-                role: "user",
-                content: [{ type: "text", text: m.content as string }],
-              }
-            : m),
-          timestamp: at,
-        }));
-        const estimate = await piAiEstimateContextTokens(llm);
+        const estimate = await piEstimate(wire);
         assert.equal(estimate.usageTokens, usages[3]);
         const budget = WINDOW - estimate.tokens - 4096;
         assert.ok(
@@ -9502,7 +9660,7 @@ Active anchors (root → leaf, % of 100k):
       return { sm, result };
     }
 
-    it("no projectedTokens: every stale assistant stays zeroed", () => {
+    it("no override: every stale assistant stays zeroed", () => {
       const { sm } = staleContext();
       const projected = __testHooks.buildContextMessages(sm);
       assert.deepEqual(assistantUsages(projected as never), [10, 0, 0]);
@@ -9545,7 +9703,7 @@ Active anchors (root → leaf, % of 100k):
       assert.deepEqual(
         scoped,
         [5_000, 0, 75_490, 0],
-        "the calibrated size stays on the planner's entry",
+        "the prefix stays on the planner's entry",
       );
       assert.deepEqual(
         scoped.filter((_, i) => i !== 2),
@@ -9554,7 +9712,7 @@ Active anchors (root → leaf, % of 100k):
       );
     });
 
-    it("planWithhold's projectedTokens decreases as results are withheld and lands at or below the target", () => {
+    it("planWithhold's estimate decreases as results are withheld; only a real count yields a prefix", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 5_000);
       const issuer = appendToolCallAssistant(
@@ -9579,17 +9737,38 @@ Active anchors (root → leaf, % of 100k):
       assert.equal(loose.withheld, 1);
       assert.equal(tight.withheld, 2);
       assert.ok(loose.fits && tight.fits);
-      assert.ok(loose.projectedTokens <= 85_000);
-      assert.ok(tight.projectedTokens <= 73_000);
+      assert.ok(loose.estimateTokens <= 85_000);
+      assert.ok(tight.estimateTokens <= 73_000);
+      assert.ok(
+        tight.estimateTokens < loose.estimateTokens,
+        `more withheld, smaller estimate: ${tight.estimateTokens} < ${loose.estimateTokens}`,
+      );
+      // No real count: no prefix, no override target — #101's zeroing stays.
+      assert.equal(loose.baselineTokens, undefined);
+      assert.equal(loose.overrideEntryId, undefined);
+      // With the overflowed request's real count the prefix is the baseline
+      // less the withheld savings, and it stays below the plan's total.
+      const looseReal = __testHooks.planWithhold(
+        sm,
+        errId,
+        [],
+        85_000,
+        undefined,
+        84_000,
+      );
       assert.equal(
-        loose.overrideEntryId,
+        looseReal.overrideEntryId,
         issuer.id,
         "the 60k baseline's entry owns the override",
       );
-      assert.equal(tight.overrideEntryId, issuer.id);
+      assert.equal(
+        looseReal.baselineTokens,
+        60_000,
+        "no saving landed above the baseline",
+      );
       assert.ok(
-        tight.projectedTokens < loose.projectedTokens,
-        `more withheld, smaller projected: ${tight.projectedTokens} < ${loose.projectedTokens}`,
+        (looseReal.baselineTokens ?? 0) < looseReal.estimateTokens,
+        "the prefix is not the plan's total",
       );
     });
 
@@ -9602,21 +9781,22 @@ Active anchors (root → leaf, % of 100k):
      * numbers is trusted.
      */
     it("a forced rewind ended by D8 hands no override and drops the plan's numbers", async () => {
-      const f = await forcedSetup();
+      const f = await forcedStaleSetup();
       try {
         const sessionId = f.sm.getSessionId();
-        await runErrorEnd(f, errorOverflow(f.sm).message);
+        const overflow = lengthOverflow(f.sm, 111_000);
+        await runErrorEnd(f, overflow.message);
         const planned = __testHooks.forcedRecord(f.pi.pi, sessionId);
         assert.ok(planned, "the forced rewind is pending");
-        const { projectedTokens, overrideEntryId } = planned;
+        const { baselineTokens, overrideEntryId } = planned;
         assert.ok(
-          projectedTokens !== undefined && overrideEntryId !== undefined,
+          baselineTokens !== undefined && overrideEntryId !== undefined,
           `a pending record carries the plan's numbers: ${JSON.stringify(planned)}`,
         );
         const pending = assistantUsages(fireContext(f.pi, f.ctx));
         assert.ok(
-          pending.includes(projectedTokens),
-          `the pending record's size is in force: ${pending.join()}`,
+          pending.includes(baselineTokens),
+          `the pending record's prefix is in force: ${pending.join()}`,
         );
         // S6: a second overflow ends the rewind with D8, in the same run.
         const { settle } = await runErrorEnd(f, errorOverflow(f.sm).message);
@@ -9624,9 +9804,9 @@ Active anchors (root → leaf, % of 100k):
         const ended = __testHooks.forcedRecord(f.pi.pi, sessionId);
         assert.equal(ended?.ended, true, "D8 marks the record ended");
         assert.equal(
-          ended?.projectedTokens,
+          ended?.baselineTokens,
           undefined,
-          "D8 drops the calibrated size from the record",
+          "D8 drops the prefix from the record",
         );
         assert.equal(
           ended?.overrideEntryId,
@@ -9643,8 +9823,8 @@ Active anchors (root → leaf, % of 100k):
           "an ended record adds no override: each assistant keeps its own usage",
         );
         assert.ok(
-          !wire.includes(projectedTokens),
-          `no assistant carries the projected size: ${wire.join()}`,
+          !wire.includes(baselineTokens),
+          `no assistant carries the prefix: ${wire.join()}`,
         );
         assert.deepEqual(
           sessionAssistantUsages(f.sm),

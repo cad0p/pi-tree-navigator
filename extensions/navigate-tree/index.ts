@@ -351,6 +351,10 @@ export function buildContextMessages(
   pendingInstructionEntryId?: string | null,
   usageOverride?: { tokens: number; entryId?: string },
 ): ReturnType<typeof sessionEntryToContextMessages> {
+  // `usageOverride.tokens` is a whole-context PREFIX, not a total (#107):
+  // pi's `estimateContextTokens` adds its own char estimate for every
+  // message after the assistant that carries the usage, so handing it a
+  // total would count the tail twice and clamp `max_tokens` towards 0.
   let entries:
     | Array<{ sourceEntry: SessionEntry | null; messages: AgentMessage[] }>
     | undefined;
@@ -394,10 +398,12 @@ export function buildContextMessages(
   // target, and after the edit, keep their exact usage.
   const stale = staleUsageFlags(entries);
   // #107: pi's clamp reads the newest non-zero assistant usage, and stale ones
-  // are zeroed below — so the calibrated post-withhold size must land on the
-  // assistant whose usage is the plan's baseline: the planner's entry by id,
-  // NOT the newest stale one, which another extension's later `context_edit`
-  // can push the target onto (shrinking a usage that was exact).
+  // are zeroed below — so the post-withhold PREFIX must land on the assistant
+  // whose usage is the plan's baseline: the planner's entry by id, NOT the
+  // newest stale one, which another extension's later `context_edit` can push
+  // the target onto (shrinking a usage that was exact). The prefix alone:
+  // pi's `estimateContextTokens` re-adds every message after this assistant
+  // (chars/3.5), so the plan's total would count the tail twice.
   const tokens = usageOverride?.tokens;
   const overrideAt =
     tokens === undefined
@@ -526,9 +532,9 @@ function newestAssistantUsageIndex(
 }
 
 /**
- * `message` with the calibrated post-withhold size in its usage (#107), the
- * number pi's clamp sizes the reply from. A clone: the session's own message
- * objects are never mutated.
+ * `message` with the post-withhold prefix in its usage (#107) — the prefix
+ * only, because pi's clamp adds the messages after it on its own. A clone:
+ * the session's own message objects are never mutated.
  */
 function withContextTokens(
   message: AgentMessage,
@@ -934,11 +940,30 @@ interface WithholdPlan {
   drafts: SessionBoundaryDraft[];
   withheld: number;
   fits: boolean;
-  /** The calibrated post-withhold estimate (#107): pi's clamp basis. */
-  projectedTokens: number;
   /**
-   * The entry whose assistant usage is that estimate's baseline (#107): the
-   * override must land on it by id, not on whatever is newest later.
+   * The plan's whole post-withhold estimate, the basis of `fits` (#101, A).
+   * **Never write this into a usage**: pi's `estimateContextTokens` adds its
+   * own char estimate for every message after the assistant carrying the
+   * usage, so a whole-context total would count the tail twice (#107).
+   */
+  estimateTokens: number;
+  /**
+   * The post-withhold PREFIX (#107) — `estimateTokens` minus the tail, i.e.
+   * the plan's baseline usage less the unscaled savings of the results
+   * withheld before that assistant. This is the only plan number a usage may
+   * carry: pi re-adds the messages after the baseline itself, so its total
+   * lands on `estimateTokens` instead of overshooting by the whole tail.
+   *
+   * `undefined` when the plan had no real count (`realTokens`, #101 A): the
+   * estimate is then uncalibrated, and #101's own fallback — zero the stale
+   * usages and let pi pick an older exact one — is better than a chars-based
+   * prefix.
+   */
+  baselineTokens?: number;
+  /**
+   * The entry whose assistant usage is that prefix (#107): the override must
+   * land on it by id, not on whatever is newest later. `undefined` with
+   * `baselineTokens`.
    */
   overrideEntryId?: string;
 }
@@ -986,6 +1011,11 @@ function overflowRequestTokens(
  * (real − baseline) / tail, clamped to at least 1; the planner then fits
  * `baseline + ratio × tail` under `target`. Without `realTokens` the
  * ratio is 1.
+ *
+ * #107: the plan reports that total (`estimateTokens`, the fit basis) and the
+ * post-savings `baseline` (`baselineTokens`, the prefix the tail is added
+ * to). Only the prefix may reach a usage: pi's clamp adds the messages after
+ * the baseline again.
  */
 function planWithhold(
   sm: SessionManager,
@@ -1078,14 +1108,21 @@ function planWithhold(
       replacement: { content },
     });
   }
+  // #107: the prefix, floored: a zero or negative prefix is not a usable
+  // usage (pi skips a zero baseline and would fall back to an older one).
+  const prefix = Math.round(baseline);
+  const overridable = realTokens !== undefined && prefix > 0 && anchor >= 0;
   return {
     drafts,
     withheld: drafts.length,
     fits: estimate() <= target,
-    projectedTokens: Math.round(estimate()),
+    estimateTokens: Math.round(estimate()),
+    // Only a plan with a real count overrides the wire: without one, #101's
+    // zeroing and pi's own fallback stay in charge (the plan's fallback item).
+    baselineTokens: overridable ? prefix : undefined,
     // The assistant whose real usage is the baseline the estimate was built
     // from: the one the override must replace (#107).
-    overrideEntryId: anchor >= 0 ? owners[anchor] : undefined,
+    overrideEntryId: overridable ? owners[anchor] : undefined,
   };
 }
 
@@ -1854,7 +1891,7 @@ export default function (pi: ExtensionAPI) {
     const record = forcedRewinds.get(sessionId) ?? { attempts: 0 };
     record.ended = true;
     // #107: the override is only in force while the forced rewind is pending.
-    delete record.projectedTokens;
+    delete record.baselineTokens;
     delete record.overrideEntryId;
     forcedRewinds.set(sessionId, record);
     return [
@@ -1954,7 +1991,7 @@ export default function (pi: ExtensionAPI) {
       pending.hiddenEntryIds.push(...failedIds);
       forcedRewinds.set(sessionId, {
         attempts: 0,
-        projectedTokens: plan.projectedTokens,
+        baselineTokens: plan.baselineTokens,
         overrideEntryId: plan.overrideEntryId,
       });
       hintTracker.markSpent();
@@ -1988,7 +2025,7 @@ export default function (pi: ExtensionAPI) {
     );
     forcedRewinds.set(sessionId, {
       attempts: 0,
-      projectedTokens: plan.projectedTokens,
+      baselineTokens: plan.baselineTokens,
       overrideEntryId: plan.overrideEntryId,
     });
     hintTracker.markSpent();
@@ -3378,19 +3415,23 @@ export default function (pi: ExtensionAPI) {
         instructionEntryId = undefined;
       }
     }
-    // #107: hand pi the planner's calibrated post-withhold size, so the forced
-    // summary turn is not sized from a usage measured before the withholding.
+    // #107: hand pi the planner's post-withhold PREFIX, so the forced summary
+    // turn is not sized from a usage measured before the withholding. The
+    // prefix, never the plan's total: pi's own `estimateContextTokens` adds a
+    // char estimate for every message after the assistant carrying the usage,
+    // so a whole-context total here counts the withheld tail twice and starves
+    // the turn it was meant to rescue.
     // An ended record (D8) is out of force whatever it still holds: the same
-    // run must not re-send the size it just gave up on.
+    // run must not re-send the number it just gave up on.
     const forced =
       sessionId === undefined ? undefined : forcedRewinds.get(sessionId);
     return {
       messages: buildContextMessages(
         sm,
         instructionEntryId,
-        forced && !forced.ended && forced.projectedTokens !== undefined
+        forced && !forced.ended && forced.baselineTokens !== undefined
           ? {
-              tokens: forced.projectedTokens,
+              tokens: forced.baselineTokens,
               entryId: forced.overrideEntryId,
             }
           : undefined,
@@ -4026,14 +4067,19 @@ Operations (set \`action\`):
 
 /**
  * A forced rewind's record (#101, rewind-driven compaction): the attempts
- * spent, whether a final error (D8) ended it, and the plan's calibrated
- * post-withhold size with the entry it replaces (#107).
+ * spent, whether a final error (D8) ended it, and the plan's post-withhold
+ * prefix with the entry it replaces (#107).
  */
 interface ForcedRewind {
   attempts: number;
   ended?: boolean;
-  projectedTokens?: number;
-  /** The entry the projected size replaces (#107). */
+  /**
+   * The plan's post-withhold PREFIX (#107) — never its whole-context total:
+   * pi adds every message after the baseline assistant again. Absent when
+   * the plan had no real count, which leaves #101's zeroing in charge.
+   */
+  baselineTokens?: number;
+  /** The entry the prefix replaces (#107). */
   overrideEntryId?: string;
 }
 
