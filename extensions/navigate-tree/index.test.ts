@@ -10138,20 +10138,26 @@ Active anchors (root → leaf, % of 100k):
     });
 
     /**
-     * #112. The walk used to stop at a `branch_summary`, on the assumption that
-     * it is a context boundary. It is not: pi's `buildContextEntries` cuts only
-     * at a `compaction`, so the anchor's kept background above a summary is
-     * still sent and still counted. A live 400k session died on this: five
-     * branch summaries, 153k tokens of tool results behind the newest one, and
-     * only 11k still reachable above it against a 26k shortfall.
+     * #112. The walk used to end on an entry TYPE — a compaction or a
+     * `branch_summary` — on the assumption that either is a context boundary.
+     * Neither is a reliable boundary, and the projection already is one:
      *
-     * Shape here: three big results BEFORE the anchor (the kept background),
-     * a `branch_summary` forked from the anchor, then a batch whose own two
-     * results are not enough. 90k baseline + a 24k tail (chars/4) against an
-     * 83 616 target: both fresh results go, the plan still needs ~6k, and only
-     * the background can give it.
+     * - a `branch_summary` is an ordinary message on the path, so the anchor's
+     *   kept background above it is still sent and still counted;
+     * - a `compaction` CUTS with `firstKeptEntryId`, which sits ABOVE the
+     *   compaction entry, so the kept range is projected too; pi also cuts at a
+     *   tool-call assistant while keeping that call's results.
+     *
+     * A live 400k session died on the first: five branch summaries put 153k
+     * tokens of tool results behind the newest one, and the 11k still reachable
+     * above it could not free the 26k the plan needed.
+     *
+     * Shapes here: four big results as background (o0 cut by the compaction
+     * case, o1..o3 kept), then a boundary, then a batch whose own two results
+     * are not enough — 90k baseline + a 24k tail (chars/4) against an 83 616
+     * target, so the plan needs one background result after both fresh ones.
      */
-    async function backgroundAcrossSummary(boundary: "summary" | "compaction") {
+    async function backgroundReady() {
       const fixture = makeConfigFixture();
       writeGlobalConfig(
         fixture,
@@ -10165,24 +10171,22 @@ Active anchors (root → leaf, % of 100k):
       appendToolCallAssistant(
         sm,
         [
+          { id: "o0", name: "read" },
           { id: "o1", name: "read" },
           { id: "o2", name: "read" },
           { id: "o3", name: "read" },
         ],
         5_000,
       );
+      const o0 = appendToolResult(sm, "o0", "read", BIG);
       const o1 = appendToolResult(sm, "o1", "read", BIG);
       const o2 = appendToolResult(sm, "o2", "read", BIG);
       const o3 = appendToolResult(sm, "o3", "read", BIG);
-      const anchor = appendTurn(sm, "u1", "a1", 5_000);
-      pi.pi.setLabel(anchor.assistantId, "anchor:start");
-      if (boundary === "summary") {
-        sm.branchWithSummary(anchor.assistantId, "## Goal\ncollapsed work");
-      } else {
-        // A compaction cuts the projection at `firstKeptEntryId`, which is
-        // what makes the background unreachable rather than skipped.
-        sm.appendCompaction("compacted", anchor.assistantId, 1_000);
-      }
+      return { fixture, sm, pi, ctx, o0, o1, o2, o3 };
+    }
+
+    /** The post-boundary work plus the batch that overflows. */
+    function addBatch(sm: SessionManager) {
       appendTurn(sm, "u2", "a2", 20_000);
       const issuer = appendToolCallAssistant(
         sm,
@@ -10195,36 +10199,31 @@ Active anchors (root → leaf, % of 100k):
       const r1 = appendToolResult(sm, "r1", "read", BIG);
       const r2 = appendToolResult(sm, "r2", "read", BIG);
       const overflow = lengthOverflow(sm, 120_000);
-      return {
-        fixture,
-        sm,
-        pi,
-        ctx,
-        issuerId: issuer.id,
-        r1,
-        r2,
-        o1,
-        o2,
-        o3,
-        overflow,
-      };
+      return { issuerId: issuer.id, r1, r2, overflow };
     }
 
+    const targets = (plan: ReturnType<typeof planFor>) =>
+      plan.drafts.map((d) => (d.type === "context_edit" ? d.targetId : ""));
+
     it("the walk crosses a branch_summary and withholds the kept background (#112)", async () => {
-      const f = await backgroundAcrossSummary("summary");
+      const f = await backgroundReady();
       try {
-        const plan = planFor(f.sm, f.overflow.id, 120_000);
+        const anchor = appendTurn(f.sm, "u1", "a1", 5_000);
+        f.pi.pi.setLabel(anchor.assistantId, "anchor:start");
+        f.sm.branchWithSummary(anchor.assistantId, "## Goal\ncollapsed work");
+        const b = addBatch(f.sm);
+        const plan = planFor(f.sm, b.overflow.id, 120_000);
         assert.deepEqual(
-          plan.drafts.map((d) => (d.type === "context_edit" ? d.targetId : "")),
-          [f.r2, f.r1, f.o3],
+          targets(plan),
+          [b.r2, b.r1, f.o3],
           "newest first, across the summary: both fresh results, then the newest background result",
         );
         assert.equal(plan.withheld, 3);
-        assert.equal(plan.fits, true, "the background closes the last 6k");
+        assert.equal(plan.fits, true, "the background closes the last 12k");
         assert.ok(plan.estimateTokens <= TARGET);
         const { turn } = await runErrorEnd(
           { pi: f.pi, ctx: f.ctx },
-          f.overflow.message,
+          b.overflow.message,
         );
         assert.equal(turn.continue, true, "the forced rewind starts");
         assert.match(
@@ -10236,30 +10235,57 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
-    it("a compaction is still a boundary: nothing above it is projected or withheld (#112)", async () => {
-      const f = await backgroundAcrossSummary("compaction");
+    it("the walk crosses more than one branch_summary (#112)", async () => {
+      // Five summaries is the live shape; two is enough to kill the "cross only
+      // the newest one" non-fix, which the rest of the suite lets through.
+      const f = await backgroundReady();
       try {
-        const plan = planFor(f.sm, f.overflow.id, 120_000);
+        const a1 = appendTurn(f.sm, "u1", "a1", 5_000);
+        f.pi.pi.setLabel(a1.assistantId, "anchor:start");
+        f.sm.branchWithSummary(a1.assistantId, "## Goal\nfirst segment");
+        const a2 = appendTurn(f.sm, "u2", "a2", 5_000);
+        f.sm.branchWithSummary(a2.assistantId, "## Goal\nsecond segment");
+        const b = addBatch(f.sm);
+        const plan = planFor(f.sm, b.overflow.id, 120_000);
         assert.deepEqual(
-          plan.drafts.map((d) => (d.type === "context_edit" ? d.targetId : "")),
-          [f.r2, f.r1],
-          "only the fresh results: the compaction cut the background out of the projection",
+          targets(plan),
+          [b.r2, b.r1, f.o3],
+          "both summaries crossed, newest result first",
         );
-        assert.equal(plan.fits, false, "90k of baseline cannot fit 83 616");
-        const { turn } = await runErrorEnd(
-          { pi: f.pi, ctx: f.ctx },
-          f.overflow.message,
-        );
-        assert.equal(turn.continue, false, "the run ends");
-        assert.equal(
-          forcedDrafts(turn)[0].content,
-          buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
-        );
+        assert.equal(plan.fits, true);
       } finally {
         cleanupConfigFixture(f.fixture);
       }
     });
 
+    it("a compaction's kept region stays withholdable, and what it cut is skipped (#112)", async () => {
+      const f = await backgroundReady();
+      try {
+        // firstKeptEntryId sits ABOVE the compaction entry: o1..o3 stay in the
+        // projection, o0 and the call that produced it do not.
+        f.sm.appendCompaction("compacted", f.o1, 1_000);
+        const b = addBatch(f.sm);
+        const projected = new Set(
+          f.sm.buildSessionProjection().entries.map((e) => e.sourceEntry.id),
+        );
+        assert.equal(projected.has(f.o1), true, "the kept region is projected");
+        assert.equal(projected.has(f.o0), false, "the cut region is not");
+        const plan = planFor(f.sm, b.overflow.id, 120_000);
+        assert.deepEqual(
+          targets(plan),
+          [b.r2, b.r1, f.o3],
+          "the walk crosses the compaction into its kept region",
+        );
+        assert.equal(
+          targets(plan).includes(f.o0),
+          false,
+          "a result the compaction cut is never withheld",
+        );
+        assert.equal(plan.fits, true);
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
     it("the fallback skips an aborted or errored assistant, like pi's usage predicate", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 5_000);
