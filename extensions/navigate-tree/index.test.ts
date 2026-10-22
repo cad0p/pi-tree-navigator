@@ -10153,10 +10153,12 @@ Active anchors (root → leaf, % of 100k):
      * tokens of tool results behind the newest one, and the 11k still reachable
      * above it could not free the 26k the plan needed.
      *
-     * Shapes here: four big results as background (o0 cut by the compaction
-     * case, o1..o3 kept), then a boundary, then a batch whose own two results
-     * are not enough — 90k baseline + a 24k tail (chars/4) against an 83 616
-     * target, so the plan needs one background result after both fresh ones.
+     * Shapes here: two batches of big results as background — the earlier one
+     * (c1, behind its own assistant call) is what the compaction case CUTS, and
+     * the later one (o0..o3, behind a second call) is what it KEEPS — then a
+     * boundary, then a batch whose own two results are not enough: 90k baseline
+     * + a 24k tail (chars/4) against an 83 616 target, so the plan needs one
+     * background result after both fresh ones.
      */
     async function backgroundReady() {
       const fixture = makeConfigFixture();
