@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 - *(rewind)* Give the forced summary turn real output room (closes #107)
 - *(rewind)* The withhold walk is bounded by the projection, not by an entry type (closes #112)
+- *(rewind)* The hint copy carries the percentage only (closes #114)
 
 
 ## [0.3.0] - 2026-10-15
