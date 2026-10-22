@@ -5842,24 +5842,16 @@ function usageAt(percent: number, contextWindow = 1_000_000): ContextUsage {
 }
 
 /**
- * The hint text at `percent` of `contextWindow` (via `usageAt`), with the
- * reserve the test config sets and the active-anchor list the handler must
- * render (default: the lone `anchorStart` label at 0.0% of 1.0M).
+ * The hint text at `percent` of `contextWindow`, with the active-anchor
+ * list the handler must render (default: the lone `anchorStart` label at
+ * 0.0% of 1.0M). The copy carries the percentage only (#114).
  */
 function expectedHint(
   percent: number,
   anchors = "Active anchors (root → leaf, % of 1.0M):\n   0.0%  start",
-  reserve = 100_000,
   contextWindow = 1_000_000,
 ): string {
-  const usage = usageAt(percent, contextWindow);
-  return buildRewindHintText(
-    percent,
-    contextWindow - (usage.tokens ?? 0),
-    reserve,
-    contextWindow,
-    anchors,
-  );
+  return buildRewindHintText(percent, contextWindow, anchors);
 }
 
 /**
@@ -5970,7 +5962,7 @@ describe("rewind hint: session_start config wiring (#44)", () => {
       // Byte-exact pin: the anchors are named, so no `list` call is needed.
       assert.equal(
         pi.sendMessageCalls[0][0].content,
-        "[navigate_tree hint] Context is at 90.0% of 1.0M — 100.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   0.0%  start",
+        "[navigate_tree hint] Context is at 90.0% of 1.0M. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   0.0%  start",
       );
     } finally {
       cleanupConfigFixture(fixture);
@@ -6303,7 +6295,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.equal(pi.sendMessageCalls.length, 1);
       assert.equal(
         (pi.sendMessageCalls[0][0] as { content: string }).content,
-        "[navigate_tree hint] Context is at 105.0% of 1.0M — 0.0k tokens left, within the 100.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   0.0%  start",
+        "[navigate_tree hint] Context is at 105.0% of 1.0M. Persist what matters to files now, then rewind to the oldest appropriate anchor.\nActive anchors (root → leaf, % of 1.0M):\n   0.0%  start",
       );
     } finally {
       cleanupConfigFixture(fixture);
@@ -6386,7 +6378,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
       assert.deepEqual(pi.sendMessageCalls[1], [
         {
           customType: REWIND_HINT_CUSTOM_TYPE,
-          content: expectedHint(21, undefined, 800_000),
+          content: expectedHint(21),
           display: true,
         },
       ]);
@@ -6907,9 +6899,9 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
       ctx.setContextUsage(usageAt(92));
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
-      assert.match(
-        String((pi.sendMessageCalls[0][0] as { content: unknown }).content),
-        /within the 100\.0k reserve/,
+      assert.equal(
+        (pi.sendMessageCalls[0][0] as { content: unknown }).content,
+        expectedHint(92),
       );
     } finally {
       cleanupConfigFixture(fixture);
@@ -6929,9 +6921,9 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
       ctx.model = { api: "openai", provider: "x", id: "other" };
       fireTurnEnd(pi, ctx);
       assert.equal(pi.sendMessageCalls.length, 1);
-      assert.match(
-        String((pi.sendMessageCalls[0][0] as { content: unknown }).content),
-        /within the 100\.0k reserve/,
+      assert.equal(
+        (pi.sendMessageCalls[0][0] as { content: unknown }).content,
+        expectedHint(99),
       );
     } finally {
       cleanupConfigFixture(fixture);

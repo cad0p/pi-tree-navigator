@@ -95,10 +95,10 @@ Enable it with `rewindHintReserveTokens` (see [Configuration](#configuration-tre
 - One hint per crossing: fires when `tokens left <= reserve`, re-arms only after the tokens left climb back above it (a rewind or compaction); no escalation, no re-fire while spent.
 - **Removed in 0.3.0: `rewindHintAtPercent`.** A percentage meant very different budgets on different windows (90% leaves 100k on 1M but 10k on 100k). The key is now ignored with a field-scoped warning pointing at `rewindHintReserveTokens`; migrate by picking the tokens you want left (e.g. `"90"` on a 1M window → `100000`).
 
-When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message naming every active anchor with its cumulative context percentage — so the model knows a rewind target exists (including the automatic `start`) without a `list` call. Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
+When the crossing has at least one `anchor:` label on the active branch, the agent receives a persisted custom message naming every active anchor with its cumulative context percentage — so the model knows a rewind target exists (including the automatic `start`) without a `list` call. The message prints the percentage only, not a tokens-left count: a model reads "N tokens left" as "I am running out of tokens" and stalls instead of rewinding (#114). Mid-run this steers the running loop (one reaction turn in the same run); when the agent is idle it only appends and waits for the user's next prompt, so an idle-agent rewind stays user-confirmed:
 
 ```text
-[navigate_tree hint] Context is at 95.2% of 1.0M — 48.0k tokens left, within the 50.0k reserve. Persist what matters to files now, then rewind to the oldest appropriate anchor.
+[navigate_tree hint] Context is at 95.2% of 1.0M. Persist what matters to files now, then rewind to the oldest appropriate anchor.
 Active anchors (root → leaf, % of 1.0M):
    4.1%  start
   12.0%  context-gathered
