@@ -8084,7 +8084,7 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
-  it("the walk stops at a compaction: nothing above it is withheld, and a plan that still cannot fit ends with D8 (#101, #107)", async () => {
+  it("the walk stops where the projection does: nothing above the cut is withheld, and a plan that still cannot fit ends with D8 (#101, #107, #112)", async () => {
     const f = await forcedSetup({ issuerTokens: 60_000 });
     try {
       const next = f.sm.appendMessage({
@@ -8099,8 +8099,9 @@ Active anchors (root → leaf, % of 100k):
       );
       const r3 = appendToolResult(f.sm, "t3", "read", "ok");
       const err = errorOverflow(f.sm);
-      // The walk reaches r3, then hits the compaction: r1 and r2 are above it
-      // and are not in the projected context, so they must not be withheld.
+      // The walk crosses the compaction entry (an entry type is not a stop,
+      // #112) and reaches r3; r1 and r2 are above the cut and carry no
+      // position in the projection, so they are skipped, not withheld.
       const plan = __testHooks.planWithhold(f.sm, err.id, [], WINDOW - 16_384);
       assert.deepEqual(
         plan.drafts.flatMap((d) => ("targetId" in d ? [d.targetId] : [])),
@@ -10168,7 +10169,18 @@ Active anchors (root → leaf, % of 100k):
       ctx.cwd = fixture.projectDir;
       await runSessionStart(pi, ctx, fixture);
       appendTurn(sm, "u0", "a0", 5_000);
-      appendToolCallAssistant(
+      // The cut candidate: a batch the compaction's cut removes entirely.
+      const cutCall = appendToolCallAssistant(
+        sm,
+        [{ id: "c1", name: "read" }],
+        5_000,
+      );
+      const c1 = appendToolResult(sm, "c1", "read", BIG);
+      // The kept batch, preceded by the assistant call pi can actually cut at:
+      // `isCutPointMessage` never returns true for a tool result, so a
+      // compaction's `firstKeptEntryId` is a call like this one, and its results
+      // (o0..o3) follow it into the projection.
+      const keptCall = appendToolCallAssistant(
         sm,
         [
           { id: "o0", name: "read" },
@@ -10182,7 +10194,19 @@ Active anchors (root → leaf, % of 100k):
       const o1 = appendToolResult(sm, "o1", "read", BIG);
       const o2 = appendToolResult(sm, "o2", "read", BIG);
       const o3 = appendToolResult(sm, "o3", "read", BIG);
-      return { fixture, sm, pi, ctx, o0, o1, o2, o3 };
+      return {
+        fixture,
+        sm,
+        pi,
+        ctx,
+        cutCallId: cutCall.id,
+        keptCallId: keptCall.id,
+        c1,
+        o0,
+        o1,
+        o2,
+        o3,
+      };
     }
 
     /** The post-boundary work plus the batch that overflows. */
@@ -10261,31 +10285,51 @@ Active anchors (root → leaf, % of 100k):
     it("a compaction's kept region stays withholdable, and what it cut is skipped (#112)", async () => {
       const f = await backgroundReady();
       try {
-        // firstKeptEntryId sits ABOVE the compaction entry: o1..o3 stay in the
-        // projection, o0 and the call that produced it do not.
-        f.sm.appendCompaction("compacted", f.o1, 1_000);
+        // pi cuts at an assistant call, keeping that call's results: the kept
+        // region here is the kept batch (o0..o3) and the cut region is the
+        // earlier batch (c1 and its call).
+        f.sm.appendCompaction("compacted", f.keptCallId, 1_000);
         const b = addBatch(f.sm);
         const projected = new Set(
           f.sm.buildSessionProjection().entries.map((e) => e.sourceEntry.id),
         );
-        assert.equal(projected.has(f.o1), true, "the kept region is projected");
-        assert.equal(projected.has(f.o0), false, "the cut region is not");
+        assert.equal(projected.has(f.o0), true, "the kept batch is projected");
+        assert.equal(
+          projected.has(f.c1),
+          false,
+          "the batch the cut removed is not",
+        );
         const plan = planFor(f.sm, b.overflow.id, 120_000);
         assert.deepEqual(
           targets(plan),
           [b.r2, b.r1, f.o3],
           "the walk crosses the compaction into its kept region",
         );
-        assert.equal(
-          targets(plan).includes(f.o0),
-          false,
-          "a result the compaction cut is never withheld",
-        );
         assert.equal(plan.fits, true);
+        // The guard's own assertion: at a target the walk can only chase by
+        // consuming the whole kept region, the cut result must still never be
+        // drafted. Without the position guard the walk reaches c1 and reports
+        // a false fit.
+        const deep = __testHooks.planWithhold(
+          f.sm,
+          b.overflow.id,
+          [b.overflow.id],
+          40_000,
+          undefined,
+          120_000,
+        );
+        assert.deepEqual(
+          targets(deep),
+          [b.r2, b.r1, f.o3, f.o2, f.o1, f.o0],
+          "every kept result, newest first, and never the cut one",
+        );
+        assert.equal(deep.fits, false, "the kept region runs out before 40k");
       } finally {
         cleanupConfigFixture(f.fixture);
       }
     });
+
+
     it("the fallback skips an aborted or errored assistant, like pi's usage predicate", () => {
       const { sm } = setup();
       appendTurn(sm, "u1", "a1", 5_000);
