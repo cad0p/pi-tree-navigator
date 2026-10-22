@@ -2092,12 +2092,14 @@ export default function (pi: ExtensionAPI) {
     // message that cannot fit buys one more request with less than
     // `reserveTokens - 4096` of output room — in the live arm-B shape, the
     // single token that starts D8 anyway. End it here with the D8 row
-    // instead, keeping the hide of the failed attempt.
+    // instead, keeping the hide of the failed attempt. The reason is
+    // `STILL_OVER`, not `OVERFLOWED_AGAIN`: no forced rewind ever started,
+    // so nothing overflowed "again".
     if (!plan.fits) {
       return {
         drafts: [
           ...hideDrafts(failedIds),
-          ...compactionFailed(sessionId, COMPACTION_FAILED_OVERFLOWED_AGAIN),
+          ...compactionFailed(sessionId, COMPACTION_FAILED_STILL_OVER),
         ],
         continue: false,
       };

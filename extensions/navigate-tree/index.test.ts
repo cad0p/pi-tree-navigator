@@ -7818,7 +7818,11 @@ describe("rewind-driven compaction (#101)", () => {
   }
 
   /** pi's order after an error turn: turn_end, agent_end, before_settle. */
-  async function runErrorEnd(f: Forced, message: unknown, cont = false) {
+  async function runErrorEnd(
+    f: Pick<Forced, "pi" | "ctx">,
+    message: unknown,
+    cont = false,
+  ) {
     const turn = await fireTurnEndAll(f.pi, f.ctx, message);
     for (const h of f.pi.onCalls.get("agent_end") ?? []) {
       h({ type: "agent_end", messages: [message] } as never, f.ctx as never);
@@ -8112,11 +8116,11 @@ Active anchors (root → leaf, % of 100k):
       assert.equal(forcedDrafts(settle).length, 1);
       assert.equal(
         forcedDrafts(settle)[0].content,
-        buildRewindCompactionFailedText(COMPACTION_FAILED_OVERFLOWED_AGAIN),
+        buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
       );
       assert.deepEqual(forcedDrafts(settle)[0].details, {
         status: "failed",
-        reason: COMPACTION_FAILED_OVERFLOWED_AGAIN,
+        reason: COMPACTION_FAILED_STILL_OVER,
       });
     } finally {
       cleanupConfigFixture(f.fixture);
@@ -10049,11 +10053,11 @@ Active anchors (root → leaf, % of 100k):
         assert.equal(rows.length, 1, "no forced message, one D8 row");
         assert.equal(
           rows[0].content,
-          buildRewindCompactionFailedText(COMPACTION_FAILED_OVERFLOWED_AGAIN),
+          buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
         );
         assert.deepEqual(rows[0].details, {
           status: "failed",
-          reason: COMPACTION_FAILED_OVERFLOWED_AGAIN,
+          reason: COMPACTION_FAILED_STILL_OVER,
         });
         assert.deepEqual(
           turn.entries.filter((d) => d.type === "context_edit"),
@@ -10073,6 +10077,63 @@ Active anchors (root → leaf, % of 100k):
         );
       } finally {
         cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("a user message the walk cannot withhold: the clamp view alone refuses the fresh plan (#107)", async () => {
+      // Target 83 616. The newest usage is 1 000 and the tail is ONE 320k
+      // user message, which the walk never withholds: the calibrated view
+      // (chars/4) is 1 000 + 80 000 = 81 000 and fits, while pi's clamp view
+      // (chars/3.5) is 1 000 + 91 429 = 92 429 and does not. Only the clamp
+      // disjunct of `fits` can refuse this plan; without it the fresh path
+      // sends a forced message pi clamps to 3.5k of the promised 16k reserve.
+      const fixture = makeConfigFixture();
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 20_000 }),
+      );
+      const { sm, pi, ctx } = setup({ contextWindow: WINDOW });
+      (ctx.model as { maxTokens?: number }).maxTokens = 64_000;
+      ctx.cwd = fixture.projectDir;
+      await runSessionStart(pi, ctx, fixture);
+      try {
+        const t = appendTurn(sm, "u1", "a1", 1_000);
+        pi.pi.setLabel(t.assistantId, "anchor:start");
+        sm.appendMessage({
+          role: "user",
+          content: [{ type: "text", text: "p".repeat(320_000) }],
+        } as never);
+        const overflow = lengthOverflow(sm, 81_000);
+        const plan = planFor(sm, overflow.id, 81_000);
+        assert.equal(plan.withheld, 0, "a user message is not withholdable");
+        assert.equal(
+          plan.estimateTokens,
+          81_000,
+          "the calibrated view is 1 000 + 320k chars/4",
+        );
+        assert.ok(
+          plan.estimateTokens <= TARGET,
+          `the calibrated view fits: ${plan.estimateTokens} <= ${TARGET}`,
+        );
+        assert.equal(
+          plan.fits,
+          false,
+          "the clamp view does not: the fresh path must not send",
+        );
+        const { turn } = await runErrorEnd({ pi, ctx }, overflow.message);
+        assert.equal(turn.continue, false, "the run ends");
+        const rows = forcedDrafts(turn);
+        assert.equal(rows.length, 1, "no forced message, one D8 row");
+        assert.equal(
+          rows[0].content,
+          buildRewindCompactionFailedText(COMPACTION_FAILED_STILL_OVER),
+        );
+        assert.deepEqual(rows[0].details, {
+          status: "failed",
+          reason: COMPACTION_FAILED_STILL_OVER,
+        });
+      } finally {
+        cleanupConfigFixture(fixture);
       }
     });
 
