@@ -8080,7 +8080,7 @@ Active anchors (root → leaf, % of 100k):
     }
   });
 
-  it("the walk stops at a compaction: nothing above it is withheld (#101)", async () => {
+  it("the walk stops at a compaction: nothing above it is withheld, and a plan that still cannot fit ends with D8 (#101, #107)", async () => {
     const f = await forcedSetup({ issuerTokens: 60_000 });
     try {
       const next = f.sm.appendMessage({
@@ -8095,8 +8095,29 @@ Active anchors (root → leaf, % of 100k):
       );
       const r3 = appendToolResult(f.sm, "t3", "read", "ok");
       const err = errorOverflow(f.sm);
+      // The walk reaches r3, then hits the compaction: r1 and r2 are above it
+      // and are not in the projected context, so they must not be withheld.
+      const plan = __testHooks.planWithhold(f.sm, err.id, [], WINDOW - 16_384);
+      assert.deepEqual(
+        plan.drafts.flatMap((d) => ("targetId" in d ? [d.targetId] : [])),
+        [r3],
+      );
+      // 99.3k of baseline cannot be withheld away, so the fresh path cannot
+      // produce a forced message with output room (#107, round 3): it ends
+      // with the D8 row instead of sending one pi would clamp to 1 token.
+      assert.equal(plan.fits, false);
       const { settle } = await runErrorEnd(f, err.message);
-      assert.deepEqual(withheldTargets(settle.entries), [r3]);
+      assert.equal(settle.continue, false);
+      assert.deepEqual(withheldTargets(settle.entries), []);
+      assert.equal(forcedDrafts(settle).length, 1);
+      assert.equal(
+        forcedDrafts(settle)[0].content,
+        buildRewindCompactionFailedText(COMPACTION_FAILED_OVERFLOWED_AGAIN),
+      );
+      assert.deepEqual(forcedDrafts(settle)[0].details, {
+        status: "failed",
+        reason: COMPACTION_FAILED_OVERFLOWED_AGAIN,
+      });
     } finally {
       cleanupConfigFixture(f.fixture);
     }
@@ -8157,7 +8178,8 @@ Active anchors (root → leaf, % of 100k):
 
     it("a real count below the estimate is clamped to ratio 1", async () => {
       // Real 83k: the raw ratio is 0.5. Unclamped, the estimate would fit with
-      // no withholding at all; clamped, it stays at 95k and one result goes.
+      // no withholding at all; clamped, it stays at 95k and both results go
+      // (the clamp view, chars/3.5, needs both anyway — #107, round 3).
       const f = await forcedSetup({ issuerTokens: 71_000 });
       try {
         const message = {
@@ -8173,9 +8195,9 @@ Active anchors (root → leaf, % of 100k):
         );
         assert.deepEqual(
           edits.map((d) => d.targetId),
-          [f.r2],
+          [f.r2, f.r1],
         );
-        assert.equal(forcedDrafts(turn)[0].content, D5_ONE);
+        assert.match(forcedDrafts(turn)[0].content, /: 2 tool results were/);
       } finally {
         cleanupConfigFixture(f.fixture);
       }
@@ -8194,9 +8216,9 @@ Active anchors (root → leaf, % of 100k):
         );
         assert.deepEqual(
           edits.map((d) => d.targetId),
-          [f.r2],
+          [f.r2, f.r1],
         );
-        assert.equal(forcedDrafts(turn)[0].content, D5_ONE);
+        assert.match(forcedDrafts(turn)[0].content, /: 2 tool results were/);
       } finally {
         cleanupConfigFixture(f.fixture);
       }
@@ -8390,10 +8412,13 @@ Active anchors (root → leaf, % of 100k):
       const a3 = await toolCallAttempt(f, ["tc-x"]);
       assert.equal(a3.boundary.continue, false);
       assert.equal(forcedDrafts(a3.boundary).length, 1);
-      // pi continues anyway (a steer): the next turn overflows again.
+      // pi continues anyway (a steer): the next turn overflows again. Its
+      // usage is 70k, inside the withhold target, so the next run's forced
+      // rewind can actually fit (a 99k baseline cannot be withheld away, and
+      // since #107, round 3 a plan that cannot fit ends with D8 instead).
       const message = {
         ...assistantMessage([], "length", 0),
-        usage: { ...usageOf(99_000), output: 10 },
+        usage: { ...usageOf(70_000), output: 10 },
       };
       const id = f.sm.appendMessage(message as never);
       const again = await fireTurnEndAll(f.pi, f.ctx, message, {
@@ -9606,7 +9631,7 @@ Active anchors (root → leaf, % of 100k):
       }
     });
 
-    it("the D11 frozen view — no context_edit in the request — still gets it, with usable output room (F1)", async () => {
+    it("the D11 frozen view — no context_edit in the request — still gets it, with usable output room", async () => {
       const f = await forcedSetup();
       try {
         // 99k: the rewind call's own usage overflows once the summary
@@ -9631,9 +9656,14 @@ Active anchors (root → leaf, % of 100k):
           `no assistant is zeroed in the frozen view: ${usages.join()}`,
         );
         assert.equal(usages.length, 4);
+        // This lands via `overrideEntryId`: the planner's entry is still in
+        // the frozen view, so `overrideTargetIndex` finds it by id. The
+        // id-not-in-view fallback (F1) is pinned on its own in "no
+        // context_edits: an entry id outside the view falls back to the
+        // newest usage in it".
         assert.ok(
           usages[3] > 0 && usages[3] < 99_000,
-          `the planner's entry — the newest usage, the F1 fallback — carries the prefix, got ${usages[3]}`,
+          `the planner's entry carries the prefix by id, got ${usages[3]}`,
         );
         const estimate = await piEstimate(wire);
         assert.equal(estimate.usageTokens, usages[3]);
@@ -9730,15 +9760,16 @@ Active anchors (root → leaf, % of 100k):
       const errId = sm.appendMessage(
         assistantMessage([], "length", 0) as never,
       );
-      // 60k baseline + 36k of results: one result off (84k) fits a loose
-      // target, two (72k) a tight one.
-      const loose = __testHooks.planWithhold(sm, errId, [], 85_000);
-      const tight = __testHooks.planWithhold(sm, errId, [], 73_000);
+      // 60k baseline + 36k of results (chars/4) / 41k (pi's chars/3.5, the
+      // clamp view, #107 round 3): one result off fits a 90k target, two a
+      // 74k one.
+      const loose = __testHooks.planWithhold(sm, errId, [], 90_000);
+      const tight = __testHooks.planWithhold(sm, errId, [], 74_000);
       assert.equal(loose.withheld, 1);
       assert.equal(tight.withheld, 2);
       assert.ok(loose.fits && tight.fits);
-      assert.ok(loose.estimateTokens <= 85_000);
-      assert.ok(tight.estimateTokens <= 73_000);
+      assert.ok(loose.estimateTokens <= 90_000);
+      assert.ok(tight.estimateTokens <= 74_000);
       assert.ok(
         tight.estimateTokens < loose.estimateTokens,
         `more withheld, smaller estimate: ${tight.estimateTokens} < ${loose.estimateTokens}`,
@@ -9776,9 +9807,10 @@ Active anchors (root → leaf, % of 100k):
      * The D8 scope. A forced rewind that ends with the final error hands pi no
      * override: `compactionFailed` drops the plan's numbers from the record,
      * and the read refuses an ended record. The two are redundant — either
-     * alone keeps the wire clean — so each is pinned: the record's contents
-     * here, and the wire, which fails if an ended record still holding the
-     * numbers is trusted.
+     * alone keeps the wire clean — and each has its own pin: this test covers
+     * the record's contents plus the wire, and "an ended record that still
+     * holds the numbers is ignored" injects the dropped numbers back to pin
+     * the `!ended` read alone.
      */
     it("a forced rewind ended by D8 hands no override and drops the plan's numbers", async () => {
       const f = await forcedStaleSetup();
@@ -9846,6 +9878,243 @@ Active anchors (root → leaf, % of 100k):
       } finally {
         cleanupConfigFixture(f.fixture);
       }
+    });
+
+    it("an ended record that still holds the numbers is ignored (!ended read)", async () => {
+      // `compactionFailed` drops the plan's numbers, so only an injected
+      // record can carry them past D8. The read refuses it either way: the
+      // same run must not re-send a size it just gave up on.
+      const f = await forcedStaleSetup();
+      try {
+        const sessionId = f.sm.getSessionId();
+        const newest = f.sm
+          .buildSessionContext()
+          .messages.flatMap((m) => (m.role === "assistant" ? [m] : []));
+        const target = newest.at(-1) as { usage?: { totalTokens?: number } };
+        assert.ok((target.usage?.totalTokens ?? 0) > 0);
+        __testHooks.setForcedRecord(f.pi.pi, sessionId, {
+          attempts: 0,
+          ended: true,
+          baselineTokens: 42_424,
+          overrideEntryId: "injected",
+        });
+        const wire = assistantUsages(fireContext(f.pi, f.ctx));
+        assert.ok(
+          !wire.includes(42_424),
+          `an ended record's prefix stays off the wire: ${wire.join()}`,
+        );
+        assert.deepEqual(
+          wire,
+          assistantUsages(__testHooks.buildContextMessages(f.sm) as never),
+          "an ended record changes nothing on the wire",
+        );
+        // Positive control for the same shape: pending, it does apply.
+        __testHooks.setForcedRecord(f.pi.pi, sessionId, {
+          attempts: 0,
+          baselineTokens: 42_424,
+          overrideEntryId: "injected",
+        });
+        assert.ok(
+          assistantUsages(fireContext(f.pi, f.ctx)).includes(42_424),
+          "a pending record's prefix is in force",
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    /**
+     * The live A/B (#107, arm B) at the 40k window / 12k reserve calibration:
+     * target 28 000, a 3 125-token baseline, and two 49 748-char results —
+     * 24 874 tokens by chars/4, so the calibrated view (27 999) sits just
+     * inside the target and the old planner withheld NOTHING, while pi's
+     * chars/3.5 sees 28 428 for the same tail and clamped the very next
+     * request from a 31 553-token prefix.
+     */
+    async function armBSetup() {
+      const fixture = makeConfigFixture();
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 16_000 }),
+      );
+      writePiSettings(fixture, {
+        compaction: { enabled: false, reserveTokens: 12_000 },
+      });
+      const f = setup({ contextWindow: 40_000 });
+      (f.ctx.model as { maxTokens?: number }).maxTokens = 8_000;
+      f.ctx.cwd = fixture.projectDir;
+      await runSessionStart(f.pi, f.ctx, fixture);
+      const t = appendTurn(f.sm, "u1", "a1", 3_125);
+      f.pi.pi.setLabel(t.assistantId, "anchor:start");
+      const issuer = appendToolCallAssistant(
+        f.sm,
+        [
+          { id: "b1", name: "read", arguments: { path: "a" } },
+          { id: "b2", name: "read", arguments: { path: "b" } },
+        ],
+        3_125,
+      );
+      // English-ish filler: a 4-chars-per-token estimate over-counts prose,
+      // which is what put the provider's real count under the chars/4 view.
+      const sentence =
+        "The quick brown fox jumps over the lazy dog again and again. ";
+      const english = (chars: number) =>
+        sentence.repeat(Math.ceil(chars / sentence.length)).slice(0, chars);
+      const r1 = appendToolResult(f.sm, "b1", "read", english(49_748));
+      const r2 = appendToolResult(f.sm, "b2", "read", english(49_748));
+      return { fixture, ...f, issuerId: issuer.id, r1, r2 };
+    }
+
+    it("arm B: the withhold must fit pi's clamp view, not only the calibrated one", async () => {
+      const f = await armBSetup();
+      try {
+        const target = 40_000 - 12_000;
+        // Before the plan: the calibrated view (the old planner's fit basis,
+        // ratio 1) is just inside the target, while pi's chars/3.5 view is
+        // over it — the arm-B shape, where the old planner withheld nothing
+        // and pi still had 4 351 output tokens' worth of context too much.
+        const calibrated = scaledEstimate(f.sm, 1);
+        assert.ok(
+          calibrated <= target,
+          `the old fit basis is inside the target: ${calibrated} <= ${target}`,
+        );
+        const before = await piEstimate(
+          __testHooks.buildContextMessages(f.sm) as never,
+        );
+        assert.ok(
+          before.tokens > target,
+          `pi sees more than the target: ${before.tokens} > ${target}`,
+        );
+        const oldBudget = 40_000 - before.tokens - 4096;
+        assert.ok(
+          oldBudget < 1_000 + 4_096,
+          `the old wire gave far less than the 12k reserve promises (${12_000 - 4_096}), got ${oldBudget}`,
+        );
+        const overflow = lengthOverflow(f.sm, target);
+        // `planFor` hardcodes the 100k describe's target; this window is 40k.
+        const plan = __testHooks.planWithhold(
+          f.sm,
+          overflow.id,
+          [overflow.id],
+          target,
+          undefined,
+          target,
+        );
+        assert.equal(plan.fits, true, "the plan fits both views");
+        assert.equal(plan.withheld, 1, "the clamp view withholds one more");
+        const { turn } = await runErrorEnd(f, overflow.message);
+        assert.equal(turn.continue, true, "the forced rewind starts");
+        const wire = fireContext(f.pi, f.ctx);
+        const estimate = await piEstimate(wire);
+        assert.equal(
+          estimate.usageTokens,
+          3_125,
+          "the written prefix is the small baseline: both results are after it",
+        );
+        assert.ok(
+          estimate.tokens <= target,
+          `pi's clamp view fits the target: ${estimate.tokens} <= ${target}`,
+        );
+        const budget = 40_000 - estimate.tokens - 4096;
+        assert.ok(
+          budget >= 2_000,
+          `the forced turn keeps real output room, got ${budget}`,
+        );
+        assert.ok(
+          budget >= 12_000 - 4096 - 1_000,
+          `and about the reserve minus the 4096 safety margin, got ${budget}`,
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("a tail the walk cannot withhold ends the fresh path with D8, not a starved message", async () => {
+      // A 320k-char user message is 80k chars/4 tokens: no tool result can
+      // make room for it, so the plan cannot fit. Sending the forced message
+      // anyway would only be clamped to one output token again (#107).
+      const f = await forcedSetup();
+      try {
+        appendTurn(f.sm, "u3", "a3", 84_000);
+        f.sm.appendMessage({
+          role: "user",
+          content: [{ type: "text", text: "p".repeat(320_000) }],
+        } as never);
+        const overflow = lengthOverflow(f.sm, 420_000);
+        const plan = planFor(f.sm, overflow.id, 420_000);
+        assert.equal(plan.fits, false, "nothing can make room for it");
+        const { turn } = await runErrorEnd(f, overflow.message);
+        assert.equal(turn.continue, false, "the run ends");
+        const rows = forcedDrafts(turn);
+        assert.equal(rows.length, 1, "no forced message, one D8 row");
+        assert.equal(
+          rows[0].content,
+          buildRewindCompactionFailedText(COMPACTION_FAILED_OVERFLOWED_AGAIN),
+        );
+        assert.deepEqual(rows[0].details, {
+          status: "failed",
+          reason: COMPACTION_FAILED_OVERFLOWED_AGAIN,
+        });
+        assert.deepEqual(
+          turn.entries.filter((d) => d.type === "context_edit"),
+          [
+            {
+              type: "context_edit",
+              targetId: overflow.id,
+              replacement: null,
+            },
+          ],
+          "the failed attempt is still hidden",
+        );
+        assert.equal(
+          fireToolCall(f.pi, f.ctx),
+          undefined,
+          "the gate is lifted (the record is ended)",
+        );
+      } finally {
+        cleanupConfigFixture(f.fixture);
+      }
+    });
+
+    it("the fallback skips an aborted or errored assistant, like pi's usage predicate", () => {
+      const { sm } = setup();
+      appendTurn(sm, "u1", "a1", 5_000);
+      appendTurn(sm, "u2", "a2", 20_000);
+      // pi ignores these replies' usage entirely, so a number written there
+      // would be invisible to the clamp.
+      const abortedId = sm.appendMessage(
+        assistantMessage(
+          [{ type: "text", text: "cut" }],
+          "aborted",
+          90_000,
+        ) as never,
+      );
+      sm.appendMessage(
+        assistantMessage(
+          [{ type: "text", text: "oops" }],
+          "error",
+          95_000,
+        ) as never,
+      );
+      const override = { tokens: 40_000, entryId: "not-in-this-view" };
+      assert.deepEqual(
+        assistantUsages(
+          __testHooks.buildContextMessages(sm, undefined, override) as never,
+        ),
+        [5_000, 40_000, 90_000, 95_000],
+        "the newest VISIBLE assistant carries it",
+      );
+      // The entry-scoped lookup applies the same predicate: an entry that
+      // holds only an aborted reply falls through to the visible one.
+      assert.deepEqual(
+        assistantUsages(
+          __testHooks.buildContextMessages(sm, undefined, {
+            tokens: 40_000,
+            entryId: abortedId,
+          }) as never,
+        ),
+        [5_000, 40_000, 90_000, 95_000],
+      );
     });
   });
 });

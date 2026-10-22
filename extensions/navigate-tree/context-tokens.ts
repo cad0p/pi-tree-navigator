@@ -135,3 +135,139 @@ export function estimateContextTokens(messages: AgentMessage[]): number {
   const { baseline, tail } = splitContextEstimate(messages);
   return baseline + tail;
 }
+
+// ---------------------------------------------------------------------------
+// pi-ai's own per-message estimator (#107, round 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * pi-ai's constants (`dist/utils/estimate.js` on 1.3.0 and 1.4.0, the two
+ * versions this port was byte-verified against).
+ */
+const PI_CHARS_PER_TOKEN = 3.5;
+const PI_ESTIMATED_IMAGE_CHARS = 4_800;
+
+/** pi-ai's `safeJsonStringify`: a throwing `JSON.stringify` degrades instead. */
+function piSafeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "undefined";
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+/** pi-ai's `estimateTextTokens`: chars/3.5, rounded up. */
+function piEstimateTextTokens(chars: number): number {
+  return Math.ceil(chars / PI_CHARS_PER_TOKEN);
+}
+
+/**
+ * pi-ai's `estimateTextAndImageContentChars`: string content is its length;
+ * an array sums text lengths and counts every other block as one image.
+ */
+function piContentChars(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const block of content as Array<{ type?: string; text?: string }>) {
+    chars +=
+      block?.type === "text"
+        ? (block.text ?? "").length
+        : PI_ESTIMATED_IMAGE_CHARS;
+  }
+  return chars;
+}
+
+/**
+ * pi-ai's `getSystemMessageText`: the content text followed by every non-null
+ * section, the non-empty parts joined by a blank line.
+ */
+function piSystemMessageText(message: {
+  content?: unknown;
+  sections?: Record<string, string | null>;
+}): string {
+  const content = message.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? (content as Array<{ type?: string; text?: string }>)
+            .filter((block) => block?.type === "text")
+            .map((block) => block.text ?? "")
+            .join("\n")
+        : "";
+  const parts = [text];
+  for (const section of Object.values(message.sections ?? {})) {
+    if (section !== null) parts.push(section);
+  }
+  return parts.filter((part) => part.length > 0).join("\n\n");
+}
+
+/** pi-ai's `estimateToolsTokens`: the JSON of the tool list, or 0. */
+function piToolsTokens(tools: unknown): number {
+  if (!Array.isArray(tools) || tools.length === 0) return 0;
+  return piEstimateTextTokens(piSafeJsonStringify(tools).length);
+}
+
+/**
+ * Faithful port of pi-ai's `estimateMessageTokens` (#107, round 3).
+ *
+ * pi sizes the output clamp from THIS estimator — `clampMaxTokensToContext`
+ * computes `contextWindow - estimateContextTokens(context) - 4096` — while
+ * pi-compaction's `estimateTokens` (what `splitContextEstimate` uses) is
+ * chars/4. The 4 -> 3.5 gap is what starved the forced summary turn: pi saw
+ * 37,518 tokens for a 31,530-token request and clamped `max_tokens` to 1.
+ * The withholding planner therefore has to fit BOTH views.
+ *
+ * Byte-verified against `@earendil-works/pi-ai/dist/utils/estimate.js` on
+ * 1.3.0 and 1.4.0 (the two files are identical): chars/3.5 `Math.ceil`, an
+ * image block counts 4800 chars, `system` uses the section text plus the
+ * `toolsAdded`/`toolsRemoved` JSON, `user`/`toolResult` use text+image
+ * content, and an assistant sums text + thinking + tool-call name + JSON
+ * arguments. Only LLM roles are handled: a non-LLM agent message (a custom
+ * message, a branch/compaction summary) is converted by pi's `convertToLlm`
+ * before the clamp ever sees it, so callers must convert first.
+ */
+export function piEstimateMessageTokens(message: AgentMessage): number {
+  const role = (message as { role?: string }).role;
+  if (role === "system") {
+    const system = message as unknown as {
+      content?: unknown;
+      sections?: Record<string, string | null>;
+      toolsAdded?: unknown;
+      toolsRemoved?: unknown;
+    };
+    return (
+      piEstimateTextTokens(piSystemMessageText(system).length) +
+      piToolsTokens(system.toolsAdded) +
+      piToolsTokens(system.toolsRemoved)
+    );
+  }
+  if (role === "user" || role === "toolResult") {
+    return piEstimateTextTokens(
+      piContentChars((message as { content?: unknown }).content),
+    );
+  }
+  const content = (message as { content?: unknown }).content;
+  let chars = 0;
+  for (const block of Array.isArray(content)
+    ? (content as Array<{
+        type?: string;
+        text?: string;
+        thinking?: string;
+        name?: string;
+        arguments?: unknown;
+      }>)
+    : []) {
+    if (block?.type === "text") {
+      chars += (block.text ?? "").length;
+    } else if (block?.type === "thinking") {
+      chars += (block.thinking ?? "").length;
+    } else {
+      chars +=
+        (block?.name ?? "").length +
+        piSafeJsonStringify(block?.arguments).length;
+    }
+  }
+  return piEstimateTextTokens(chars);
+}
