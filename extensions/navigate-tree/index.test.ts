@@ -31,7 +31,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import {
   type AgentSession,
   CONFIG_DIR_NAME,
@@ -49,7 +49,7 @@ import {
 } from "./config.ts";
 import { splitContextEstimate } from "./context-tokens.ts";
 import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
-import navigateTree, {
+import navigateTreeDefault, {
   __testHooks,
   ANCHOR_MANDATE,
   buildLateEntriesNote,
@@ -59,6 +59,7 @@ import navigateTree, {
   buildRewindOutcomeRow,
   buildSummaryFailedText,
   buildSummaryRequestRow,
+  createNavigateTreeExtension,
   extractSummaryText,
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
@@ -103,20 +104,16 @@ afterEach(() => {
   __testHooks.resetPrototype();
 });
 
-// The extension reads the start-anchor kill switch from `process.env` at
-// write time (#118): a caller's exported `PI_NAVIGATE_TREE_START_ANCHOR=0`
-// must not leak into tests that expect a start write. Cleared for the whole
-// file; tests that need the switch set it locally and restore it.
-const START_ANCHOR_ENV = "PI_NAVIGATE_TREE_START_ANCHOR";
-let callerStartAnchorEnv: string | undefined;
-before(() => {
-  callerStartAnchorEnv = process.env[START_ANCHOR_ENV];
-  delete process.env[START_ANCHOR_ENV];
-});
-after(() => {
-  if (callerStartAnchorEnv === undefined) delete process.env[START_ANCHOR_ENV];
-  else process.env[START_ANCHOR_ENV] = callerStartAnchorEnv;
-});
+/**
+ * A test-owned environment per extension instance (#118). Tests never read or
+ * write `process.env`: the caller's shell cannot leak in, and no test leaks
+ * into another. Only the default-export test touches the real environment.
+ */
+type TestEnv = Record<string, string | undefined>;
+
+function navigateTree(pi: ExtensionAPI, env: TestEnv = {}): void {
+  createNavigateTreeExtension(pi, env);
+}
 
 // -----------------------------------------------------------------------------
 // Fakes
@@ -465,19 +462,23 @@ const SUMMARY_TEXT =
  * Register the navigate-tree tool against a fresh fake pi + SessionManager
  * and return the captured tool plus the helpers tests need.
  */
-function setup(opts: { contextWindow?: number; noModel?: boolean } = {}): {
+function setup(
+  opts: { contextWindow?: number; noModel?: boolean; env?: TestEnv } = {},
+): {
   sm: SessionManager;
   pi: FakePi;
   ctx: FakeCtx;
   tool: CapturedTool;
+  env: TestEnv;
 } {
   const sm = SessionManager.inMemory("/tmp");
   const pi = makeFakePi(sm);
-  navigateTree(pi.pi);
+  const env = opts.env ?? {};
+  navigateTree(pi.pi, env);
   assert.equal(pi.registered.length, 1);
   const tool = pi.registered[0];
   const ctx = makeCtx(sm, opts);
-  return { sm, pi, ctx, tool };
+  return { sm, pi, ctx, tool, env };
 }
 
 /**
@@ -1637,7 +1638,7 @@ describe("factory registration", () => {
     // in-band rewind (#80) has no injectable summarizer.
     const sm = SessionManager.inMemory("/tmp");
     const fakePi = makeFakePi(sm);
-    navigateTree(fakePi.pi);
+    navigateTreeDefault(fakePi.pi);
     assert.equal(fakePi.registered.length, 1);
     const tool = fakePi.registered[0];
     const ctx = makeCtx(sm);
@@ -3520,31 +3521,19 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
   it("an assistant message_start while a rewind is pending writes no start anchor (#116)", async () => {
     // Reachable case: the kill switch was on while the session built up, so
     // no `start` exists, and it is unset before the summary turn starts.
-    const saved = process.env.PI_NAVIGATE_TREE_START_ANCHOR;
-    process.env.PI_NAVIGATE_TREE_START_ANCHOR = "0";
-    const f = setup();
-    try {
-      setupRewindable(f.sm, f.pi, { capture: true, rewindToName: "cg" });
-      await requestRewind(f, { ...REWIND_ARGS, rewindTo: "cg" });
-    } finally {
-      if (saved === undefined) delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
-      else process.env.PI_NAVIGATE_TREE_START_ANCHOR = saved;
-    }
+    const f = setup({ env: { PI_NAVIGATE_TREE_START_ANCHOR: "0" } });
+    setupRewindable(f.sm, f.pi, { capture: true, rewindToName: "cg" });
+    await requestRewind(f, { ...REWIND_ARGS, rewindTo: "cg" });
     assert.equal(
       __testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL),
       null,
       "precondition: no start label yet",
     );
     // The summary turn starting: X=0 would otherwise label the mid-task leaf
-    // that the rewind is about to collapse. The kill switch must be off here
-    // even if the caller's shell sets it, or the test passes vacuously.
-    delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
-    try {
-      fireMessageStart(f.pi, f.ctx, "assistant");
-    } finally {
-      if (saved !== undefined)
-        process.env.PI_NAVIGATE_TREE_START_ANCHOR = saved;
-    }
+    // that the rewind is about to collapse. The kill switch is off here, so
+    // only the pending-rewind skip can stop the write.
+    delete f.env.PI_NAVIGATE_TREE_START_ANCHOR;
+    fireMessageStart(f.pi, f.ctx, "assistant");
     assert.equal(__testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL), null);
     assert.ok(
       !f.pi.setLabelCalls.some(([, label]) => label === START_ANCHOR_LABEL),
@@ -6507,14 +6496,14 @@ describe("rewind hint: turn_end handler (#44)", () => {
 
   it("an empty-named manual label alone counts as no anchors", async () => {
     const fixture = makeConfigFixture();
-    const savedStartEnv = process.env.PI_NAVIGATE_TREE_START_ANCHOR;
     try {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
-      const { sm, pi, ctx } = setup();
       // `anchor:` is not a valid `rewindTo`, so the model must not be
       // pointed at it. The auto start anchor (default X=0, #116) would
       // label the leaf at this turn_end, so it is switched off here.
-      process.env.PI_NAVIGATE_TREE_START_ANCHOR = "0";
+      const { sm, pi, ctx } = setup({
+        env: { PI_NAVIGATE_TREE_START_ANCHOR: "0" },
+      });
       const t = appendTurn(sm, "u-empty", "a-empty");
       pi.pi.setLabel(t.assistantId, "anchor:");
       await runSessionStart(pi, ctx, fixture);
@@ -6525,9 +6514,6 @@ describe("rewind hint: turn_end handler (#44)", () => {
         [buildNoAnchorText(95, 1_000_000), "warning"],
       ]);
     } finally {
-      if (savedStartEnv === undefined)
-        delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
-      else process.env.PI_NAVIGATE_TREE_START_ANCHOR = savedStartEnv;
       cleanupConfigFixture(fixture);
     }
   });
@@ -7111,17 +7097,46 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
 
 describe("automatic start anchor (#55)", () => {
   const ENV_KEY = "PI_NAVIGATE_TREE_START_ANCHOR";
-  let savedEnv: string | undefined;
 
-  beforeEach(() => {
-    savedEnv = process.env[ENV_KEY];
-    delete process.env[ENV_KEY];
-  });
+  it("the default export reads the live process.env at write time; an injected env ignores it (#118)", async () => {
+    // The one test that touches the real environment: it pins the
+    // production binding, so it sets and restores the variable itself.
+    const saved = process.env[ENV_KEY];
+    const fixture = makeConfigFixture();
+    try {
+      // Default export: the kill switch in process.env suppresses the write,
+      // and clearing it later applies without a new instance.
+      process.env[ENV_KEY] = "0";
+      const sm = SessionManager.inMemory("/tmp");
+      const pi = makeFakePi(sm);
+      navigateTreeDefault(pi.pi);
+      const ctx = makeCtx(sm);
+      await runSessionStart(pi, ctx, fixture);
+      const userId = sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "first prompt" }],
+      } as never);
+      fireMessageStart(pi, ctx, "assistant");
+      assert.equal(pi.setLabelCalls.length, 0, "process.env =0 must suppress");
+      delete process.env[ENV_KEY];
+      fireMessageStart(pi, ctx, "assistant");
+      assert.deepEqual(pi.setLabelCalls, [[userId, START_ANCHOR_LABEL]]);
 
-  afterEach(() => {
-    if (savedEnv === undefined) delete process.env[ENV_KEY];
-    else process.env[ENV_KEY] = savedEnv;
-    savedEnv = undefined;
+      // Injected env: a caller-set process.env =0 does not leak in.
+      process.env[ENV_KEY] = "0";
+      const f = setup();
+      await runSessionStart(f.pi, f.ctx, fixture);
+      const userId2 = f.sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "first prompt" }],
+      } as never);
+      fireMessageStart(f.pi, f.ctx, "assistant");
+      assert.deepEqual(f.pi.setLabelCalls, [[userId2, START_ANCHOR_LABEL]]);
+    } finally {
+      if (saved === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = saved;
+      cleanupConfigFixture(fixture);
+    }
   });
 
   it("registers exactly one agent_end handler", () => {
@@ -7200,8 +7215,7 @@ describe("automatic start anchor (#55)", () => {
   it("X=0: the kill switch suppresses the message_start write", async () => {
     const fixture = makeConfigFixture();
     try {
-      process.env[ENV_KEY] = "0";
-      const { sm, pi, ctx } = setup();
+      const { sm, pi, ctx } = setup({ env: { [ENV_KEY]: "0" } });
       await runSessionStart(pi, ctx, fixture);
       sm.appendMessage({
         role: "user",
@@ -7468,12 +7482,12 @@ describe("automatic start anchor (#55)", () => {
   it("kill switch is read at write time: =0 skips both triggers; unset retries", async () => {
     const fixture = makeConfigFixture();
     try {
-      const { sm, pi, ctx } = setup();
+      const { sm, pi, ctx, env } = setup();
       await runSessionStart(pi, ctx, fixture);
       appendTurn(sm, "u1", "a1");
       appendTurn(sm, "u2", "a2");
       const leaf = sm.getLeafId();
-      process.env[ENV_KEY] = "0";
+      env[ENV_KEY] = "0";
       fireTurnEnd(pi, ctx, 1);
       fireAgentEnd(pi, ctx);
       assert.equal(
@@ -7481,7 +7495,7 @@ describe("automatic start anchor (#55)", () => {
         0,
         "kill switch must suppress both triggers",
       );
-      delete process.env[ENV_KEY];
+      delete env[ENV_KEY];
       // A skipped settle left the session unsettled: the next trigger retries.
       fireAgentEnd(pi, ctx);
       assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
