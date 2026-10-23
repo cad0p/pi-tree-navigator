@@ -3521,8 +3521,15 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
       "precondition: no start label yet",
     );
     // The summary turn starting: X=0 would otherwise label the mid-task leaf
-    // that the rewind is about to collapse.
-    fireMessageStart(f.pi, f.ctx, "assistant");
+    // that the rewind is about to collapse. The kill switch must be off here
+    // even if the caller's shell sets it, or the test passes vacuously.
+    delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
+    try {
+      fireMessageStart(f.pi, f.ctx, "assistant");
+    } finally {
+      if (saved !== undefined)
+        process.env.PI_NAVIGATE_TREE_START_ANCHOR = saved;
+    }
     assert.equal(__testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL), null);
     assert.ok(
       !f.pi.setLabelCalls.some(([, label]) => label === START_ANCHOR_LABEL),
@@ -6485,14 +6492,13 @@ describe("rewind hint: turn_end handler (#44)", () => {
 
   it("an empty-named manual label alone counts as no anchors", async () => {
     const fixture = makeConfigFixture();
-    let savedStartEnv: string | undefined;
+    const savedStartEnv = process.env.PI_NAVIGATE_TREE_START_ANCHOR;
     try {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
       const { sm, pi, ctx } = setup();
       // `anchor:` is not a valid `rewindTo`, so the model must not be
       // pointed at it. The auto start anchor (default X=0, #116) would
       // label the leaf at this turn_end, so it is switched off here.
-      savedStartEnv = process.env.PI_NAVIGATE_TREE_START_ANCHOR;
       process.env.PI_NAVIGATE_TREE_START_ANCHOR = "0";
       const t = appendTurn(sm, "u-empty", "a-empty");
       pi.pi.setLabel(t.assistantId, "anchor:");
