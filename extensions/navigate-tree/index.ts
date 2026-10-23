@@ -1841,21 +1841,22 @@ function toolError(
 }
 
 /**
- * Environment the extension reads (#118): only the start-anchor kill switch.
- * Production passes the live `process.env` object, so a mid-process change
- * still applies at write time; tests pass their own object and never touch
- * (or inherit) the real environment.
+ * Environment lookup the extension uses (#118): only the start-anchor kill
+ * switch. Production looks the name up in `process.env` on every call, so
+ * any mid-process change (even a reassigned `process.env`) applies at write
+ * time; tests pass a lookup over their own object and never touch (or
+ * inherit) the real kill switch.
  */
-export type NavigateTreeEnv = Readonly<Record<string, string | undefined>>;
+export type ReadEnv = (name: string) => string | undefined;
 
 /** pi's entry point: the factory bound to the live process environment. */
 export default function (pi: ExtensionAPI) {
-  return createNavigateTreeExtension(pi, process.env);
+  return createNavigateTreeExtension(pi, (name) => process.env[name]);
 }
 
 export function createNavigateTreeExtension(
   pi: ExtensionAPI,
-  env: NavigateTreeEnv,
+  readEnv: ReadEnv,
 ) {
   patchAgentSessionPrototype();
 
@@ -3309,7 +3310,7 @@ export function createNavigateTreeExtension(
   ): void {
     // Kill switch read at write time:
     // a mid-process change applies without an extension reload.
-    if (env.PI_NAVIGATE_TREE_START_ANCHOR === "0") return;
+    if (readEnv("PI_NAVIGATE_TREE_START_ANCHOR") === "0") return;
     let sessionId: string;
     try {
       sessionId = sm.getSessionId();

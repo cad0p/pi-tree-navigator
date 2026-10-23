@@ -106,13 +106,16 @@ afterEach(() => {
 
 /**
  * A test-owned environment per extension instance (#118). Tests never read or
- * write `process.env`: the caller's shell cannot leak in, and no test leaks
- * into another. Only the default-export test touches the real environment.
+ * write the start-anchor kill switch in `process.env`: the caller's shell
+ * cannot leak in, and no test leaks into another. Only the default-export
+ * binding test touches the real variable. (`runSessionStart` still points
+ * `PI_CODING_AGENT_DIR` at the config fixture and restores it — that one is
+ * read by pi's `getAgentDir`, not by the extension.)
  */
 type TestEnv = Record<string, string | undefined>;
 
 function navigateTree(pi: ExtensionAPI, env: TestEnv = {}): void {
-  createNavigateTreeExtension(pi, env);
+  createNavigateTreeExtension(pi, (name) => env[name]);
 }
 
 // -----------------------------------------------------------------------------
@@ -7098,7 +7101,7 @@ describe("rewind hint: per-model modelOverrides (#86)", () => {
 describe("automatic start anchor (#55)", () => {
   const ENV_KEY = "PI_NAVIGATE_TREE_START_ANCHOR";
 
-  it("the default export reads the live process.env at write time; an injected env ignores it (#118)", async () => {
+  it("the default export reads process.env at write time, even after a reassignment; an injected env ignores it (#118)", async () => {
     // The one test that touches the real environment: it pins the
     // production binding, so it sets and restores the variable itself.
     const saved = process.env[ENV_KEY];
@@ -7118,6 +7121,17 @@ describe("automatic start anchor (#55)", () => {
       } as never);
       fireMessageStart(pi, ctx, "assistant");
       assert.equal(pi.setLabelCalls.length, 0, "process.env =0 must suppress");
+      // A wholesale reassignment is seen too: the lookup goes through the
+      // global on every write, never through a captured object.
+      delete process.env[ENV_KEY];
+      const original = process.env;
+      try {
+        process.env = { ...original, [ENV_KEY]: "0" };
+        fireMessageStart(pi, ctx, "assistant");
+        assert.equal(pi.setLabelCalls.length, 0, "reassigned =0 suppresses");
+      } finally {
+        process.env = original;
+      }
       delete process.env[ENV_KEY];
       fireMessageStart(pi, ctx, "assistant");
       assert.deepEqual(pi.setLabelCalls, [[userId, START_ANCHOR_LABEL]]);
