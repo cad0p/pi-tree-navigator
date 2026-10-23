@@ -31,7 +31,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import {
   type AgentSession,
   CONFIG_DIR_NAME,
@@ -101,6 +101,21 @@ import {
 
 afterEach(() => {
   __testHooks.resetPrototype();
+});
+
+// The extension reads the start-anchor kill switch from `process.env` at
+// write time (#118): a caller's exported `PI_NAVIGATE_TREE_START_ANCHOR=0`
+// must not leak into tests that expect a start write. Cleared for the whole
+// file; tests that need the switch set it locally and restore it.
+const START_ANCHOR_ENV = "PI_NAVIGATE_TREE_START_ANCHOR";
+let callerStartAnchorEnv: string | undefined;
+before(() => {
+  callerStartAnchorEnv = process.env[START_ANCHOR_ENV];
+  delete process.env[START_ANCHOR_ENV];
+});
+after(() => {
+  if (callerStartAnchorEnv === undefined) delete process.env[START_ANCHOR_ENV];
+  else process.env[START_ANCHOR_ENV] = callerStartAnchorEnv;
 });
 
 // -----------------------------------------------------------------------------
