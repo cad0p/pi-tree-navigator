@@ -3281,7 +3281,8 @@ export default function (pi: ExtensionAPI) {
   const toolActiveBySession = new Map<string, boolean>();
 
   // Auto start anchor (#55): silent `anchor:start` write, shared by the
-  // `turn_end` trigger and the `agent_end` fallback. `completedTurns` is the
+  // first-prompt `message_start` trigger (X=0, #116), the `turn_end`
+  // trigger and the `agent_end` fallback. `completedTurns` is the
   // number of finished turns in the current agent run
   // (`Number.POSITIVE_INFINITY` for the run-end fallback). Fail-open
   // everywhere: any read/write failure leaves the session unsettled so the
@@ -3771,6 +3772,27 @@ export default function (pi: ExtensionAPI) {
         "warning",
       );
     }
+  });
+
+  // Auto start anchor at X=0 (#116): the first user prompt. pi persists a
+  // message only AFTER its extension `message_end` dispatch, so the user
+  // message's own `message_end` still sees the pre-prompt leaf; the first
+  // assistant `message_start` of the run is the first event where the prompt
+  // (and any context messages sent with it) is the persisted leaf. It fires
+  // at stream start, and on the error path too, before the reply is
+  // persisted. With X>0 the 0 passed here is below the bound — a no-op, and
+  // `turn_end` / `agent_end` stay the triggers (they also back X=0 up).
+  pi.on("message_start", (event, ctx) => {
+    if (event.message?.role !== "assistant") return;
+    let sm: typeof ctx.sessionManager;
+    try {
+      sm = ctx.sessionManager;
+      // A pending rewind owns the leaf (#90): never anchor mid-rewind.
+      if (livePending(sm as SessionManager, sm.getSessionId())) return;
+    } catch {
+      return;
+    }
+    writeStartAnchorIfNeeded(sm as SessionManager, 0);
   });
 
   // Auto start anchor (#55) run-end fallback: a run that finishes before its

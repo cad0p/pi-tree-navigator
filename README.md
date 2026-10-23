@@ -73,7 +73,7 @@ Both the rewind hint and the automatic start anchor read one two-layer config fi
 | Project | `join(cwd, CONFIG_DIR_NAME, "tree-navigator.json")` (`.pi/` by default; read only when the project is trusted — untrusted projects are ignored silently) |
 
 ```json
-{ "rewindHintReserveTokens": 50000, "anchorStartAfterTurns": 2 }
+{ "rewindHintReserveTokens": 50000, "anchorStartAfterTurns": 0 }
 ```
 
 A project key, when present, wins (including the hint's disable sentinels); absent → global; absent everywhere → the field's default. File-level problems (non-ENOENT read error, invalid JSON, non-object root) warn and make that layer contribute nothing for *every* field, so the other layer still applies; a missing file is silent. Each field-level invalid value emits its own field-scoped warning when the session has a UI (headless sessions stay silent, like every `ui.notify`).
@@ -187,19 +187,22 @@ The thinking level is not changed for the forced turns, so they stay cached.
 
 ## Automatic start anchor
 
-Independent of the hint, the extension writes a silent `anchor:start` label at the X-th turn of the agent run (or at the run's end if it finishes earlier), so every session leg has a guaranteed low-floor fallback rewind target (typically ~4% of the window) with no user action. `start` shows up in `list` output like any other anchor; nothing else model-visible changes in v1.
+Independent of the hint, the extension writes a silent `anchor:start` label so every session leg has a guaranteed low-floor fallback rewind target with no user action. By default (X=0) it labels the first user prompt — the leaf right after it, before the first assistant reply — so the floor is only the base load (system prompt + first message). With X ≥ 1 it labels the X-th turn of the agent run instead (or the run's end if it finishes earlier). `start` shows up in `list` output like any other anchor; nothing else model-visible changes.
+
+Why 0 (#116): on small windows the first turns are expensive. Haiku 5.5 subagents (100k) measured 12–15k at the first prompt but 19–40k after two turns, and a session landing at 40% on every rewind refilled the window with re-reads before making any edit. In isolated replays the first-prompt anchor gave more working room and did not make the retained first prompt take over after a rewind (the stale-request re-answers happened at X=2, where the retained turns show the agent working on the old request). It also gives rewind-driven compaction an anchor when the very first reply overflows (#104).
 
 `anchorStartAfterTurns` (see [Configuration](#configuration-tree-navigatorjson)):
 
-- Value: integer **1–50** inclusive. A bare number is canonical (`2`); numeric strings (`"2"`) are accepted. Default **2**.
+- Value: integer **0–50** inclusive. `0` = the first user prompt; `N ≥ 1` = the N-th turn of the run. A bare number is canonical (`0`); numeric strings (`"0"`) are accepted. Default **0**.
 - **Non-optional**: unlike the hint, an absent `anchorStartAfterTurns` — or no config file at all — still fires at the default; absence is never a warning.
-- Invalid value (out of range, decimal, non-numeric string, `null`, `false`, object): a field-scoped warning, then the other layer's valid value applies, else the default 2 — a touched-but-invalid value must not disable a non-optional feature.
-- Precedence: trusted project > global > default 2.
+- Invalid value (out of range, decimal, non-numeric string, `null`, `false`, object): a field-scoped warning, then the other layer's valid value applies, else the default 0 — a touched-but-invalid value must not disable a non-optional feature.
+- Precedence: trusted project > global > default 0.
 - Kill switch: `PI_NAVIGATE_TREE_START_ANCHOR=0` suppresses the write, read at write time (a mid-process change applies without `/reload`).
 
 Behavior and edge cases:
 
-- **Run-bounded**: X counts native turns of the current agent run. A run shorter than X anchors at its end (`agent_end`); `agent_end` fires on completed, aborted, and errored runs, so settlement always happens by the end of the first run (with X=2, even a one-turn run anchors at turn 1).
+- **First prompt (X=0)**: written when the run's first assistant message starts (pi persists the prompt, and any context messages sent with it, just before), so it lands even if that reply errors or overflows. The first `turn_end` and `agent_end` back it up.
+- **Run-bounded (X ≥ 1)**: X counts native turns of the current agent run. A run shorter than X anchors at its end (`agent_end`); `agent_end` fires on completed, aborted, and errored runs, so settlement always happens by the end of the first run (with X=2, even a one-turn run anchors at turn 1). An overflowed turn is never anchored.
 - **Once per session**: `start` marks the start of the current session leg. Once the label is written — or found already on the active branch (e.g. a manual `/tree` label) — the extension never writes it again in that session, including later prompts and agent loops. `/reload` re-evaluates only via the existence check, so no duplicate is ever written.
 - **Every session**, including subagents, gated only on `navigate_tree` being in the active tool set (headless included).
 - **Labels are unique** (see [What you get](#what-you-get)): the tool refuses a duplicate `name`/`newLabel`, so `start` is never moved or overwritten by the agent. A manual `/tree` duplicate remains possible; `list` shows both and `rewindTo` resolves leaf-most.

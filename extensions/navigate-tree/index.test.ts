@@ -5892,6 +5892,15 @@ function fireTurnEnd(pi: FakePi, ctx: FakeCtx, turnIndex = 0): void {
   handlers[1]({ type: "turn_end", turnIndex } as never, ctx as never);
 }
 
+/** Fire every captured `message_start` handler for a message of `role`. */
+function fireMessageStart(pi: FakePi, ctx: FakeCtx, role: string): void {
+  const handlers = pi.onCalls.get("message_start");
+  assert.ok(handlers, "factory must register a message_start handler");
+  for (const h of handlers) {
+    h({ type: "message_start", message: { role } } as never, ctx as never);
+  }
+}
+
 /** Fire the captured `agent_end` handler (run-end fallback). */
 function fireAgentEnd(pi: FakePi, ctx: FakeCtx): void {
   const handlers = pi.onCalls.get("agent_end");
@@ -6452,7 +6461,9 @@ describe("rewind hint: turn_end handler (#44)", () => {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
       const { sm, pi, ctx } = setup();
       // `anchor:` is not a valid `rewindTo`, so the model must not be
-      // pointed at it.
+      // pointed at it. The auto start anchor (default X=0, #116) would
+      // label the leaf at this turn_end, so it is switched off here.
+      process.env.PI_NAVIGATE_TREE_START_ANCHOR = "0";
       const t = appendTurn(sm, "u-empty", "a-empty");
       pi.pi.setLabel(t.assistantId, "anchor:");
       await runSessionStart(pi, ctx, fixture);
@@ -6463,6 +6474,7 @@ describe("rewind hint: turn_end handler (#44)", () => {
         [buildNoAnchorText(95, 1_000_000), "warning"],
       ]);
     } finally {
+      delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
       cleanupConfigFixture(fixture);
     }
   });
@@ -7066,9 +7078,93 @@ describe("automatic start anchor (#55)", () => {
     assert.equal(handlers.length, 1);
   });
 
-  it("defaults to X=2 with no config: silent write at the 2nd turn, no model message, no UI", async () => {
+  it("defaults to X=0 with no config (#116): labels the first user prompt at the first assistant message_start, silently", async () => {
     const fixture = makeConfigFixture();
     try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      assert.deepEqual(ctx.notifyCalls, [], "absent config must not warn");
+      assert.equal(START_ANCHOR_DEFAULT_TURNS, 0);
+
+      const userId = sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "first prompt" }],
+      } as never);
+      // The user message's own message_start is not the trigger.
+      fireMessageStart(pi, ctx, "user");
+      assert.equal(pi.setLabelCalls.length, 0);
+      fireMessageStart(pi, ctx, "assistant");
+      assert.deepEqual(pi.setLabelCalls, [[userId, START_ANCHOR_LABEL]]);
+      assert.equal(
+        __testHooks.findLabeledEntry(sm, START_ANCHOR_LABEL),
+        userId,
+      );
+      // Once per session: later assistant messages and turns do not re-write.
+      appendTurn(sm, "u2", "a2");
+      fireMessageStart(pi, ctx, "assistant");
+      fireTurnEnd(pi, ctx, 0);
+      fireAgentEnd(pi, ctx);
+      assert.equal(pi.setLabelCalls.length, 1);
+      // Silent: label entry only — no model message, no UI.
+      assert.equal(pi.sendMessageCalls.length, 0);
+      assert.deepEqual(ctx.notifyCalls, []);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("X=0: turn_end backs up a missed message_start (labels the turn's tail)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      appendTurn(sm, "u1", "a1");
+      const leaf = sm.getLeafId();
+      fireTurnEnd(pi, ctx, 0);
+      assert.deepEqual(pi.setLabelCalls, [[leaf, START_ANCHOR_LABEL]]);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("X>0: the assistant message_start is a no-op", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 1 }));
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "first prompt" }],
+      } as never);
+      fireMessageStart(pi, ctx, "assistant");
+      assert.equal(pi.setLabelCalls.length, 0);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("X=0: the kill switch suppresses the message_start write", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      process.env[ENV_KEY] = "0";
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "first prompt" }],
+      } as never);
+      fireMessageStart(pi, ctx, "assistant");
+      assert.equal(pi.setLabelCalls.length, 0);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("X=2 when configured: silent write at the 2nd turn, no model message, no UI", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ anchorStartAfterTurns: 2 }));
       const { sm, pi, ctx } = setup();
       await runSessionStart(pi, ctx, fixture);
       assert.deepEqual(ctx.notifyCalls, [], "absent config must not warn");
