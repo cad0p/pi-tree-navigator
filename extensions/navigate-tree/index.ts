@@ -1844,8 +1844,8 @@ function toolError(
  * Environment lookup the extension uses (#118): only the start-anchor kill
  * switch. Production looks the name up in `process.env` on every call, so
  * any mid-process change (even a reassigned `process.env`) applies at write
- * time; tests pass a lookup over their own object, so the caller's shell
- * value cannot leak into them.
+ * time. Tests that build through the factory pass a lookup over their own
+ * object, so the caller's shell value cannot leak into them.
  */
 export type ReadEnv = (name: string) => string | undefined;
 

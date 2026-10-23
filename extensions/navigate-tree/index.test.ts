@@ -105,12 +105,15 @@ afterEach(() => {
 });
 
 /**
- * A test-owned environment per extension instance (#118). Apart from the
- * default-export binding test, no test reads or writes the start-anchor kill
- * switch in `process.env`: the caller's shell cannot leak in, and no test
- * leaks into another. (`runSessionStart` still points
- * `PI_CODING_AGENT_DIR` at the config fixture and restores it — that one is
- * read by pi's `getAgentDir`, not by the extension.)
+ * A test-owned environment for instances built through this wrapper (and so
+ * `setup()`) (#118). Apart from the default-export binding test, no test
+ * reads or writes the start-anchor kill switch in `process.env`, so the
+ * caller's shell cannot leak in and no test leaks into another. Two tests
+ * build through the default export: the binding test, and the registration
+ * test, which only calls `list` and never reaches a start-anchor write.
+ * (`runSessionStart` still points `PI_CODING_AGENT_DIR` at the config
+ * fixture and restores it: pi's `getAgentDir`, which the config loader
+ * calls, reads it. It is not the kill switch.)
  */
 type TestEnv = Record<string, string | undefined>;
 
