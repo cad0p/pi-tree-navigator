@@ -7102,8 +7102,8 @@ describe("automatic start anchor (#55)", () => {
   const ENV_KEY = "PI_NAVIGATE_TREE_START_ANCHOR";
 
   it("the default export reads process.env at write time, even after a reassignment; an injected env ignores it (#118)", async () => {
-    // The one test that touches the real environment: it pins the
-    // production binding, so it sets and restores the variable itself.
+    // The one test that touches the real kill switch in process.env: it pins
+    // the production binding, so it sets and restores the variable itself.
     const saved = process.env[ENV_KEY];
     const fixture = makeConfigFixture();
     try {
