@@ -3502,6 +3502,34 @@ describe("rewind phase 2: failed attempts are hidden and re-sent (#90)", () => {
     assert.equal(done?.details.status, "done");
   });
 
+  it("an assistant message_start while a rewind is pending writes no start anchor (#116)", async () => {
+    // Reachable case: the kill switch was on while the session built up, so
+    // no `start` exists, and it is unset before the summary turn starts.
+    const saved = process.env.PI_NAVIGATE_TREE_START_ANCHOR;
+    process.env.PI_NAVIGATE_TREE_START_ANCHOR = "0";
+    const f = setup();
+    try {
+      setupRewindable(f.sm, f.pi, { capture: true, rewindToName: "cg" });
+      await requestRewind(f, { ...REWIND_ARGS, rewindTo: "cg" });
+    } finally {
+      if (saved === undefined) delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
+      else process.env.PI_NAVIGATE_TREE_START_ANCHOR = saved;
+    }
+    assert.equal(
+      __testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL),
+      null,
+      "precondition: no start label yet",
+    );
+    // The summary turn starting: X=0 would otherwise label the mid-task leaf
+    // that the rewind is about to collapse.
+    fireMessageStart(f.pi, f.ctx, "assistant");
+    assert.equal(__testHooks.findLabeledEntry(f.sm, START_ANCHOR_LABEL), null);
+    assert.ok(
+      !f.pi.setLabelCalls.some(([, label]) => label === START_ANCHOR_LABEL),
+    );
+    assert.ok(fireToolCall(f.pi, f.ctx), "still pending");
+  });
+
   it("agent_end keeps a pending rewind (agent_before_settle decides)", async () => {
     const f = await pending();
     fireAgentEnd(f.pi, f.ctx);
@@ -6457,12 +6485,14 @@ describe("rewind hint: turn_end handler (#44)", () => {
 
   it("an empty-named manual label alone counts as no anchors", async () => {
     const fixture = makeConfigFixture();
+    let savedStartEnv: string | undefined;
     try {
       writeGlobalConfig(fixture, ENABLED_CONFIG);
       const { sm, pi, ctx } = setup();
       // `anchor:` is not a valid `rewindTo`, so the model must not be
       // pointed at it. The auto start anchor (default X=0, #116) would
       // label the leaf at this turn_end, so it is switched off here.
+      savedStartEnv = process.env.PI_NAVIGATE_TREE_START_ANCHOR;
       process.env.PI_NAVIGATE_TREE_START_ANCHOR = "0";
       const t = appendTurn(sm, "u-empty", "a-empty");
       pi.pi.setLabel(t.assistantId, "anchor:");
@@ -6474,7 +6504,9 @@ describe("rewind hint: turn_end handler (#44)", () => {
         [buildNoAnchorText(95, 1_000_000), "warning"],
       ]);
     } finally {
-      delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
+      if (savedStartEnv === undefined)
+        delete process.env.PI_NAVIGATE_TREE_START_ANCHOR;
+      else process.env.PI_NAVIGATE_TREE_START_ANCHOR = savedStartEnv;
       cleanupConfigFixture(fixture);
     }
   });
