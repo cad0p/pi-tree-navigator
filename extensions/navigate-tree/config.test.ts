@@ -227,7 +227,9 @@ describe("parseTreeNavigatorConfig", () => {
 
   describe("anchorStartAfterTurns: accepts integer turn bounds (number and string forms)", () => {
     const accepted: Array<[string, unknown, number]> = [
-      ["default", 2, 2],
+      ["default (#116: first user prompt)", 0, 0],
+      ["two", 2, 2],
+      ["zero string", "0", 0],
       ["numeric string", "2", 2],
       ["trimmed numeric string", " 2 ", 2],
       ["min edge number", START_ANCHOR_MIN_TURNS, START_ANCHOR_MIN_TURNS],
@@ -248,7 +250,6 @@ describe("parseTreeNavigatorConfig", () => {
 
   describe("anchorStartAfterTurns: rejects unusable field values as invalid", () => {
     const invalid: Array<[string, unknown]> = [
-      ["zero (no turn 0)", 0],
       ["one above max", START_ANCHOR_MAX_TURNS + 1],
       ["negative", -1],
       ["decimal", 2.5],

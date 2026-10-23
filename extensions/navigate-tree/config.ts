@@ -17,8 +17,10 @@
  *     hint, fired when the tokens left in the window drop to the reserve,
  *     or a disable sentinel. Replaces `rewindHintAtPercent` (removed in
  *     0.3.0): a present legacy key only warns and is otherwise ignored.
- *   - `anchorStartAfterTurns` (issue #55): turn bound for the automatic
- *     `anchor:start` write. Non-optional — an absent key still fires.
+ *   - `anchorStartAfterTurns` (issues #55/#116): turn bound for the
+ *     automatic `anchor:start` write. Non-optional — an absent key still
+ *     fires. `0` (the default since #116) anchors the first user prompt,
+ *     before the first assistant reply.
  *   - `modelOverrides` (issue #86): per-model `rewindHintReserveTokens`,
  *     keyed by exact `provider/modelId`, mirroring pi's
  *     `compaction.modelOverrides`. Layers merge per key (project entry over
@@ -59,14 +61,17 @@ import { join } from "node:path";
 export const TREE_NAVIGATOR_CONFIG_FILENAME = "tree-navigator.json";
 export const REWIND_HINT_MIN_RESERVE = 1_000;
 export const REWIND_HINT_MAX_RESERVE = 1_000_000;
-export const START_ANCHOR_MIN_TURNS = 1;
+export const START_ANCHOR_MIN_TURNS = 0;
 export const START_ANCHOR_MAX_TURNS = 50;
 /**
  * Effective turn bound when `anchorStartAfterTurns` is absent everywhere
  * (or invalid in every layer that touched it). Unlike the hint, the start
  * anchor is non-optional: a missing config file still fires at this default.
+ * `0` (#116): the label lands on the first user prompt, so the guaranteed
+ * fallback rewind target costs only the base load (system prompt + first
+ * message) — the turns after it are what small-window sessions need room for.
  */
-export const START_ANCHOR_DEFAULT_TURNS = 2;
+export const START_ANCHOR_DEFAULT_TURNS = 0;
 
 /**
  * Per-field parse outcome for `rewindHintReserveTokens`.
