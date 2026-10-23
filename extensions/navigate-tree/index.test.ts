@@ -105,10 +105,10 @@ afterEach(() => {
 });
 
 /**
- * A test-owned environment per extension instance (#118). Tests never read or
- * write the start-anchor kill switch in `process.env`: the caller's shell
- * cannot leak in, and no test leaks into another. Only the default-export
- * binding test touches the real variable. (`runSessionStart` still points
+ * A test-owned environment per extension instance (#118). Apart from the
+ * default-export binding test, no test reads or writes the start-anchor kill
+ * switch in `process.env`: the caller's shell cannot leak in, and no test
+ * leaks into another. (`runSessionStart` still points
  * `PI_CODING_AGENT_DIR` at the config fixture and restores it — that one is
  * read by pi's `getAgentDir`, not by the extension.)
  */
