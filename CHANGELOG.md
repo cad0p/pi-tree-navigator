@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* The withhold walk is bounded by the projection, not by an entry type (closes #112)
 - *(rewind)* The hint copy carries the percentage only (closes #114)
 - *(tests)* Inject an env lookup so only the binding test touches the real kill switch (closes #118)
+- *(rewind)* The nested refusal states the solo rule, with no codemode wording (closes #120)
 
 
 ## [0.3.0] - 2026-10-15
