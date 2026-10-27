@@ -4368,6 +4368,11 @@ describe("rewind: solo-call guard (#37, restored by #90 S6)", () => {
       );
     // A nested list is fine, but then the script's rewind is not its first call.
     assert.equal(nested("tc-code/1", "list"), undefined);
+    // The refusal is the solo rule, with no codemode wording (#120).
+    assert.equal(
+      NESTED_REWIND_REFUSAL,
+      "rewind must be the only tool call in its message — re-issue only the rewind, alone.",
+    );
     assert.deepEqual(nested("tc-code/2", "rewind"), {
       block: true,
       reason: NESTED_REWIND_REFUSAL,

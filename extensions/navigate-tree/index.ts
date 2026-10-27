@@ -1283,13 +1283,21 @@ export const REWIND_OUTCOME_CUSTOM_TYPE = "navigate-tree-rewind-outcome";
 export const SUMMARY_PENDING_BLOCK_REASON = `${TOOL_NAME}: blocked: the model tried to call a tool instead of summarizing.`;
 
 /** Refusal of a rewind that shares its assistant message with other calls (#37). */
-export const SOLO_REWIND_REFUSAL =
-  "rewind must be the only tool call in its message — re-issue only the rewind, alone. The other calls in this message ran normally.";
+/** The solo-call rule (#37), shared by the batch and nested refusals. */
+const SOLO_REWIND_RULE =
+  "rewind must be the only tool call in its message — re-issue only the rewind, alone.";
+export const SOLO_REWIND_REFUSAL = `${SOLO_REWIND_RULE} The other calls in this message ran normally.`;
 
 /** pi-codemode's tool name: its scripts issue nested calls (#103). */
 const CODEMODE_TOOL_NAME = "codemode";
-/** Refusal of a codemode script's rewind that is not its first nested call (#103). */
-export const NESTED_REWIND_REFUSAL = `rewind from a codemode script must be the script's first nested call — call ${TOOL_NAME} directly, or start the script with it.`;
+/**
+ * Refusal of a codemode script's rewind that is not its first nested call
+ * (#103): the same solo rule, with no codemode wording (#120). Under
+ * `codemode.mode: "only"` there is no direct call to point at. It drops the
+ * "ran normally" clause: in a script that awaits the rewind, the calls after
+ * it never run.
+ */
+export const NESTED_REWIND_REFUSAL = SOLO_REWIND_RULE;
 
 /** The rewind's tool result (#90): it only reports that the rewind was accepted. */
 export function buildRewindAcceptedText(
