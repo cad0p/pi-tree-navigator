@@ -2820,10 +2820,13 @@ describe("rewind phase 2: completion", () => {
     assert.match(text, /### Blocked/);
     assert.match(text, /## Next Steps/);
     assert.match(text, /are pending/);
-    assert.match(text, /It is the newest branch_summary, the current state/);
+    assert.match(text, /It represents the current state/);
+    assert.match(text, /are from historical collapsed segments/);
     assert.match(text, /continuing the latest branch_summary's work/);
-    assert.match(text, /User messages retained above predate this rewind/);
-    assert.match(text, /do not re-answer them/);
+    assert.ok(
+      !/do not re-answer them/.test(text),
+      "the re-answer clause is gone: one 'historical collapsed segments' sentence carries it",
+    );
   });
 
   it("refreshes agent.state.messages to the rewound chain", async () => {
@@ -4931,7 +4934,7 @@ describe("rewind message copy (byte-exact)", () => {
         },
         4_000,
       ),
-      "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M\n\nA branch_summary of the collapsed work has been appended to your context. It is the newest branch_summary, the current state; earlier branch_summary messages, if present, are older collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work. User messages retained above predate this rewind — do not re-answer them.",
+      "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M\n\nA branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work.",
     );
   });
 
