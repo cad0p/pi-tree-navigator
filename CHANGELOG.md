@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* The hint copy carries the percentage only (closes #114)
 - *(tests)* Inject an env lookup so only the binding test touches the real kill switch (closes #118)
 - *(rewind)* The nested refusal states the solo rule, with no codemode wording (closes #120)
+- *(rewind)* The continuation prose says the summary represents the current state (closes #125)
 
 
 ## [0.3.0] - 2026-10-15
