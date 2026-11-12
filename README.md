@@ -229,8 +229,8 @@ agent: navigate_tree(action="rewind", rewindTo="impl-start", newLabel="impl-end"
 agent: ## Goal ... ## Next Steps ...        ← the summary, a plain live turn (cache hit)
   → [rewind to 'impl-start' · collapsed as 'impl-end'] · context 30.4% → 4.1% of 1.0M
     A branch_summary of the collapsed work has been appended to your context.
-    It is the newest branch_summary, the current state. User messages retained
-    above predate this rewind — do not re-answer them. ...
+    It represents the current state; earlier branch_summary or user messages,
+    if present, are from historical collapsed segments. ...
 
 agent: ...continues with the freed context, the next API call is back at ~4%...
 ```
