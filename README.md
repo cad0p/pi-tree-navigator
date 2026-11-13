@@ -230,9 +230,8 @@ agent: ## Goal ... ## Next Steps ...        ← the summary, a plain live turn (
   → [rewind to 'impl-start' · collapsed as 'impl-end'] · context 30.4% → 4.1% of 1.0M
     A branch_summary of the collapsed work has been appended to your context.
     It represents the current state; earlier branch_summary or user messages,
-    if present, are from historical collapsed segments. ... resuming the latest
-    branch_summary's work. Do not continue previous state or user messages; those
-    are just historical context from this session. ...
+    if present, are from historical collapsed segments. ... continuing the
+    latest branch_summary's work. ...
 
 agent: ...continues with the freed context, the next API call is back at ~4%...
 ```
