@@ -1806,17 +1806,185 @@ function collectLateEntries(
   return late;
 }
 
+/** Quote lengths of the done copy (#135): shorter quotes measured worse. */
+const DONE_LATEST_QUOTE_CHARS = 160;
+const DONE_RETAINED_QUOTE_CHARS = 80;
+const DONE_NEXT_STEP_QUOTE_CHARS = 200;
+
+export interface RewindDoneUserMessage {
+  text: string;
+  /** The entry's ISO timestamp. */
+  timestamp?: string;
+}
+
+/**
+ * What the done copy quotes (#135). A model that sees only "earlier messages
+ * are history" still acts on a retained user message; it stops when it is
+ * shown the newer user message that the collapse removed, and its next step.
+ */
+export interface RewindDoneFacts {
+  /** The newest user message inside the collapsed work. */
+  latest?: RewindDoneUserMessage;
+  /**
+   * The user message before it, also collapsed. Quoted too because the newest
+   * one is often no request at all ("rewind now", "ok"), and on its own it
+   * reads as "nothing real was asked since the retained message".
+   */
+  previous?: RewindDoneUserMessage;
+  /** The newest user message still in context, above the branch_summary. */
+  retained?: RewindDoneUserMessage;
+  /** The first item of the summary's `## Next Steps`. */
+  nextStep?: string;
+  /** Late messages re-appended after the branch_summary: new input. */
+  lateCount?: number;
+}
+
+function quoteSnippet(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max).trimEnd()}…` : oneLine;
+}
+
+function userMessageText(entry: SessionEntry): string | undefined {
+  if (entry.type !== "message" || entry.message.role !== "user") {
+    return undefined;
+  }
+  const content: unknown = entry.message.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content
+            .map((block: unknown) =>
+              block &&
+              typeof block === "object" &&
+              typeof (block as { text?: unknown }).text === "string"
+                ? (block as { text: string }).text
+                : "",
+            )
+            .join(" ")
+        : "";
+  return text.trim() ? text : undefined;
+}
+
+function newestUserIndex(
+  entries: readonly SessionEntry[],
+  before: number,
+): number {
+  for (let i = before - 1; i >= 0; i--) {
+    if (userMessageText(entries[i]) !== undefined) return i;
+  }
+  return -1;
+}
+
+function userMessageAt(
+  entries: readonly SessionEntry[],
+  index: number,
+): RewindDoneUserMessage | undefined {
+  if (index < 0) return undefined;
+  const text = userMessageText(entries[index]);
+  return text === undefined
+    ? undefined
+    : { text, timestamp: entries[index].timestamp };
+}
+
+/** The first list item under the summary's `## Next Steps`. */
+export function firstNextStep(summaryText: string): string | undefined {
+  const section = summaryText.match(
+    /^## Next Steps[ \t]*\n([\s\S]*?)(?=\n## |\n<read-files>|\n<modified-files>|$(?![\s\S]))/m,
+  );
+  if (!section) return undefined;
+  for (const line of section[1].split("\n")) {
+    const item = line.trim().match(/^(?:\d+[.)]|[-*])\s+(.*\S)/);
+    if (item) return item[1];
+  }
+  return undefined;
+}
+
+/**
+ * `collapsed`: the entries the rewind collapses, oldest first. Those after
+ * the rewind call are late input, not collapsed work, and are left out.
+ * `retained`: the entries that stay in context (root to the anchor).
+ */
+export function collectRewindDoneFacts(
+  collapsed: readonly SessionEntry[],
+  retained: readonly SessionEntry[],
+  rewindEntryId: string,
+  summaryText: string,
+): RewindDoneFacts {
+  const cut = collapsed.findIndex((e) => e.id === rewindEntryId);
+  const work = cut < 0 ? collapsed : collapsed.slice(0, cut);
+  const newest = newestUserIndex(work, work.length);
+  return {
+    latest: userMessageAt(work, newest),
+    previous: userMessageAt(work, newestUserIndex(work, newest)),
+    retained: userMessageAt(
+      retained,
+      newestUserIndex(retained, retained.length),
+    ),
+    nextStep: firstNextStep(summaryText),
+  };
+}
+
+function stamp(timestamp: string | undefined, chars: number): string {
+  if (!timestamp || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(timestamp)) {
+    return "";
+  }
+  const value = timestamp.slice(0, chars).replace("T", " ");
+  return chars > 10 ? ` (${value} UTC)` : ` (${value})`;
+}
+
 export function buildRewindDoneText(
   pending: Pick<
     PendingRewind,
     "rewindTo" | "newLabel" | "beforeTokens" | "contextWindow"
   >,
   afterTokens: number,
+  facts: RewindDoneFacts = {},
 ): string {
-  return (
-    `[rewind to '${pending.rewindTo}' · collapsed as '${pending.newLabel}'] · ${formatContextDelta(pending.beforeTokens, afterTokens, pending.contextWindow)}\n\n` +
-    `A branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, resuming the latest branch_summary's work. Do not continue previous state or user messages; those are just historical context from this session.`
+  const parts = [
+    `[rewind to '${pending.rewindTo}' · collapsed as '${pending.newLabel}'] · ${formatContextDelta(pending.beforeTokens, afterTokens, pending.contextWindow)}`,
+  ];
+  const late = facts.lateCount ?? 0;
+  const step = facts.nextStep
+    ? `Next Steps item 1: "${quoteSnippet(facts.nextStep, DONE_NEXT_STEP_QUOTE_CHARS)}"`
+    : undefined;
+  if (late > 0) {
+    // The late messages are the newest user input: nothing is quoted as
+    // "the latest user message", and the summary's work comes after them.
+    parts.push(buildLateEntriesNote(late));
+    parts.push(
+      step
+        ? `Then your next action is ${step}`
+        : "Then resume the branch_summary's Next Steps.",
+    );
+    return parts.join("\n\n");
+  }
+  const retained = facts.retained
+    ? `"${quoteSnippet(facts.retained.text, DONE_RETAINED_QUOTE_CHARS)}"${stamp(facts.retained.timestamp, 10)}`
+    : undefined;
+  const quote = (message: RewindDoneUserMessage) =>
+    `"${quoteSnippet(message.text, DONE_LATEST_QUOTE_CHARS)}"${stamp(message.timestamp, 16)}`;
+  const older = retained
+    ? ` ${retained} is older; it is not a new request.`
+    : "";
+  if (facts.latest) {
+    parts.push(
+      (facts.previous
+        ? `The latest user messages are ${quote(facts.previous)} and ${quote(facts.latest)}, inside the collapsed work.`
+        : `The latest user message is ${quote(facts.latest)}, inside the collapsed work.`) +
+        older,
+    );
+  } else if (retained) {
+    parts.push(
+      `The user message ${retained} predates this branch_summary; it is not a new request.`,
+    );
+  }
+  parts.push(
+    step
+      ? `Your next action is ${step}`
+      : "Resume the branch_summary's Next Steps.",
   );
+  return parts.join("\n\n");
 }
 
 export function buildLateEntriesNote(count: number): string {
@@ -2548,6 +2716,18 @@ export function createNavigateTreeExtension(
         `the branch could not be written (${err instanceof Error ? err.message : String(err)})`,
       );
     }
+    // What the continuation quotes (#135). Guarded: the branch has landed.
+    let doneFacts: RewindDoneFacts = {};
+    try {
+      doneFacts = collectRewindDoneFacts(
+        entries,
+        sm.getBranch(pending.target),
+        pending.rewindEntryId,
+        summaryText,
+      );
+    } catch {
+      doneFacts = {};
+    }
     pendingRewinds.delete(sessionId);
     // A forced rewind landed: the gate lifts (#101, D7).
     forcedRewinds.delete(sessionId);
@@ -2595,9 +2775,10 @@ export function createNavigateTreeExtension(
     );
     return [
       rewindMessageDraft(
-        buildRewindDoneText(pending, afterTokens) +
-          (reappended > 0 ? `\n\n${buildLateEntriesNote(reappended)}` : "") +
-          (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
+        buildRewindDoneText(pending, afterTokens, {
+          ...doneFacts,
+          lateCount: reappended,
+        }) + (refreshed ? "" : `\n\n${REFLECTION_BOOTSTRAP_WARNING_REWIND}`),
         {
           status: "done",
           rewindTo: pending.rewindTo,

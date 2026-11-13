@@ -228,11 +228,12 @@ agent: navigate_tree(action="rewind", rewindTo="impl-start", newLabel="impl-end"
 
 agent: ## Goal ... ## Next Steps ...        ← the summary, a plain live turn (cache hit)
   → [rewind to 'impl-start' · collapsed as 'impl-end'] · context 30.4% → 4.1% of 1.0M
-    A branch_summary of the collapsed work has been appended to your context.
-    It represents the current state; earlier branch_summary or user messages,
-    if present, are from historical collapsed segments. ... resuming the latest
-    branch_summary's work. Do not continue previous state or user messages; those
-    are just historical context from this session. ...
+    The latest user messages are "the parser API looks right, now fix edge case X"
+    (2026-11-13 07:41 UTC) and "rewind before you start" (2026-11-13 07:44 UTC),
+    inside the collapsed work. "can you sketch a parser for the config format?"
+    (2026-11-10) is older; it is not a new request.
+
+    Your next action is Next Steps item 1: "Fix edge case X in parse()."
 
 agent: ...continues with the freed context, the next API call is back at ~4%...
 ```
@@ -275,7 +276,9 @@ Every other way a pending rewind can end goes through the same path, so the mode
 
 A provider error keeps the rewind pending without spending an attempt (pi's auto-retry or pi-fallback-provider continues the run); `agent_end` no longer drops it. Each ending is persisted: at a boundary as drafts, otherwise with `appendContextEdit` and `appendEntry`. A `navigate-tree-rewind-outcome` custom entry (`toolCallId`, `status`, `reason`, `text`, `rewindTo`, `newLabel`, `hiddenIds`, `toolResultEntryId`) records it. It renders in the TUI as `[rewind to '<rewindTo>' · collapse as '<newLabel>'] · failed: <reason> · nothing collapsed` (or `· aborted · nothing collapsed`). The `context` handler uses it to send the rewind's tool result with `isError: true`. On `session_start`, an instruction on the active branch with neither a `branch:<newLabel>` label nor an outcome entry after it gets an aborted ending.
 
-Input that arrives after the rewind call (user steers, other extensions' messages such as subagent results or timers) is hidden while the rewind is pending. On success it is re-appended onto the new branch in its original order, and the continuation message flags it as new and still unanswered. On failure it simply becomes visible again, right after the failed rewind's tool result. To pick a different anchor, press Esc and ask again; a steer without Esc does not cancel the rewind.
+The continuation message is short and quotes three things (#135): the last two user messages inside the collapsed work (first 160 characters each, with their time), the newest user message still in context above the summary (first 80 characters, with its date), and the first item of the summary's `## Next Steps` (first 200 characters). Two collapsed messages rather than one, because the newest is often no request at all ("rewind now", "ok"); nothing classifies them. With only one collapsed user message the sentence starts `The latest user message is "…"`. A model that still sees an old request in its context, and no newer one, tends to answer it again after a rewind; telling it "earlier messages are history" did not stop that, showing it the newer message did (measurements in [`scripts/rewind-repro`](scripts/rewind-repro/README.md)). When no user message was collapsed the first sentence becomes `The user message "…" (<date>) predates this branch_summary; it is not a new request.`; when the summary has no list item under `## Next Steps` the last line is `Resume the branch_summary's Next Steps.`
+
+Input that arrives after the rewind call (user steers, other extensions' messages such as subagent results or timers) is hidden while the rewind is pending. On success it is re-appended onto the new branch in its original order, and the continuation message flags it as new and still unanswered instead of quoting a user message (the next step follows as `Then your next action is …`). On failure it simply becomes visible again, right after the failed rewind's tool result. To pick a different anchor, press Esc and ask again; a steer without Esc does not cancel the rewind.
 
 The continuation message is returned as a `turn_end` boundary entry with `continue: true`: pi commits it right after the handler, before draining queued steers, and guarantees one more provider request — so it lands ahead of anything typed meanwhile and the run continues even after a text-only summary turn. Its `details` carry `status`, `rewindTo`, `newLabel`, `targetId`, `summaryId`, `collapsedEntries`, `contextBefore`/`contextAfter`, `contextWindow`, `summaryAttempts`, `agentMessagesRefreshed`, `historyRewriteNotified`, `reappendedLateMessages`, and the file lists. The rewind hint stays silent on any turn a rewind owns.
 

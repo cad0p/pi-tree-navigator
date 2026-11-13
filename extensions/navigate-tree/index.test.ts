@@ -59,8 +59,10 @@ import navigateTreeDefault, {
   buildRewindOutcomeRow,
   buildSummaryFailedText,
   buildSummaryRequestRow,
+  collectRewindDoneFacts,
   createNavigateTreeExtension,
   extractSummaryText,
+  firstNextStep,
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
   MAX_SUMMARY_ATTEMPTS,
@@ -984,6 +986,20 @@ async function rewindFixture(
     summaryEntryId: summary.entryId,
     done: messages[messages.length - 1],
   };
+}
+
+/** The timestamp of the user entry with this text, on or off the branch. */
+function userEntryTimestamp(sm: SessionManager, text: string): string {
+  const entry = sm
+    .getEntries()
+    .find(
+      (e) =>
+        e.type === "message" &&
+        e.message.role === "user" &&
+        JSON.stringify(e.message.content).includes(JSON.stringify(text)),
+    );
+  assert.ok(entry, `no user entry with text ${text}`);
+  return entry.timestamp;
 }
 
 // =============================================================================
@@ -2782,6 +2798,12 @@ describe("rewind phase 2: completion", () => {
           contextWindow: 1_000_000,
         },
         d.contextAfter as number,
+        {
+          latest: { text: "u4", timestamp: userEntryTimestamp(f.sm, "u4") },
+          previous: { text: "u3", timestamp: userEntryTimestamp(f.sm, "u3") },
+          retained: { text: "u1", timestamp: userEntryTimestamp(f.sm, "u1") },
+          nextStep: "Verify the branch_summary.",
+        },
       ),
     );
     assert.deepEqual(d, {
@@ -2811,22 +2833,21 @@ describe("rewind phase 2: completion", () => {
     );
   });
 
-  it("continuation prose: [rewind] header + pending-work guidance", async () => {
+  it("continuation prose: [rewind] header, the collapsed user messages, the retained one, the next step (#135)", async () => {
     const f = await rewindFixture();
     const text = f.done.message.content;
-    assert.match(text, /^\[rewind to 'start' · collapsed as 'end'\] · /);
-    assert.match(text, /### Done/);
-    assert.match(text, /### In Progress/);
-    assert.match(text, /### Blocked/);
-    assert.match(text, /## Next Steps/);
-    assert.match(text, /are pending/);
-    assert.match(text, /It represents the current state/);
-    assert.match(text, /are from historical collapsed segments/);
-    assert.match(text, /resuming the latest branch_summary's work/);
+    const [header, users, next, ...rest] = text.split("\n\n");
+    assert.match(header, /^\[rewind to 'start' · collapsed as 'end'\] · /);
+    // u2..u4 are collapsed, u1 stays above the anchor.
     assert.match(
-      text,
-      /Do not continue previous state or user messages; those are just historical context from this session\./,
+      users,
+      /^The latest user messages are "u3" \(\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\) and "u4" \(\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\), inside the collapsed work\. "u1" \(\d{4}-\d{2}-\d{2}\) is older; it is not a new request\.$/,
     );
+    assert.equal(
+      next,
+      'Your next action is Next Steps item 1: "Verify the branch_summary."',
+    );
+    assert.deepEqual(rest, []);
   });
 
   it("refreshes agent.state.messages to the rewound chain", async () => {
@@ -4662,6 +4683,9 @@ describe("rewind phase 2: multi-block text and late entries", () => {
   const NOTE_TWO =
     "The 2 messages between the branch_summary and this one arrived while the rewind was pending — they are new and still unanswered; handle them now.";
 
+  const LATE_THEN =
+    'Then your next action is Next Steps item 1: "Verify the branch_summary."';
+
   function appendLateUser(sm: SessionManager, text: string): string {
     return sm.appendMessage({
       role: "user",
@@ -4723,7 +4747,8 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     }
     // No steer queue: re-appends never go back through input handlers.
     assert.deepEqual(f.pi.sendUserMessageCalls, []);
-    assert.ok(done.content.endsWith(`\n\n${NOTE_TWO}`));
+    assert.ok(done.content.endsWith(`\n\n${NOTE_TWO}\n\n${LATE_THEN}`));
+    assert.ok(!done.content.includes("inside the collapsed work"));
   });
 
   it("the continuation follows the re-appended entries once delivered", async () => {
@@ -4749,7 +4774,7 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     await summaryTurn(f);
     const done = rewindMessages(f.pi)[0].message;
     assert.equal(done.details.reappendedLateMessages, 1);
-    assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}`));
+    assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}\n\n${LATE_THEN}`));
     assert.equal(buildLateEntriesNote(1), NOTE_ONE);
     assert.equal(buildLateEntriesNote(2), NOTE_TWO);
     assert.equal(
@@ -4851,7 +4876,7 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     const done = rewindMessages(f.pi)[0].message;
     assert.equal(done.details.status, "done");
     assert.equal(done.details.reappendedLateMessages, 1);
-    assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}`));
+    assert.ok(done.content.endsWith(`\n\n${NOTE_ONE}\n\n${LATE_THEN}`));
     assert.deepEqual(tailAfterSummary(f.sm), [
       "branch_summary",
       "label",
@@ -4923,32 +4948,204 @@ describe("rewind phase 2: multi-block text and late entries", () => {
 // =============================================================================
 
 describe("rewind message copy (byte-exact)", () => {
-  it("buildRewindDoneText", () => {
+  const PENDING = {
+    rewindTo: "start",
+    newLabel: "end",
+    beforeTokens: 30_000,
+    contextWindow: 1_000_000,
+  };
+  const HEADER =
+    "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M";
+  const LATEST = {
+    text: "ok, ship the parser fix",
+    timestamp: "2026-11-13T07:41:09.123Z",
+  };
+  const RETAINED = {
+    text: "can you propose a demo?",
+    timestamp: "2026-11-10T18:04:32.269Z",
+  };
+
+  const PREVIOUS = {
+    text: "the parser API looks right",
+    timestamp: "2026-11-13T07:02:44.000Z",
+  };
+
+  it("buildRewindDoneText: the last two collapsed user messages + retained one + next step (#135)", () => {
     assert.equal(
-      buildRewindDoneText(
-        {
-          rewindTo: "start",
-          newLabel: "end",
-          beforeTokens: 30_000,
-          contextWindow: 1_000_000,
-        },
-        4_000,
+      buildRewindDoneText(PENDING, 4_000, {
+        latest: LATEST,
+        previous: PREVIOUS,
+        retained: RETAINED,
+        nextStep: "Run the parser tests.",
+      }),
+      `${HEADER}\n\nThe latest user messages are "the parser API looks right" (2026-11-13 07:02 UTC) and "ok, ship the parser fix" (2026-11-13 07:41 UTC), inside the collapsed work. "can you propose a demo?" (2026-11-10) is older; it is not a new request.\n\nYour next action is Next Steps item 1: "Run the parser tests."`,
+    );
+  });
+
+  it("buildRewindDoneText: one collapsed user message", () => {
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000, {
+        latest: LATEST,
+        retained: RETAINED,
+        nextStep: "Run the parser tests.",
+      }),
+      `${HEADER}\n\nThe latest user message is "ok, ship the parser fix" (2026-11-13 07:41 UTC), inside the collapsed work. "can you propose a demo?" (2026-11-10) is older; it is not a new request.\n\nYour next action is Next Steps item 1: "Run the parser tests."`,
+    );
+  });
+
+  it("buildRewindDoneText: no user message in the collapsed work", () => {
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000, {
+        retained: RETAINED,
+        nextStep: "Run the parser tests.",
+      }),
+      `${HEADER}\n\nThe user message "can you propose a demo?" (2026-11-10) predates this branch_summary; it is not a new request.\n\nYour next action is Next Steps item 1: "Run the parser tests."`,
+    );
+  });
+
+  it("buildRewindDoneText: no retained user message, no next step, no facts", () => {
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000, {
+        latest: LATEST,
+        previous: PREVIOUS,
+      }),
+      `${HEADER}\n\nThe latest user messages are "the parser API looks right" (2026-11-13 07:02 UTC) and "ok, ship the parser fix" (2026-11-13 07:41 UTC), inside the collapsed work.\n\nResume the branch_summary's Next Steps.`,
+    );
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000, { latest: LATEST }),
+      `${HEADER}\n\nThe latest user message is "ok, ship the parser fix" (2026-11-13 07:41 UTC), inside the collapsed work.\n\nResume the branch_summary's Next Steps.`,
+    );
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000),
+      `${HEADER}\n\nResume the branch_summary's Next Steps.`,
+    );
+  });
+
+  it("buildRewindDoneText: late messages are the newest input, so no user message is quoted", () => {
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000, {
+        latest: LATEST,
+        retained: RETAINED,
+        nextStep: "Run the parser tests.",
+        lateCount: 1,
+      }),
+      `${HEADER}\n\nThe message between the branch_summary and this one arrived while the rewind was pending — it is new and still unanswered; handle it now.\n\nThen your next action is Next Steps item 1: "Run the parser tests."`,
+    );
+    assert.equal(
+      buildRewindDoneText(PENDING, 4_000, { latest: LATEST, lateCount: 2 }),
+      `${HEADER}\n\nThe 2 messages between the branch_summary and this one arrived while the rewind was pending — they are new and still unanswered; handle them now.\n\nThen resume the branch_summary's Next Steps.`,
+    );
+  });
+
+  it("buildRewindDoneText: quotes are one line and cut at 160 / 80 / 200 chars; a bad timestamp is left out", () => {
+    const text = buildRewindDoneText(PENDING, 4_000, {
+      latest: { text: `a\n\n  b ${"x".repeat(200)}`, timestamp: "nope" },
+      previous: {
+        text: "p".repeat(161),
+        timestamp: "2026-11-13T07:02:44.000Z",
+      },
+      retained: { text: "r".repeat(81) },
+      nextStep: "s".repeat(201),
+    });
+    assert.equal(
+      text,
+      `${HEADER}\n\nThe latest user messages are "${"p".repeat(160)}…" (2026-11-13 07:02 UTC) and "a b ${"x".repeat(156)}…", inside the collapsed work. "${"r".repeat(80)}…" is older; it is not a new request.\n\nYour next action is Next Steps item 1: "${"s".repeat(200)}…"`,
+    );
+  });
+
+  it("firstNextStep: the first list item under ## Next Steps", () => {
+    assert.equal(
+      firstNextStep("## Goal\nG\n\n## Next Steps\n1. First thing.\n2. Second."),
+      "First thing.",
+    );
+    assert.equal(
+      firstNextStep(
+        "## Next Steps\n\nintro line\n- [ ] Bullet one  \n- two\n\n## Other\n1. not this",
       ),
-      "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M\n\nA branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, resuming the latest branch_summary's work. Do not continue previous state or user messages; those are just historical context from this session.",
+      "[ ] Bullet one",
+    );
+    assert.equal(
+      firstNextStep(
+        "## Next Steps\n1) Paren form\n<read-files>\na\n</read-files>",
+      ),
+      "Paren form",
+    );
+    assert.equal(
+      firstNextStep("## Next Steps\n\n## Other\n1. not this"),
+      undefined,
+    );
+    assert.equal(firstNextStep("## Next Steps\n(none)"), undefined);
+    assert.equal(firstNextStep("## Goal\n1. not a next step"), undefined);
+  });
+
+  it("collectRewindDoneFacts: newest collapsed user message before the rewind call, newest retained one", () => {
+    const user = (id: string, content: unknown, timestamp: string) =>
+      ({
+        type: "message",
+        id,
+        parentId: null,
+        timestamp,
+        message: { role: "user", content },
+      }) as never;
+    const other = (id: string, type: string, role?: string) =>
+      ({
+        type,
+        id,
+        parentId: null,
+        timestamp: "t",
+        ...(role ? { message: { role, content: "assistant text" } } : {}),
+        ...(type === "custom_message" ? { content: "injected" } : {}),
+      }) as never;
+    const facts = collectRewindDoneFacts(
+      [
+        user("c1", "first collapsed", "t1"),
+        user(
+          "c2",
+          [
+            { type: "text", text: "second" },
+            { type: "image" },
+            { type: "text", text: "collapsed" },
+          ],
+          "t2",
+        ),
+        user("c3", [{ type: "image" }], "t3"),
+        other("c4", "custom_message"),
+        other("rw", "message", "assistant"),
+        user("late", "a late steer", "t5"),
+      ],
+      [user("r1", "old ask", "t0"), other("r2", "message", "assistant")],
+      "rw",
+      "## Next Steps\n1. Go.",
+    );
+    assert.deepEqual(facts, {
+      latest: { text: "second  collapsed", timestamp: "t2" },
+      previous: { text: "first collapsed", timestamp: "t1" },
+      retained: { text: "old ask", timestamp: "t0" },
+      nextStep: "Go.",
+    });
+    assert.deepEqual(collectRewindDoneFacts([], [], "rw", "no sections"), {
+      latest: undefined,
+      previous: undefined,
+      retained: undefined,
+      nextStep: undefined,
+    });
+    // Without the rewind entry among the collapsed ones, all of them count.
+    assert.deepEqual(
+      collectRewindDoneFacts([user("c1", "x", "t1")], [], "rw", ""),
+      {
+        latest: { text: "x", timestamp: "t1" },
+        previous: undefined,
+        retained: undefined,
+        nextStep: undefined,
+      },
     );
   });
 
   it("buildRewindDoneText without a context window uses the token form", () => {
     assert.equal(
-      buildRewindDoneText(
-        {
-          rewindTo: "start",
-          newLabel: "end",
-          beforeTokens: 30_000,
-          contextWindow: 0,
-        },
-        4_000,
-      ).split("\n")[0],
+      buildRewindDoneText({ ...PENDING, contextWindow: 0 }, 4_000).split(
+        "\n",
+      )[0],
       "[rewind to 'start' · collapsed as 'end'] · tokens 30000 → 4000",
     );
   });
