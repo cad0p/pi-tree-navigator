@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - *(tests)* Inject an env lookup so only the binding test touches the real kill switch (closes #118)
 - *(rewind)* The nested refusal states the solo rule, with no codemode wording (closes #120)
 - *(rewind)* The continuation prose says the summary represents the current state (closes #125)
+- *(rewind)* The done copy resumes the summary and forbids continuing previous state (closes #127)
 
 
 ## [0.3.0] - 2026-10-15
