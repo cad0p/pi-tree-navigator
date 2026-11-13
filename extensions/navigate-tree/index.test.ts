@@ -2822,10 +2822,10 @@ describe("rewind phase 2: completion", () => {
     assert.match(text, /are pending/);
     assert.match(text, /It represents the current state/);
     assert.match(text, /are from historical collapsed segments/);
-    assert.match(text, /continuing the latest branch_summary's work/);
-    assert.ok(
-      !/do not re-answer them/.test(text),
-      "the re-answer clause is gone: one 'historical collapsed segments' sentence carries it",
+    assert.match(text, /resuming the latest branch_summary's work/);
+    assert.match(
+      text,
+      /Do not continue previous state or user messages; those are just historical context from this session\./,
     );
   });
 
@@ -4934,7 +4934,7 @@ describe("rewind message copy (byte-exact)", () => {
         },
         4_000,
       ),
-      "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M\n\nA branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work.",
+      "[rewind to 'start' · collapsed as 'end'] · context 3.0% → 0.4% of 1.0M\n\nA branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, resuming the latest branch_summary's work. Do not continue previous state or user messages; those are just historical context from this session.",
     );
   });
 
