@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(rewind)* Summary instruction as a custom message, failed attempts re-sent (closes #90, closes #82)
+- *(rewind)* Rewind-driven compaction — force a rewind on context overflow (closes #101)
+- *(anchor)* Automatic start anchor at the first user prompt by default (closes #116, closes #104)
+
+### 🐛 Bug Fixes
+
+- *(rewind)* Give the forced summary turn real output room (closes #107)
+- *(rewind)* The withhold walk is bounded by the projection, not by an entry type (closes #112)
+- *(rewind)* The hint copy carries the percentage only (closes #114)
+- *(tests)* Inject an env lookup so only the binding test touches the real kill switch (closes #118)
+- *(rewind)* The nested refusal states the solo rule, with no codemode wording (closes #120)
+- *(rewind)* The continuation prose says the summary represents the current state (closes #125)
+- *(rewind)* The done copy resumes the summary and forbids continuing previous state (closes #127)
+- *(rewind)* The done copy says continuing, with no blanket prohibition on user messages (closes #131)
+- *(rewind)* Restore the #127 done copy — #132 was an agent error (closes #133)
+- *(rewind)* The done message quotes the latest collapsed user messages and the next step (closes #135)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(scripts)* Rewind-repro harness — replay a real rewind end-to-end (closes #129)
+
+
 ## [0.3.0] - 2026-10-15
 
 <!-- USER-EDITABLE SECTION START -->
