@@ -82,11 +82,12 @@ quota and another alias's 5-hour quota. Decide the matrix before running it.
 
 ## What it has shown so far
 
-End-to-end, DeepSeek V4.1 Flash (max), two fixtures (2026-11-13):
+End-to-end, DeepSeek V4.1 Flash (max) on the `opencode-go-11` alias (one fixture-B baseline run on
+`opencode-go-9`), two fixtures (2026-11-13):
 
 | extension under test | fixture A | fixture B |
 |---|---|---|
-| shipped (0.3.0-20261113.0) | 1 / 2 resumed | 0 / 3 resumed |
+| shipped (0.3.0-20261113.0) | 1 / 2 resumed | 0 / 4 resumed |
 | + a `## Requests Above This Point` summary section (six wordings) | 1 / 1 | 0 / 7 |
 
 - The section gets written correctly every time — the model records "answered earlier, here is where" for
