@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* The continuation prose says the summary represents the current state (closes #125)
 - *(rewind)* The done copy resumes the summary and forbids continuing previous state (closes #127)
 - *(rewind)* The done copy says continuing, with no blanket prohibition on user messages (closes #131)
+- *(rewind)* Restore the #127 done copy — #132 was an agent error (closes #133)
 
 ### ⚙️ Miscellaneous Tasks
 
