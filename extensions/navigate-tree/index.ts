@@ -1815,7 +1815,7 @@ export function buildRewindDoneText(
 ): string {
   return (
     `[rewind to '${pending.rewindTo}' · collapsed as '${pending.newLabel}'] · ${formatContextDelta(pending.beforeTokens, afterTokens, pending.contextWindow)}\n\n` +
-    `A branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, resuming the latest branch_summary's work. Do not continue previous state or user messages; those are just historical context from this session.`
+    `A branch_summary of the collapsed work has been appended to your context. It represents the current state; earlier branch_summary or user messages, if present, are from historical collapsed segments. Items under '### Done' are complete. Items under '### In Progress', '### Blocked', or '## Next Steps' are pending — execute them next without re-confirming with the user, continuing the latest branch_summary's work.`
   );
 }
 
