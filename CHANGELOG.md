@@ -24,6 +24,10 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* The continuation prose says the summary represents the current state (closes #125)
 - *(rewind)* The done copy resumes the summary and forbids continuing previous state (closes #127)
 
+### ⚙️ Miscellaneous Tasks
+
+- *(scripts)* Rewind-repro harness — replay a real rewind end-to-end (closes #129)
+
 
 ## [0.3.0] - 2026-10-15
 
