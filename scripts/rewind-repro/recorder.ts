@@ -21,6 +21,22 @@ const ALLOWED = new Set([
 ]);
 
 export default function (pi: ExtensionAPI) {
+  // PI_REPRO_CUSTOM_PROMPT=1 (run_e2e.sh --request custom): deliver the rewind
+  // request as a custom message, not a user message, so no user entry is added
+  // to the collapsed segment — as when the model rewinds on the hint.
+  pi.on("input", async (event: any) => {
+    if (process.env.PI_REPRO_CUSTOM_PROMPT !== "1") return { action: "continue" };
+    if (event.source === "extension") return { action: "continue" };
+    pi.sendMessage(
+      { customType: "repro-rewind-request", content: event.text, display: true },
+      { triggerTurn: true },
+    );
+    // Print mode exits when the prompt returns: hold it until the run settles.
+    await new Promise<void>((resolve) => {
+      pi.on("agent_settled", () => resolve());
+    });
+    return { action: "handled" };
+  });
   pi.on("tool_call", (event: any) => {
     const log = process.env.PI_REPRO_LOG;
     if (log) {

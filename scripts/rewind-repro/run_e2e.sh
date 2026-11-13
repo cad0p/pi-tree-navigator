@@ -7,6 +7,9 @@
 #                   [--provider P] [--model M] [--thinking LEVEL] [--root DIR]
 #                   [--provider-extension FILE]   (the extension that registers
 #                   the provider alias, when the provider is not built in)
+#                   [--request user|custom]   (how the rewind is asked for:
+#                   a typed user message, the default, or a custom message,
+#                   which adds no user entry to the collapsed segment)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -15,6 +18,7 @@ fixture="" extension="" anchor="" label=""
 provider="opencode-go-11" model="deepseek-v4.1-flash" thinking="max"
 root="${TMPDIR:-/tmp}/rewind-repro"
 provider_extension=""
+request="user"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -27,6 +31,7 @@ while [ $# -gt 0 ]; do
     --thinking) thinking="$2"; shift 2 ;;
     --root) root="$2"; shift 2 ;;
     --provider-extension) provider_extension="$2"; shift 2 ;;
+    --request) request="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -35,6 +40,12 @@ done
   echo "usage: run_e2e.sh --fixture F --extension DIR --anchor NAME --label L" >&2
   exit 2
 }
+
+case "$request" in
+  user) custom_prompt=0 ;;
+  custom) custom_prompt=1 ;;
+  *) echo "--request must be user or custom" >&2; exit 2 ;;
+esac
 
 mkdir -p "$root/work" "$root/logs"
 fixture="$(cd "$(dirname "$fixture")" && pwd)/$(basename "$fixture")"
@@ -47,10 +58,10 @@ log="$root/logs/$label.log"
 echo "session:  $session"
 echo "log:      $log"
 echo "model:    $provider/$model ($thinking)"
-echo "anchor:   $anchor -> $label"
+echo "anchor:   $anchor -> $label (request: $request)"
 
 cd "$root/work"
-PI_REPRO_LOG="$log" pi --no-extensions \
+PI_REPRO_LOG="$log" PI_REPRO_CUSTOM_PROMPT="$custom_prompt" pi --no-extensions \
   -e "$here/recorder.ts" \
   -e "$extension/index.ts" \
   ${provider_extension:+-e "$provider_extension"} \

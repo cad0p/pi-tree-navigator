@@ -31,7 +31,12 @@ exited without running a turn and was not pursued.
 
 The end-to-end protocol has its own caveat: the rewind is requested by a `-p` user message. That message
 sits after the anchor, so the rewind collapses it and it is not in the continuation's context — but in the
-real sessions the model rewound on its own (context-pressure hint), not because it was asked.
+real sessions the model usually rewound on its own (context-pressure hint), not because it was asked. Since
+#135 the continuation quotes the last collapsed user messages, so that prompt is no longer invisible: run
+both ways. `--request user` (default) is the session where the user types "rewind"; `--request custom`
+makes the recorder deliver the same text as a custom message, which adds no user entry to the collapsed
+segment (the recorder holds the `input` handler open until `agent_settled`, or print mode would exit
+mid-run).
 
 **Fixtures are real session files.** They hold private conversation content: keep them in a scratch
 directory, never in the repo.
@@ -97,3 +102,47 @@ End-to-end, DeepSeek V4.1 Flash (max) on the `opencode-go-11` alias (one fixture
   demo question (demo already shipped)" under Done; the run that drifted reasoned "the branch summary is
   about a different workstream".
 - Small numbers. They rule out "the copy fixed it"; they do not establish a fix.
+
+### Continuation-message variants (2026-11-13, #135)
+
+Same protocol and model, the continuation message built by a scratch copy of the extension. "Resumed" is
+the first assistant turn after the continuation; "re-answered" counts runs that resumed and then answered
+the retained request in a later turn of the same run (the recorder blocks `bash`, so a run's second turn
+is often a text wrap-up, which may inflate that count).
+
+| continuation message | fixture A resumed | fixture B resumed | re-answered later |
+|---|---|---|---|
+| shipped paragraph (0.3.0-20261113.3) | 1 / 5 | 0 / 9 | — |
+| shipped + quoted Next Steps item 1 | — | 6 / 10 | — |
+| shipped + dated facts about the retained message + quoted item 1 (~1,500 chars) | — | 10 / 10 | B 4 / 10 |
+| terse "resume the summary" sentence + quoted item 1, three wordings (224–437 chars) | — | 3 / 9 | — |
+| `The user message "<retained>" (<date>) predates this branch_summary; it is not a new request.` + quoted item 1 | 1 / 5 | 10 / 10 | B 5 / 10 |
+| **newest collapsed user message + retained one "is older" + quoted item 1** (466–702 chars) | **10 / 10** | **10 / 10** | A 0 / 10, B 2 / 10 |
+| same, quotes cut to 80 / 50 chars | 2 / 4 | 4 / 4 | — |
+| same, without the quoted item 1 (`Resume the branch_summary's Next Steps.`) | 8 / 10 | 10 / 10 | B 3 / 10 |
+
+- What works is showing the model the user message it can no longer see: the newest one inside the
+  collapsed work, quoted with its time, next to the retained one. Saying that the retained message is old,
+  without the newer one, held on fixture B only.
+- The quoted next step matters less than that line but is not free to drop, and shorter quotes hurt.
+- Swapping the stored summary's preamble on top of the fourth row did not help (A 1 / 5, B 1 / 4 clean).
+- One model family, two fixtures.
+
+### The shipped form, and a typed rewind request (2026-11-13, #135)
+
+The scratch variant above skipped this harness's own `-p "Rewind to the anchor…"` prompt by its text. The
+extension cannot: it takes the user messages from the collapsed entries, and a typed rewind request is one
+of them — in a real session too. Run against the extension itself:
+
+| continuation message | rewind requested by | fixture A resumed | fixture B resumed | re-answered later |
+|---|---|---|---|---|
+| newest collapsed user message + retained one + quoted item 1 | custom message | 5 / 5 | 5 / 5 | B 1 / 5 |
+| same | typed user message | 1 / 3 | 3 / 3 | — |
+| count of collapsed user messages + the newest one + quoted item 1 | typed user message | 1 / 5 | 3 / 3 | B 1 / 3 |
+| **the last two collapsed user messages + retained one + quoted item 1** (shipped) | typed user message | **5 / 5** | **3 / 3** | A 0 / 5, B 2 / 3 |
+| same | custom message | 3 / 3 | 3 / 3 | A 0 / 3, B 2 / 3 |
+
+- When the newest collapsed user message is the rewind request, quoting it alone fails on fixture A: "the
+  latest message is just the rewind instruction, so the last real request is the demo". A count of collapsed
+  user messages does not repair that; a second quote does.
+- Nothing classifies the messages. The two newest are quoted whatever they say.
