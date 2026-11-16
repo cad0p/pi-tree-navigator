@@ -2,8 +2,8 @@
  * rewind-hint — context-pressure nudge for the navigate-tree extension.
  *
  * Pure state + copy builders. `RewindHintTracker` fires exactly once per
- * reserve crossing and re-arms only when the tokens left climb back above
- * the reserve (a rewind or compaction). The builders render the two
+ * reserve crossing and re-arms when the tokens left climb back above the
+ * reserve (a rewind or compaction) or when a rewind lands (#137). The builders render the two
  * user-visible strings (agent hint + TUI-only no-anchor warning).
  *
  * No pi runtime imports — the tracker and builders take plain values; the
@@ -48,7 +48,10 @@ export class RewindHintTracker {
     this.spent = true;
   }
 
-  /** Re-arm for a fresh session (`session_start`). */
+  /**
+   * Re-arm: a fresh session (`session_start`) or a landed rewind (#137),
+   * whose kept context may still be inside the reserve.
+   */
   reset(): void {
     this.spent = false;
   }
