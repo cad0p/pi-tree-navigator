@@ -34,6 +34,7 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
   type AgentSession,
+  buildSessionContext,
   CONFIG_DIR_NAME,
   type ContextUsage,
   type ExtensionAPI,
@@ -47,8 +48,11 @@ import {
   START_ANCHOR_MIN_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
-import { splitContextEstimate } from "./context-tokens.ts";
-import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
+import {
+  estimateContextTokens,
+  splitContextEstimate,
+} from "./context-tokens.ts";
+import { formatPct1, MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTreeDefault, {
   __testHooks,
   ANCHOR_MANDATE,
@@ -63,6 +67,7 @@ import navigateTreeDefault, {
   createNavigateTreeExtension,
   extractSummaryText,
   firstNextStep,
+  latestTailRatios,
   MAX_HINT_WALK_DEPTH,
   MAX_SESSION_REFS,
   MAX_SUMMARY_ATTEMPTS,
@@ -76,6 +81,7 @@ import navigateTreeDefault, {
   START_ANCHOR_LABEL,
   SUMMARY_PENDING_BLOCK_REASON,
   SUMMARY_REQUEST_CUSTOM_TYPE,
+  TAIL_CALIBRATION_CUSTOM_TYPE,
   wrapPlainLine,
 } from "./index.ts";
 import {
@@ -10783,5 +10789,212 @@ Active anchors (root → leaf, % of 100k):
         [5_000, 40_000, 90_000, 95_000],
       );
     });
+  });
+});
+
+// =============================================================================
+// Tail calibration after a rewind (#138)
+// =============================================================================
+
+describe("tail calibration after a rewind (#138)", () => {
+  /** A summary whose chars/4 estimate clears MIN_CALIBRATION_TAIL_TOKENS. */
+  const LONG_SUMMARY = `${SUMMARY_TEXT}\n\n## Critical Context\n${"- abc1234 path/to/file.ts #42\n".repeat(700)}`;
+
+  /** An assistant reply whose request sent `real` context tokens. */
+  function replyWithRealContext(text: string, real: number): AssistantTurn {
+    const message = assistantMessage([{ type: "text", text }], "stop");
+    return {
+      ...message,
+      usage: {
+        ...usageOf(0),
+        input: 3,
+        cacheRead: real - 3,
+        output: 500,
+        totalTokens: real + 500,
+      },
+    };
+  }
+
+  function calibrationCalls(pi: FakePi): unknown[] {
+    return pi.appendEntryCalls
+      .filter(([type]) => type === TAIL_CALIBRATION_CUSTOM_TYPE)
+      .map(([, data]) => data);
+  }
+
+  async function landRewind(
+    f: ReturnType<typeof setup>,
+    summary = LONG_SUMMARY,
+  ): Promise<string> {
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryTurn(f, summary);
+    const done = rewindMessages(f.pi)[0].message.details;
+    assert.equal(done.status, "done");
+    return done.summaryId as string;
+  }
+
+  /** The percentage `list` prints for the `end` anchor. */
+  function endPct(text: string): string | undefined {
+    return /^\s*(\S+%)\s+end\b/m.exec(text)?.[1];
+  }
+
+  it("the first real request after the landing records the ratio, and later estimates scale the tail by it", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    assert.deepEqual(calibrationCalls(f.pi), [], "not on the summary turn");
+
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const next = replyWithRealContext("continuing", real);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    const [recorded] = calibrationCalls(f.pi) as Array<{
+      model: string;
+      ratio: number;
+      realTokens: number;
+    }>;
+    assert.equal(recorded.model, "claude/claude-sonnet-4-5");
+    assert.equal(recorded.realTokens, real);
+    assert.ok(Math.abs(recorded.ratio - 1.85) < 0.001, String(recorded.ratio));
+
+    // Measured once: the next turn records nothing.
+    const after = replyWithRealContext("more", real + 100);
+    f.sm.appendMessage(after as never);
+    await fireTurnEndAll(f.pi, f.ctx, after);
+    assert.equal(calibrationCalls(f.pi).length, 1);
+
+    // `list` prints the anchor on the summary with the scaled tail.
+    const entries = f.sm.getEntries();
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const scaled = estimateContextTokens(atEnd, recorded.ratio);
+    assert.ok(scaled > estimateContextTokens(atEnd));
+    const listed = await f.tool.execute(
+      "tc-list",
+      { action: "list" },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    assert.equal(endPct(listed.content[0].text), formatPct1(scaled, 1_000_000));
+  });
+
+  it("a short tail measures nothing and stops waiting", async () => {
+    const f = setup();
+    await landRewind(f, SUMMARY_TEXT);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const next = replyWithRealContext("continuing", kept.baseline + 50_000);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    assert.deepEqual(calibrationCalls(f.pi), []);
+  });
+
+  it("an aborted reply waits for the next real one", async () => {
+    const f = setup();
+    await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + kept.tail * 2;
+    const aborted = {
+      ...replyWithRealContext("", real),
+      stopReason: "aborted",
+    };
+    f.sm.appendMessage(aborted as never);
+    await fireTurnEndAll(f.pi, f.ctx, aborted);
+    assert.deepEqual(calibrationCalls(f.pi), []);
+    const next = replyWithRealContext("continuing", real);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    assert.equal(calibrationCalls(f.pi).length, 1);
+  });
+
+  it("no rewind landed: a normal turn measures nothing", async () => {
+    const f = setup();
+    setupRewindable(f.sm, f.pi, { capture: true });
+    const next = replyWithRealContext("work", 900_000);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    assert.deepEqual(calibrationCalls(f.pi), []);
+  });
+
+  it("session_start restores the newest ratio for the active model from the session", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const f = setup();
+      const summaryId = await landRewind(f);
+      f.sm.appendCustomEntry(TAIL_CALIBRATION_CUSTOM_TYPE, {
+        model: "claude/claude-sonnet-4-5",
+        ratio: 3,
+        realTokens: 1,
+      });
+      f.sm.appendCustomEntry(TAIL_CALIBRATION_CUSTOM_TYPE, {
+        model: "other/model",
+        ratio: 1.5,
+        realTokens: 1,
+      });
+      await runSessionStart(f.pi, f.ctx, fixture);
+      const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+      const listed = await f.tool.execute(
+        "tc-list",
+        { action: "list" },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      assert.equal(
+        endPct(listed.content[0].text),
+        formatPct1(estimateContextTokens(atEnd, 3), 1_000_000),
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a ratio measured on another model does not apply", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      const f = setup();
+      const summaryId = await landRewind(f);
+      f.sm.appendCustomEntry(TAIL_CALIBRATION_CUSTOM_TYPE, {
+        model: "other/model",
+        ratio: 3,
+        realTokens: 1,
+      });
+      await runSessionStart(f.pi, f.ctx, fixture);
+      const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+      const listed = await f.tool.execute(
+        "tc-list",
+        { action: "list" },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      assert.equal(
+        endPct(listed.content[0].text),
+        formatPct1(estimateContextTokens(atEnd), 1_000_000),
+      );
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+});
+
+describe("latestTailRatios (#138)", () => {
+  const entry = (data: unknown, customType = TAIL_CALIBRATION_CUSTOM_TYPE) =>
+    ({ type: "custom", customType, data }) as never;
+
+  it("keeps the newest valid ratio per model and skips everything else", () => {
+    const ratios = latestTailRatios([
+      entry({ model: "a/x", ratio: 1.2 }),
+      entry({ model: "b/y", ratio: 2 }),
+      entry({ model: "a/x", ratio: 1.9 }),
+      entry({ model: "a/x", ratio: Number.NaN }),
+      entry({ model: "a/x", ratio: 0 }),
+      entry({ model: "a/x", ratio: "3" }),
+      entry({ ratio: 3 }),
+      entry({ model: "c/z", ratio: 5 }, "something-else"),
+    ]);
+    assert.deepEqual([...ratios.entries()].sort(), [
+      ["a/x", 1.9],
+      ["b/y", 2],
+    ]);
   });
 });
