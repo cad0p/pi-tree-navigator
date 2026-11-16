@@ -2768,6 +2768,10 @@ export function createNavigateTreeExtension(
       afterTokens = 0;
     }
     const refreshed = refreshAgentMessages(sm);
+    // A landed rewind re-arms the hint (#137): when the kept context is still
+    // inside the reserve, no later observation climbs above it, so without
+    // this the crossing would stay spent for the rest of the session.
+    hintTracker.reset();
     const historyRewriteNotified = await emitSessionTree(
       sm,
       oldLeafId,

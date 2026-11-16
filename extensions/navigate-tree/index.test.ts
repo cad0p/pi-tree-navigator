@@ -7093,6 +7093,83 @@ describe("rewind hint: suppressed on turns a rewind owns (#80)", () => {
     }
   });
 
+  it("a landed rewind re-arms a spent crossing: a context still inside the reserve gets a fresh hint (#137)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await runSessionStart(f.pi, f.ctx, fixture);
+      f.ctx.setContextUsage(usageAt(95));
+
+      // A normal turn spends the crossing; a second one stays silent.
+      for (const text of ["work", "more work"]) {
+        const turn = assistantMessage([{ type: "text", text }], "stop");
+        f.sm.appendMessage(turn as never);
+        await fireTurnEndAll(f.pi, f.ctx, turn);
+      }
+      assert.equal(hintCalls(f.pi).length, 1, "spent after the crossing");
+
+      await requestRewind(f);
+      await summaryTurn(f);
+      assert.equal(rewindMessages(f.pi)[0].message.details.status, "done");
+      assert.equal(hintCalls(f.pi).length, 1, "not on the completing turn");
+
+      // Still at 95% after the landing: the next normal turn fires again.
+      const next = assistantMessage([{ type: "text", text: "next" }], "stop");
+      f.sm.appendMessage(next as never);
+      await fireTurnEndAll(f.pi, f.ctx, next);
+      assert.equal(hintCalls(f.pi).length, 2, "re-armed by the landing");
+      // And once only: the re-armed crossing is spent again.
+      const after = assistantMessage([{ type: "text", text: "after" }], "stop");
+      f.sm.appendMessage(after as never);
+      await fireTurnEndAll(f.pi, f.ctx, after);
+      assert.equal(hintCalls(f.pi).length, 2);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("a rewind that fails does not re-arm a spent crossing (#137)", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000 }),
+      );
+      const f = setup();
+      setupRewindable(f.sm, f.pi, { capture: true });
+      await runSessionStart(f.pi, f.ctx, fixture);
+      f.ctx.setContextUsage(usageAt(95));
+      const turn = assistantMessage([{ type: "text", text: "work" }], "stop");
+      f.sm.appendMessage(turn as never);
+      await fireTurnEndAll(f.pi, f.ctx, turn);
+      assert.equal(hintCalls(f.pi).length, 1);
+
+      await requestRewind(f);
+      for (let i = 0; i < 3; i++) {
+        await summaryTurn(f, "Okay, summarizing now.", "stop", {
+          commit: true,
+        });
+      }
+      assert.deepEqual(
+        outcomeEntries(f.sm).map((o) => o.status),
+        ["failed"],
+        "the rewind ended without landing",
+      );
+      assert.equal(rewindMessages(f.pi).length, 0);
+      const next = assistantMessage([{ type: "text", text: "next" }], "stop");
+      f.sm.appendMessage(next as never);
+      await fireTurnEndAll(f.pi, f.ctx, next);
+      assert.equal(hintCalls(f.pi).length, 1, "still spent");
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
   it("skips a tool-call failure turn too, and the start anchor skips it as well (#90)", async () => {
     const fixture = makeConfigFixture();
     try {
