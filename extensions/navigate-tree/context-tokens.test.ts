@@ -15,10 +15,6 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import {
   estimateContextTokens,
-  MAX_TAIL_RATIO,
-  MIN_CALIBRATION_TAIL_TOKENS,
-  MIN_TAIL_RATIO,
-  measureTailRatio,
   piEstimateMessageTokens,
   requestContextTokens,
 } from "./context-tokens.ts";
@@ -364,63 +360,11 @@ describe("piEstimateMessageTokens", () => {
 });
 
 // -----------------------------------------------------------------------------
-// Tail calibration (#138)
+// Real request sizes (#138)
 // -----------------------------------------------------------------------------
 
-describe("tail calibration (#138)", () => {
-  // baseline 1000 (real), then a 10,000-token chars/4 tail.
-  const chain = () => [
-    user(4),
-    assistant(8, { totalTokens: 1000 }),
-    user(20_000),
-    user(20_000),
-  ];
-
-  it("estimateContextTokens scales only the tail by the ratio", () => {
-    assert.equal(estimateContextTokens(chain()), 11_000);
-    assert.equal(estimateContextTokens(chain(), 1), 11_000);
-    assert.equal(estimateContextTokens(chain(), 1.85), 1000 + 18_500);
-    // Rounded to a whole token.
-    assert.equal(estimateContextTokens(chain(), 1.00005), 11_001);
-  });
-
-  it("measures (real − baseline) / tail", () => {
-    assert.equal(measureTailRatio(chain(), 1000 + 18_500), 1.85);
-    assert.equal(measureTailRatio(chain(), 1000 + 7_000), 0.7);
-  });
-
-  it("clamps to [MIN_TAIL_RATIO, MAX_TAIL_RATIO]", () => {
-    assert.equal(measureTailRatio(chain(), 1000 + 100_000), MAX_TAIL_RATIO);
-    assert.equal(measureTailRatio(chain(), 1000 + 1), MIN_TAIL_RATIO);
-  });
-
-  it("is undefined when the real count does not exceed the baseline", () => {
-    assert.equal(measureTailRatio(chain(), 1000), undefined);
-    assert.equal(measureTailRatio(chain(), 500), undefined);
-    assert.equal(measureTailRatio(chain(), Number.NaN), undefined);
-  });
-
-  it("is undefined below MIN_CALIBRATION_TAIL_TOKENS of tail", () => {
-    const below = [
-      assistant(8, { totalTokens: 1000 }),
-      user((MIN_CALIBRATION_TAIL_TOKENS - 1) * 4),
-    ];
-    assert.equal(measureTailRatio(below, 50_000), undefined);
-    const at = [
-      assistant(8, { totalTokens: 1000 }),
-      user(MIN_CALIBRATION_TAIL_TOKENS * 4),
-    ];
-    assert.equal(
-      measureTailRatio(at, 1000 + MIN_CALIBRATION_TAIL_TOKENS * 2),
-      2,
-    );
-  });
-
-  it("with no usage anywhere the whole estimate is the tail", () => {
-    assert.equal(measureTailRatio([user(40_000)], 20_000), 2);
-  });
-
-  it("requestContextTokens counts the input side only, never the reply's output", () => {
+describe("requestContextTokens (#138)", () => {
+  it("counts the input side only, never the reply's output", () => {
     assert.equal(
       requestContextTokens({
         input: 10,

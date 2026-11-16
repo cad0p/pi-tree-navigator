@@ -83,7 +83,6 @@ import {
 } from "./config.ts";
 import {
   estimateContextTokens,
-  measureTailRatio,
   newestUsageIndex,
   piEstimateMessageTokens,
   requestContextTokens,
@@ -773,57 +772,221 @@ function findLabeledEntry(
   return null;
 }
 
-// `tailRatio` (#138): the session's measured scale for the chars/4 tail
-// (`measureTailRatio`), 1 when none is known for the active model.
-function estimateActiveBranchTokens(sm: SessionManager, tailRatio = 1): number {
-  return estimateContextTokens(sm.buildSessionContext().messages, tailRatio);
-}
-
-function estimateAtEntry(
-  entries: SessionEntry[],
-  entryId: string,
-  byId: Map<string, SessionEntry>,
-  tailRatio = 1,
-): number {
-  return estimateContextTokens(
-    buildSessionContext(entries, entryId, byId).messages,
-    tailRatio,
-  );
+function estimateActiveBranchTokens(sm: SessionManager): number {
+  return estimateContextTokens(sm.buildSessionContext().messages);
 }
 
 /**
- * Custom entry (not sent to the model) recording one tail calibration
- * (#138), so a restart keeps the ratio: `{ model, ratio, realTokens }`.
+ * The bare model id of a possibly stale ctx (#138): any throw reads as
+ * `undefined`, and the estimate falls back to chars/4.
  */
-export const TAIL_CALIBRATION_CUSTOM_TYPE = "navigate-tree-tail-calibration";
+function ctxModelId(ctx: { model?: { id?: string } }): string | undefined {
+  try {
+    return ctx.model?.id;
+  } catch {
+    return undefined;
+  }
+}
 
-/** The newest recorded ratio per `provider/modelId` in `entries`. */
-export function latestTailRatios(
+/** Deepest path `estimateAtEntry` searches for a measured reply (#138). */
+const MEASURED_REPLY_MAX_DEPTH = 24;
+
+/**
+ * A shared, per-render read index for `estimateAtEntry` (#138): the
+ * parent→children map over `entries`, plus per-entry memos of the
+ * projected context and of the measured replies found below an ancestor.
+ * Entries are append-only, so all of it stays valid for the duration of
+ * one render (a `list` call, an anchor table).
+ */
+/** A measured reply below an ancestor and its real request size (#138). */
+interface MeasuredReply {
+  entry: SessionEntry;
+  realTokens: number;
+}
+
+export interface AnchorEstimateIndex {
+  children: Map<string, string[]>;
+  messages: Map<string, AgentMessage[]>;
+  measured: Map<string, MeasuredReply[]>;
+}
+
+export function createAnchorEstimateIndex(
   entries: readonly SessionEntry[],
-): Map<string, number> {
-  const ratios = new Map<string, number>();
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i] as {
-      type?: string;
-      customType?: string;
-      data?: { model?: unknown; ratio?: unknown };
-    };
-    if (e.type !== "custom" || e.customType !== TAIL_CALIBRATION_CUSTOM_TYPE) {
+): AnchorEstimateIndex {
+  const children = new Map<string, string[]>();
+  for (const e of entries) {
+    if (!e.parentId || e.parentId === e.id) continue;
+    const list = children.get(e.parentId);
+    if (list) list.push(e.id);
+    else children.set(e.parentId, [e.id]);
+  }
+  return { children, messages: new Map(), measured: new Map() };
+}
+
+/**
+ * The assistant replies below `ancestorId` that measured their request
+ * for real (#138): a DFS over the entry tree where each path stops at its
+ * first assistant message — later replies on that path were sent with the
+ * earlier one already in context, so they measure more than the anchor
+ * wants. A reply qualifies when it ran on `modelId` (tokenizers differ
+ * across models; providers alias the same one, so provider is ignored),
+ * ended normally, and recorded the request's input-side tokens
+ * (`requestContextTokens`). Bounded at `MEASURED_REPLY_MAX_DEPTH`
+ * entries per path.
+ */
+function measuredRepliesBelow(
+  index: AnchorEstimateIndex,
+  byId: Map<string, SessionEntry>,
+  ancestorId: string,
+  modelId: string,
+): MeasuredReply[] {
+  const key = `${modelId}\u0000${ancestorId}`;
+  const cached = index.measured.get(key);
+  if (cached) return cached;
+  const found: MeasuredReply[] = [];
+  const stack: Array<{ id: string; depth: number }> = (
+    index.children.get(ancestorId) ?? []
+  ).map((id) => ({ id, depth: 1 }));
+  while (stack.length > 0) {
+    const { id, depth } = stack.pop() as { id: string; depth: number };
+    const entry = byId.get(id);
+    if (!entry) continue;
+    if (
+      entry.type === "message" &&
+      (entry.message as { role?: string }).role === "assistant"
+    ) {
+      const message = entry.message as {
+        model?: unknown;
+        stopReason?: string;
+        usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
+      };
+      if (message.model === modelId) {
+        const realTokens = message.usage
+          ? requestContextTokens(message.usage)
+          : 0;
+        if (
+          message.stopReason !== "aborted" &&
+          message.stopReason !== "error" &&
+          realTokens > 0
+        ) {
+          found.push({ entry, realTokens });
+        }
+      }
       continue;
     }
-    const model = e.data?.model;
-    const ratio = e.data?.ratio;
-    if (
-      typeof model === "string" &&
-      typeof ratio === "number" &&
-      Number.isFinite(ratio) &&
-      ratio > 0 &&
-      !ratios.has(model)
-    ) {
-      ratios.set(model, ratio);
+    if (depth >= MEASURED_REPLY_MAX_DEPTH) continue;
+    for (const child of index.children.get(id) ?? []) {
+      stack.push({ id: child, depth: depth + 1 });
     }
   }
-  return ratios;
+  index.measured.set(key, found);
+  return found;
+}
+
+/**
+ * Estimated context tokens at `entryId` (#138). The classic estimate —
+ * the newest valid usage on the path plus chars/4 of the tail after it —
+ * under-counts once rewinds stack branch summaries with no usage between
+ * them (about 2 chars per token on hash/path-heavy summaries, against the
+ * assumed 4). Every anchor already HAS a real count in the session file,
+ * though: the first assistant reply sent below it recorded the request's
+ * real input-side tokens, and that reply stays in `entries` after later
+ * rewinds move it off the active branch.
+ *
+ * With `modelId` (a bare model id — provider aliases share a tokenizer)
+ * each ancestor A of `entryId`, nearest first and up to the classic
+ * baseline's entry, is searched for such a measured reply R. R's usage
+ * counts the context at `R.parentId` for real; subtracting the estimated
+ * gap between A and `R.parentId` and adding the estimated gap between A
+ * and `entryId` lands a candidate estimate at `entryId`. The candidate
+ * with the smallest combined gap wins, and only when that gap is smaller
+ * than the tail the classic estimate would guess anyway — a reply whose
+ * gaps estimate as much as the tail itself is no improvement. Fail-open:
+ * any throw returns the classic estimate.
+ */
+export function estimateAtEntry(
+  entries: SessionEntry[],
+  entryId: string,
+  byId: Map<string, SessionEntry>,
+  modelId?: string,
+  index?: AnchorEstimateIndex,
+): number {
+  // Without a model nothing is searched: skip building the children index
+  // (a full pass over `entries`) and only memoize into a caller's index.
+  const idx =
+    index ??
+    (modelId === undefined ? undefined : createAnchorEstimateIndex(entries));
+  const contextAt = (id: string): AgentMessage[] => {
+    const cached = idx?.messages.get(id);
+    if (cached) return cached;
+    const messages = buildSessionContext(entries, id, byId).messages;
+    idx?.messages.set(id, messages);
+    return messages;
+  };
+  // A `system` entry restates the system prompt, which pi sends once
+  // (folded into the current system state), so the real count already holds
+  // it: summing it into a gap would subtract or add a whole prompt.
+  const estimatedTail = (msgs: AgentMessage[], from: number): number => {
+    let total = 0;
+    for (let i = Math.max(0, from); i < msgs.length; i++) {
+      if ((msgs[i] as { role?: string }).role === "system") continue;
+      total += estimateTokens(msgs[i]);
+    }
+    return total;
+  };
+  const messages = contextAt(entryId);
+  const split = splitContextEstimate(messages);
+  const classic = split.baseline + split.tail;
+  if (modelId === undefined || !idx) return classic;
+  try {
+    // The entry owning the classic baseline usage: the walk stops there.
+    // Replies below an ancestor above it only re-measure data the baseline
+    // already counts for real, so they can never beat the classic tail.
+    const baselineIndex = newestUsageIndex(messages);
+    let baselineId: string | undefined;
+    if (baselineIndex >= 0) {
+      let pos = 0;
+      for (const projected of buildSessionProjection(entries, entryId, byId)
+        .entries) {
+        if (baselineIndex < pos + projected.messages.length) {
+          baselineId = projected.sourceEntry.id;
+          break;
+        }
+        pos += projected.messages.length;
+      }
+    }
+    const aboveGap = (countA: number): number =>
+      estimatedTail(messages, countA);
+    let best: { value: number; uncertainty: number } | undefined;
+    let ancestor: SessionEntry | undefined = byId.get(entryId);
+    while (ancestor) {
+      const countA = contextAt(ancestor.id).length;
+      for (const reply of measuredRepliesBelow(
+        idx,
+        byId,
+        ancestor.id,
+        modelId,
+      )) {
+        const parentMsgs = reply.entry.parentId
+          ? contextAt(reply.entry.parentId)
+          : [];
+        const belowGap = estimatedTail(parentMsgs, countA);
+        const uncertainty = belowGap + aboveGap(countA);
+        const candidate = reply.realTokens - belowGap + aboveGap(countA);
+        if (!best || uncertainty < best.uncertainty) {
+          best = { value: candidate, uncertainty };
+        }
+      }
+      if (ancestor.id === baselineId) break;
+      ancestor = ancestor.parentId ? byId.get(ancestor.parentId) : undefined;
+    }
+    if (best && best.uncertainty < split.tail) {
+      return Math.max(0, best.value);
+    }
+  } catch {
+    // Fail-open: the classic estimate stands.
+  }
+  return classic;
 }
 
 /**
@@ -841,10 +1004,11 @@ function formatActiveAnchors(
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
-  tailRatio = 1,
+  modelId?: string,
 ): { names: string[]; text: string } {
   const names: string[] = [];
   const rows: AnchorTableRow[] = [];
+  const estIndex = createAnchorEstimateIndex(allEntries);
   for (const e of sm.getBranch()) {
     const lbl = sm.getLabel(e.id);
     if (!lbl?.startsWith(LABEL_PREFIX)) continue;
@@ -852,7 +1016,10 @@ function formatActiveAnchors(
     if (!isValidName(name)) continue;
     names.push(name);
     rows.push({
-      pct: formatPct1(estimateAtEntry(allEntries, e.id, byId, tailRatio), cw),
+      pct: formatPct1(
+        estimateAtEntry(allEntries, e.id, byId, modelId, estIndex),
+        cw,
+      ),
       name,
     });
   }
@@ -878,9 +1045,9 @@ function buildMinSavingsRejection(
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
-  tailRatio = 1,
+  modelId?: string,
 ): string {
-  const anchors = formatActiveAnchors(sm, cw, allEntries, byId, tailRatio);
+  const anchors = formatActiveAnchors(sm, cw, allEntries, byId, modelId);
   const guidance =
     anchors.names[0] === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
@@ -1275,8 +1442,8 @@ interface PendingRewind {
   summaryFocus: string;
   /** Estimated context at the anchor (before the summary is added). */
   tokensAtTarget: number;
-  /** The tail ratio the estimates used (#138); the readout reuses it. */
-  tailRatio?: number;
+  /** The model id the anchor estimates matched on (#138); reused at landing. */
+  modelId?: string;
   /** The rewind's tool-result entry, set when its turn ends. */
   toolResultEntryId?: string;
   /** The rewind turn ended and the instruction draft was returned. */
@@ -2241,7 +2408,7 @@ export function createNavigateTreeExtension(
     at: { contextWindow: number; target: number },
     failedEntryId: string,
     failedIds: readonly string[],
-    tailRatio = 1,
+    modelId?: string,
   ): { drafts: SessionBoundaryDraft[]; continue: boolean } | null {
     const record = forcedRewinds.get(sessionId);
     // A final error already ended it in this run: pi ends the run.
@@ -2323,7 +2490,7 @@ export function createNavigateTreeExtension(
       at.contextWindow,
       allEntries,
       byId,
-      tailRatio,
+      modelId,
     );
     // D14: nothing to rewind to.
     if (anchors.names.length === 0) {
@@ -2783,8 +2950,6 @@ export function createNavigateTreeExtension(
     pendingRewinds.delete(sessionId);
     // A forced rewind landed: the gate lifts (#101, D7).
     forcedRewinds.delete(sessionId);
-    // The next real request measures the kept chain's tail (#138).
-    calibrationPending.add(sessionId);
     // The summary landed unlabeled if both writes fail; `list` simply won't
     // show it.
     writeLabel(sm, summaryId, LABEL_PREFIX + pending.newLabel);
@@ -2817,7 +2982,16 @@ export function createNavigateTreeExtension(
     // continuation always reaches the model.
     let afterTokens = 0;
     try {
-      afterTokens = estimateActiveBranchTokens(sm, pending.tailRatio ?? 1);
+      const leafId = sm.getLeafId();
+      const landed = sm.getEntries();
+      const landedById = new Map<string, SessionEntry>();
+      for (const e of landed) landedById.set(e.id, e);
+      // #138: the estimate at the new leaf finds a measured reply below
+      // the target (the old branch kept it): real count at the target plus
+      // chars/4 of the summary and continuation appended since.
+      afterTokens = leafId
+        ? estimateAtEntry(landed, leafId, landedById, pending.modelId)
+        : estimateActiveBranchTokens(sm);
     } catch {
       afterTokens = 0;
     }
@@ -2997,7 +3171,7 @@ export function createNavigateTreeExtension(
           at,
           messageEntryId,
           failedIds,
-          tailRatioFor(sessionId, ctx.model),
+          ctxModelId(ctx),
         );
         if (result) return deliverRaw(result.drafts, result.continue);
       }
@@ -3300,7 +3474,7 @@ export function createNavigateTreeExtension(
               at,
               last.id,
               [last.id],
-              tailRatioFor(sessionId, ctx.model),
+              ctxModelId(ctx),
             )
           : null;
         if (result) {
@@ -3537,36 +3711,6 @@ export function createNavigateTreeExtension(
   let hintByModel: ReadonlyMap<string, number | null> = new Map();
   let hintTracker = new RewindHintTracker();
 
-  // Tail calibration (#138): per session, the newest measured ratio per
-  // `provider/modelId` (tokenizers differ by model), restored at
-  // `session_start` from the persisted entries. `calibrationPending` holds
-  // the sessions whose rewind landed and whose next real request has not
-  // been measured yet.
-  const tailRatios = new Map<string, Map<string, number>>();
-  const calibrationPending = new Set<string>();
-
-  /** The measured tail ratio for `model` in this session, else 1. */
-  function tailRatioFor(
-    sessionId: string,
-    model: { provider?: string; id?: string } | undefined,
-  ): number {
-    if (!model?.provider || !model.id) return 1;
-    return tailRatios.get(sessionId)?.get(`${model.provider}/${model.id}`) ?? 1;
-  }
-
-  /** `tailRatioFor` from a possibly stale ctx: any throw reads as 1. */
-  function ctxTailRatio(ctx: {
-    sessionManager: unknown;
-    model?: { provider?: string; id?: string };
-  }): number {
-    try {
-      const sm = ctx.sessionManager as SessionManager;
-      return tailRatioFor(sm.getSessionId(), ctx.model);
-    } catch {
-      return 1;
-    }
-  }
-
   // Auto start-anchor closure state (#55). All of it is keyed by session id
   // and NEVER cleared in-process: once a session has settled (write or
   // found-existing), no later prompt / agent loop re-inserts the label.
@@ -3681,13 +3825,6 @@ export function createNavigateTreeExtension(
     rewindHintReserveTokens = null;
     hintByModel = new Map();
     hintTracker = new RewindHintTracker();
-    // #138: the ratios this session measured before, newest per model.
-    calibrationPending.delete(sessionId);
-    try {
-      tailRatios.set(sessionId, latestTailRatios(sm.getEntries()));
-    } catch {
-      tailRatios.delete(sessionId);
-    }
     toolActive = true;
     let reserve: number | null = null;
     let byModel: ReadonlyMap<string, number | null> = new Map();
@@ -3895,77 +4032,6 @@ export function createNavigateTreeExtension(
   // handler is delivered in the same run. Synchronous by design: no await
   // before any ctx use. Fires once per reserve crossing; see
   // `RewindHintTracker` for the re-arm semantics.
-  // Tail calibration (#138): the first real request after a landed rewind
-  // measures how far the chars/4 tail of the kept chain is off. Called first
-  // in the hint's `turn_end` handler so a hint on the same turn already uses
-  // the new ratio. Turns a rewind owns and overflowed turns are not measured
-  // (their request is not the kept chain); an aborted or failed reply waits
-  // for the next one.
-  function calibrateAfterRewind(
-    event: { message?: unknown; messageEntryId?: unknown },
-    sm: SessionManager,
-  ): void {
-    let sessionId: string;
-    try {
-      sessionId = sm.getSessionId();
-    } catch {
-      return;
-    }
-    if (!calibrationPending.has(sessionId)) return;
-    const message = event.message as
-      | {
-          role?: string;
-          stopReason?: string;
-          provider?: string;
-          model?: string;
-          usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
-        }
-      | undefined;
-    if (!message || typeof message !== "object") return;
-    if (message.role !== "assistant") return;
-    if (rewindTurns.has(message) || overflowedTurns.has(message)) return;
-    if (message.stopReason === "aborted" || message.stopReason === "error") {
-      return;
-    }
-    const realTokens = message.usage ? requestContextTokens(message.usage) : 0;
-    if (!(realTokens > 0)) return;
-    const entryId =
-      typeof event.messageEntryId === "string" ? event.messageEntryId : "";
-    calibrationPending.delete(sessionId);
-    if (!entryId || !message.provider || !message.model) return;
-    try {
-      const parentId = sm.getEntry(entryId)?.parentId;
-      if (!parentId) return;
-      const allEntries = sm.getEntries();
-      const byId = new Map<string, SessionEntry>();
-      for (const e of allEntries) byId.set(e.id, e);
-      const ratio = measureTailRatio(
-        buildSessionContext(allEntries, parentId, byId).messages,
-        realTokens,
-      );
-      if (ratio === undefined) return;
-      const model = `${message.provider}/${message.model}`;
-      let byModel = tailRatios.get(sessionId);
-      if (!byModel) {
-        byModel = new Map();
-        tailRatios.set(sessionId, byModel);
-      }
-      byModel.set(model, ratio);
-      const data = { model, ratio, realTokens };
-      try {
-        pi.appendEntry(TAIL_CALIBRATION_CUSTOM_TYPE, data);
-      } catch {
-        try {
-          sm.appendCustomEntry(TAIL_CALIBRATION_CUSTOM_TYPE, data);
-        } catch {
-          // Fail-open: the in-memory ratio still applies this process.
-        }
-      }
-    } catch {
-      // Fail-open: no ratio, the estimate stays chars/4.
-    }
-  }
-
   pi.on("turn_end", (event, ctx) => {
     // Single `sessionManager` capture shared by the auto start-anchor and
     // the rewind hint: the stale-ctx contract is exactly one read, before
@@ -3999,8 +4065,6 @@ export function createNavigateTreeExtension(
     if (sm && !rewindOwned && !overflowedTurn) {
       writeStartAnchorIfNeeded(sm as SessionManager, event.turnIndex + 1);
     }
-    // #138: before the hint, so its anchor table uses a fresh ratio.
-    if (sm) calibrateAfterRewind(event, sm as SessionManager);
     // Per-session hint gate (#58): an in-process sibling session's
     // `before_agent_start` (e.g. a subagent whose tool subset omits
     // `navigate_tree`) must not clear THIS session's hint. Mirrors the auto
@@ -4081,20 +4145,15 @@ export function createNavigateTreeExtension(
       const allEntries = sm.getEntries();
       const byId = new Map<string, SessionEntry>();
       for (const e of allEntries) byId.set(e.id, e);
-      // The ratio for the model that just replied: this turn's message,
+      // The id of the model that just replied: this turn's message,
       // not `ctx.model` (never read here without `modelOverrides`).
-      const replied = event.message as
-        | { provider?: string; model?: string }
-        | undefined;
+      const replied = event.message as { model?: unknown } | undefined;
       anchors = formatActiveAnchors(
         sm,
         usage.contextWindow,
         allEntries,
         byId,
-        tailRatioFor(sm.getSessionId(), {
-          provider: replied?.provider,
-          id: replied?.model,
-        }),
+        typeof replied?.model === "string" ? replied.model : undefined,
       );
     } catch {
       return;
@@ -4288,8 +4347,12 @@ Operations (set \`action\`):
         const byId = new Map<string, SessionEntry>();
         for (const e of allEntries) byId.set(e.id, e);
         const cw = ctx.model?.contextWindow ?? 0;
-        const tailRatio = ctxTailRatio(ctx);
-        const totalTokens = estimateActiveBranchTokens(sm, tailRatio);
+        const modelId = ctxModelId(ctx);
+        const estIndex = createAnchorEstimateIndex(allEntries);
+        const leafId = sm.getLeafId();
+        const totalTokens = leafId
+          ? estimateAtEntry(allEntries, leafId, byId, modelId, estIndex)
+          : estimateActiveBranchTokens(sm);
         const reflectionOk = !!findOwningSession(sm);
 
         const rows: AnchorTableRow[] = [];
@@ -4297,7 +4360,13 @@ Operations (set \`action\`):
           const lbl = sm.getLabel(e.id);
           if (lbl?.startsWith(LABEL_PREFIX)) {
             const name = lbl.slice(LABEL_PREFIX.length);
-            const tokensAt = estimateAtEntry(allEntries, e.id, byId, tailRatio);
+            const tokensAt = estimateAtEntry(
+              allEntries,
+              e.id,
+              byId,
+              modelId,
+              estIndex,
+            );
             const hint = findLabelHint(sm, e.id, LIST_HINT_MAX_LENGTH);
             rows.push({
               pct: formatPct1(tokensAt, cw),
@@ -4351,7 +4420,10 @@ Operations (set \`action\`):
         // otherwise the agent sees an error yet a retry with the same
         // name is rejected as a duplicate.
         const cw = ctx.model?.contextWindow ?? 0;
-        const tokensHere = estimateActiveBranchTokens(sm, ctxTailRatio(ctx));
+        // Classic live-branch estimate: the tail after the newest reply is
+        // small, and a throw must propagate before the label write (the
+        // atomic-anchor contract).
+        const tokensHere = estimateActiveBranchTokens(sm);
         const labelHint = findLabelHint(sm, leafId, ANCHOR_HINT_MAX_LENGTH);
         const positionLine = `${formatPct1(tokensHere, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}`;
         const hintLine = labelHint ? ` (after: “${labelHint}”)` : "";
@@ -4461,7 +4533,7 @@ Operations (set \`action\`):
       const allEntries = sm.getEntries();
       const byId = new Map<string, SessionEntry>();
       for (const e of allEntries) byId.set(e.id, e);
-      const tailRatio = ctxTailRatio(ctx);
+      const modelId = ctxModelId(ctx);
       let beforeTokens: number;
       if (
         oldLeafEntry &&
@@ -4469,21 +4541,13 @@ Operations (set \`action\`):
         oldLeafEntry.message.role === "assistant" &&
         oldLeafEntry.parentId
       ) {
-        beforeTokens = estimateAtEntry(
-          allEntries,
-          oldLeafEntry.parentId,
-          byId,
-          tailRatio,
-        );
+        // The live-branch estimate stays classic: the tail after the
+        // newest reply is small, so a measured reply adds nothing.
+        beforeTokens = estimateAtEntry(allEntries, oldLeafEntry.parentId, byId);
       } else {
-        beforeTokens = estimateActiveBranchTokens(sm, tailRatio);
+        beforeTokens = estimateActiveBranchTokens(sm);
       }
-      const tokensAtTarget = estimateAtEntry(
-        allEntries,
-        target,
-        byId,
-        tailRatio,
-      );
+      const tokensAtTarget = estimateAtEntry(allEntries, target, byId, modelId);
       const contextWindow = ctx.model?.contextWindow ?? 0;
 
       const { entries } = collectEntriesForBranchSummary(sm, oldLeaf, target);
@@ -4507,7 +4571,7 @@ Operations (set \`action\`):
             contextWindow,
             allEntries,
             byId,
-            tailRatio,
+            modelId,
           ),
           { rejected: "min-savings", apparentSavings },
         );
@@ -4555,7 +4619,7 @@ Operations (set \`action\`):
         first,
         summaryFocus: p.summaryFocus,
         tokensAtTarget,
-        tailRatio,
+        modelId,
         hiddenEntryIds: [],
         attempts: 0,
       });

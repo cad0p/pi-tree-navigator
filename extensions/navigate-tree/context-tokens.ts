@@ -130,37 +130,22 @@ export function newestUsageIndex(messages: AgentMessage[]): number {
  * everything before it); with no valid usage, sums `estimateTokens` over
  * all messages. See the file JSDoc for the version boundary and the
  * known system-message / `safeJsonStringify` divergences.
- *
- * `tailRatio` (#138) scales the chars/4 tail by the session's measured
- * real-to-estimated ratio (`measureTailRatio`); 1 leaves it as is.
  */
-export function estimateContextTokens(
-  messages: AgentMessage[],
-  tailRatio = 1,
-): number {
+export function estimateContextTokens(messages: AgentMessage[]): number {
   const { baseline, tail } = splitContextEstimate(messages);
-  return baseline + Math.round(tail * tailRatio);
+  return baseline + tail;
 }
 
 // ---------------------------------------------------------------------------
-// Tail calibration (#138)
+// Real request sizes (#138)
 // ---------------------------------------------------------------------------
-
-/**
- * Smallest estimated tail a ratio is measured on. Below it the per-request
- * noise (system-prompt drift since the baseline, other extensions'
- * injections, the baseline turn's own thinking) is a large share of the
- * delta, so the measurement would mostly be noise.
- */
-export const MIN_CALIBRATION_TAIL_TOKENS = 4000;
-/** Bounds on a measured ratio: an outlier never scales the tail past them. */
-export const MIN_TAIL_RATIO = 0.5;
-export const MAX_TAIL_RATIO = 4;
 
 /**
  * The context a request actually sent: the input side of its usage
  * (`input + cacheRead + cacheWrite`). Not `calculateContextTokens`, which
- * prefers `totalTokens` and so counts the reply's own output too.
+ * prefers `totalTokens` and so counts the reply's own output too. Anchor
+ * estimates (#138) read this off the first reply below the anchor — the
+ * real count the chars/4 tail would otherwise under-count.
  */
 export function requestContextTokens(usage: {
   input?: number;
@@ -168,31 +153,6 @@ export function requestContextTokens(usage: {
   cacheWrite?: number;
 }): number {
   return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-}
-
-/**
- * #138: how far the chars/4 tail is off for one real request. `messages` is
- * the context the request sent and `realTokens` its provider count
- * (`requestContextTokens`). The baseline is already real, so the whole
- * disagreement sits in the tail: `ratio = (realTokens − baseline) / tail`,
- * clamped to [`MIN_TAIL_RATIO`, `MAX_TAIL_RATIO`]. Undefined when the tail is
- * below `MIN_CALIBRATION_TAIL_TOKENS` or the real count does not exceed the
- * baseline (nothing meaningful to measure).
- *
- * Measured on the first request after a rewind: the kept chain's newest
- * usage then sits before the anchor, so the tail is the stack of branch
- * summaries the estimate under-counts (about 2.2 chars per token on
- * summaries full of hashes and paths, against the assumed 4).
- */
-export function measureTailRatio(
-  messages: AgentMessage[],
-  realTokens: number,
-): number | undefined {
-  const { baseline, tail } = splitContextEstimate(messages);
-  if (tail < MIN_CALIBRATION_TAIL_TOKENS) return undefined;
-  const delta = realTokens - baseline;
-  if (!(delta > 0)) return undefined;
-  return Math.min(MAX_TAIL_RATIO, Math.max(MIN_TAIL_RATIO, delta / tail));
 }
 
 // ---------------------------------------------------------------------------
