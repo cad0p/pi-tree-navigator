@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* Restore the #127 done copy — #132 was an agent error (closes #133)
 - *(rewind)* The done message quotes the latest collapsed user messages and the next step (closes #135)
 - *(rewind-hint)* A landed rewind re-arms the crossing (closes #137)
+- *(estimate)* Anchor estimates use the real count of a reply below the anchor (closes #138)
 
 ### ⚙️ Miscellaneous Tasks
 
