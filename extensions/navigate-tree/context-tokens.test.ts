@@ -16,6 +16,7 @@ import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import {
   estimateContextTokens,
   piEstimateMessageTokens,
+  requestContextTokens,
 } from "./context-tokens.ts";
 
 // -----------------------------------------------------------------------------
@@ -355,5 +356,25 @@ describe("piEstimateMessageTokens", () => {
       piEstimateMessageTokens(message),
       Math.ceil((1 + "[unserializable]".length) / 3.5),
     );
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Real request sizes (#138)
+// -----------------------------------------------------------------------------
+
+describe("requestContextTokens (#138)", () => {
+  it("counts the input side only, never the reply's output", () => {
+    assert.equal(
+      requestContextTokens({
+        input: 10,
+        cacheRead: 200,
+        cacheWrite: 3000,
+        output: 40_000,
+        totalTokens: 43_210,
+      } as never),
+      3210,
+    );
+    assert.equal(requestContextTokens({}), 0);
   });
 });

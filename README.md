@@ -106,6 +106,8 @@ Active anchors (root → leaf, % of 1.0M):
 
 The same anchor table (cumulative context % at each anchor, root → leaf) ends the min-savings refusal and the forced-rewind message, and is the body of `list` (which adds an `(after: “…”)` preview column).
 
+How a percentage is counted (#138): by default, the newest real usage on the path plus chars/4 of everything after it. That under-counts a stack of branch summaries, which run about 2 characters per token. So when the session file holds a reply below the anchor that recorded its real request size, the anchor uses that real count instead, corrected by the chars/4 of the few messages in between (system entries excluded: pi sends the system prompt once). The reply must come from the same model id, ignoring the provider, because tokenizers differ between models; otherwise the default estimate stands.
+
 With no anchors the extension sends **no model message** (a rewind is impossible) and shows a TUI-only warning explaining how to add one manually: `/tree`, select the entry to rewind to, press `shift+l`, label it `anchor:<name>` (e.g. `anchor:context-gathered`), then ask the agent to rewind to it.
 
 ### Per-model reserve (`modelOverrides`)

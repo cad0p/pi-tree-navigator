@@ -137,6 +137,25 @@ export function estimateContextTokens(messages: AgentMessage[]): number {
 }
 
 // ---------------------------------------------------------------------------
+// Real request sizes (#138)
+// ---------------------------------------------------------------------------
+
+/**
+ * The context a request actually sent: the input side of its usage
+ * (`input + cacheRead + cacheWrite`). Not `calculateContextTokens`, which
+ * prefers `totalTokens` and so counts the reply's own output too. Anchor
+ * estimates (#138) read this off the first reply below the anchor — the
+ * real count the chars/4 tail would otherwise under-count.
+ */
+export function requestContextTokens(usage: {
+  input?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+}): number {
+  return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+}
+
+// ---------------------------------------------------------------------------
 // pi-ai's own per-message estimator (#107, round 3)
 // ---------------------------------------------------------------------------
 

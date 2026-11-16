@@ -34,9 +34,11 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
   type AgentSession,
+  buildSessionContext,
   CONFIG_DIR_NAME,
   type ContextUsage,
   type ExtensionAPI,
+  estimateTokens,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -47,8 +49,11 @@ import {
   START_ANCHOR_MIN_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
 } from "./config.ts";
-import { splitContextEstimate } from "./context-tokens.ts";
-import { MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
+import {
+  estimateContextTokens,
+  splitContextEstimate,
+} from "./context-tokens.ts";
+import { formatPct1, MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTreeDefault, {
   __testHooks,
   ANCHOR_MANDATE,
@@ -4891,11 +4896,15 @@ describe("rewind phase 2: multi-block text and late entries", () => {
     const sm = f.sm as unknown as {
       branchWithSummary: (...a: unknown[]) => string;
       buildSessionContext: () => unknown;
+      getLeafId: () => unknown;
     };
     const origBranch = sm.branchWithSummary.bind(f.sm);
     sm.branchWithSummary = (...a: unknown[]) => {
       const id = origBranch(...a);
       sm.buildSessionContext = () => {
+        throw new Error("estimate boom");
+      };
+      sm.getLeafId = () => {
         throw new Error("estimate boom");
       };
       return id;
@@ -10860,5 +10869,392 @@ Active anchors (root → leaf, % of 100k):
         [5_000, 40_000, 90_000, 95_000],
       );
     });
+  });
+});
+
+// =============================================================================
+// Anchor estimates from a measured reply below the anchor (#138)
+// =============================================================================
+
+describe("anchor estimates from a measured reply below the anchor (#138)", () => {
+  /** A summary whose chars/4 estimate dwarfs the done-message gap. */
+  const LONG_SUMMARY = `${SUMMARY_TEXT}\n\n## Critical Context\n${"- abc1234 path/to/file.ts #42\n".repeat(700)}`;
+
+  /** An assistant reply whose request sent `real` context tokens. */
+  function replyWithRealContext(text: string, real: number): AssistantTurn {
+    const message = assistantMessage([{ type: "text", text }], "stop");
+    return {
+      ...message,
+      usage: {
+        ...usageOf(0),
+        input: 3,
+        cacheRead: real - 3,
+        output: 500,
+        totalTokens: real + 500,
+      },
+    };
+  }
+
+  async function landRewind(
+    f: ReturnType<typeof setup>,
+    summary = LONG_SUMMARY,
+  ): Promise<string> {
+    setupRewindable(f.sm, f.pi, { capture: true });
+    await requestRewind(f);
+    await summaryTurn(f, summary);
+    const done = rewindMessages(f.pi)[0].message.details;
+    assert.equal(done.status, "done");
+    return done.summaryId as string;
+  }
+
+  /** The percentage `list` prints for the `end` anchor. */
+  function endPct(text: string): string | undefined {
+    return /^\s*(\S+%)\s+end\b/m.exec(text)?.[1];
+  }
+
+  /** chars/4 of `msgs.slice(from)` — the estimator's own units. */
+  function tailOf(msgs: readonly unknown[], from: number): number {
+    let total = 0;
+    for (const m of msgs.slice(from)) {
+      total += estimateTokens(m as never);
+    }
+    return total;
+  }
+
+  /** The entry that owns a message object appended to the session. */
+  function entryOf(f: ReturnType<typeof setup>, message: unknown) {
+    const entry = f.sm
+      .getEntries()
+      .find((e) => e.type === "message" && e.message === message);
+    assert.ok(entry, "reply entry");
+    return entry;
+  }
+
+  async function listText(f: ReturnType<typeof setup>): Promise<string> {
+    const listed = await f.tool.execute(
+      "tc-list",
+      { action: "list" },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    return listed.content[0].text;
+  }
+
+  it("stacked summaries: list prints the anchor at the real count of the reply below it, minus the gap", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    // A sizable message between the anchor and the reply: the gap the real
+    // count is corrected by must be visible at the printed precision.
+    f.sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "u".repeat(16_000) }],
+    } as never);
+    const next = replyWithRealContext("continuing", real);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    // Move the leaf elsewhere: the measured reply leaves the active branch
+    // but stays in the session file — the stacked-rewind situation.
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const replyEntry = entryOf(f, next);
+    assert.ok(replyEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      replyEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    // The candidate: real(request below the anchor) - chars/4 of the gap
+    // between the anchor and that request (the done message).
+    const expected = real - tailOf(atReplyParent, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  it("a system entry in the gap is not subtracted — pi sends the system prompt once", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    // pi records a system entry after a landing; the real request folds it
+    // into the system prompt it already counts.
+    f.sm.appendMessage({
+      role: "system",
+      content: "",
+      sections: { preamble: "s".repeat(40_000) },
+      toolsAdded: [],
+      toolsRemoved: [],
+    } as never);
+    const next = replyWithRealContext("continuing", real);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const replyEntry = entryOf(f, next);
+    assert.ok(replyEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      replyEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    assert.ok(
+      atReplyParent.some((m) => (m as { role?: string }).role === "system"),
+      "the system entry is in the projected gap",
+    );
+    const nonSystem = atReplyParent.filter(
+      (m, i) => i < atEnd.length || (m as { role?: string }).role !== "system",
+    );
+    const expected = real - tailOf(nonSystem, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  for (const kind of ["compaction", "context_edit"] as const) {
+    it(`a reply past a ${kind} below the anchor is not a measurement`, async () => {
+      const f = setup();
+      const summaryId = await landRewind(f);
+      const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+      // A tiny real count past the rewrite: used, it would read far below
+      // the classic estimate.
+      if (kind === "compaction") {
+        f.sm.appendCompaction("compacted", null, 1000);
+      } else {
+        // Drop a message above the anchor from the reply's context.
+        const above = f.sm
+          .getBranch()
+          .find(
+            (e) =>
+              e.type === "message" &&
+              (e.message as { role?: string }).role === "user",
+          );
+        assert.ok(above, "a user message above the anchor");
+        f.sm.appendContextEdit(above.id, null);
+      }
+      const next = replyWithRealContext("continuing", kept.baseline + 10);
+      f.sm.appendMessage(next as never);
+      await fireTurnEndAll(f.pi, f.ctx, next);
+      f.sm.branch(summaryId);
+      appendTurn(f.sm, "u-side", "a-side", 100);
+      const listed = await listText(f);
+      const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+      assert.equal(
+        endPct(listed),
+        formatPct1(estimateContextTokens(atEnd), 1_000_000),
+      );
+    });
+  }
+
+  it("a same-model reply below another model's reply still counts", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const other = { ...replyWithRealContext("other", real), model: "x" };
+    f.sm.appendMessage(other as never);
+    await fireTurnEndAll(f.pi, f.ctx, other);
+    const next = replyWithRealContext("continuing", real + 50);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const replyEntry = entryOf(f, next);
+    assert.ok(replyEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      replyEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const expected = real + 50 - tailOf(atReplyParent, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  it("among several replies below the anchor, the smallest gap wins", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const doneLeaf = f.sm.getLeafId();
+    assert.ok(doneLeaf);
+    // Path 1: a large message, then a reply that reads far too high.
+    f.sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "u".repeat(8_000) }],
+    } as never);
+    const far = replyWithRealContext("far", real + 400_000);
+    f.sm.appendMessage(far as never);
+    // Path 2: the reply right after the landing.
+    f.sm.branch(doneLeaf);
+    const near = replyWithRealContext("near", real);
+    f.sm.appendMessage(near as never);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const nearEntry = entryOf(f, near);
+    assert.ok(nearEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      nearEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const expected = real - tailOf(atReplyParent, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  it("a reply deeper than the search bound is not found", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    for (let i = 0; i < 30; i++) {
+      f.sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "u" }],
+      } as never);
+    }
+    const deep = replyWithRealContext("deep", kept.baseline + 10);
+    f.sm.appendMessage(deep as never);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+    assert.equal(
+      endPct(listed),
+      formatPct1(estimateContextTokens(atEnd), 1_000_000),
+    );
+  });
+
+  it("a reply from another model id is ignored — tokenizers differ", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const next = { ...replyWithRealContext("continuing", real), model: "x" };
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+    assert.equal(
+      endPct(listed),
+      formatPct1(estimateContextTokens(atEnd), 1_000_000),
+    );
+  });
+
+  it("a provider alias still counts — same model id, different provider", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const next = {
+      ...replyWithRealContext("continuing", real),
+      provider: "other-provider",
+    };
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const replyEntry = entryOf(f, next);
+    assert.ok(replyEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      replyEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const expected = real - tailOf(atReplyParent, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  for (const stopReason of ["aborted", "error"] as const) {
+    it(`an ${stopReason} reply is not a measurement`, async () => {
+      const f = setup();
+      const summaryId = await landRewind(f);
+      const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+      const real = kept.baseline + Math.round(kept.tail * 1.85);
+      const next = {
+        ...replyWithRealContext("continuing", real),
+        stopReason,
+      };
+      f.sm.appendMessage(next as never);
+      await fireTurnEndAll(f.pi, f.ctx, next);
+      f.sm.branch(summaryId);
+      appendTurn(f.sm, "u-side", "a-side", 100);
+      const listed = await listText(f);
+      const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+      assert.equal(
+        endPct(listed),
+        formatPct1(estimateContextTokens(atEnd), 1_000_000),
+      );
+    });
+  }
+
+  it("the landing readout reuses the real count below the target plus chars/4 of what landed since", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const next = replyWithRealContext("continuing", real);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    // Work on the kept chain so the next rewind clears the savings floor.
+    appendTurn(f.sm, "u-big", "a-big", 150_000);
+    await requestRewind(
+      f,
+      { ...REWIND_ARGS, rewindTo: "end", newLabel: "end2" },
+      "tc-rewind-2",
+    );
+    await summaryTurn(f, SUMMARY_TEXT);
+    const done = rewindMessages(f.pi).at(-1)?.message;
+    assert.ok(done);
+    assert.equal(done.details.status, "done");
+    // afterTokens: real count of the reply below 'end' minus the gap to its
+    // request (the first rewind's done message) plus chars/4 of the new
+    // summary — the measured reply the abandoned branch left behind.
+    const entries = f.sm.getEntries();
+    const summary2Id = done.details.summaryId as string;
+    const replyEntry = entryOf(f, next);
+    assert.ok(replyEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      replyEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const atLeaf = buildSessionContext(entries, summary2Id).messages;
+    const expected =
+      real - tailOf(atReplyParent, atEnd.length) + tailOf(atLeaf, atEnd.length);
+    const delta = /context \S+ → (\S+) of/.exec(done.content);
+    assert.equal(delta?.[1], formatPct1(expected, 1_000_000));
+  });
+
+  it("a reply whose gaps estimate as much as the classic tail is not used", async () => {
+    const f = setup();
+    const { anchorId } = setupRewindable(f.sm, f.pi, { capture: true });
+    // A measured reply straight off the anchor: the anchor is the classic
+    // baseline, so its gap equals the whole tail — never an improvement.
+    const leaf = f.sm.getLeafId();
+    assert.ok(leaf);
+    f.sm.branch(anchorId);
+    const side = replyWithRealContext("side", 999_999);
+    f.sm.appendMessage(side as never);
+    f.sm.branch(leaf);
+    await requestRewind(f);
+    await summaryTurn(f, LONG_SUMMARY);
+    const done = rewindMessages(f.pi)[0].message.details;
+    assert.equal(done.status, "done");
+    const summaryId = done.summaryId as string;
+    const listed = await listText(f);
+    const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+    assert.equal(
+      endPct(listed),
+      formatPct1(estimateContextTokens(atEnd), 1_000_000),
+    );
   });
 });
