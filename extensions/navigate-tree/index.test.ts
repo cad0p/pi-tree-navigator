@@ -10936,6 +10936,122 @@ describe("anchor estimates from a measured reply below the anchor (#138)", () =>
     assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
   });
 
+  for (const kind of ["compaction", "context_edit"] as const) {
+    it(`a reply past a ${kind} below the anchor is not a measurement`, async () => {
+      const f = setup();
+      const summaryId = await landRewind(f);
+      const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+      // A tiny real count past the rewrite: used, it would read far below
+      // the classic estimate.
+      if (kind === "compaction") {
+        f.sm.appendCompaction("compacted", null, 1000);
+      } else {
+        // Drop a message above the anchor from the reply's context.
+        const above = f.sm
+          .getBranch()
+          .find(
+            (e) =>
+              e.type === "message" &&
+              (e.message as { role?: string }).role === "user",
+          );
+        assert.ok(above, "a user message above the anchor");
+        f.sm.appendContextEdit(above.id, null);
+      }
+      const next = replyWithRealContext("continuing", kept.baseline + 10);
+      f.sm.appendMessage(next as never);
+      await fireTurnEndAll(f.pi, f.ctx, next);
+      f.sm.branch(summaryId);
+      appendTurn(f.sm, "u-side", "a-side", 100);
+      const listed = await listText(f);
+      const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+      assert.equal(
+        endPct(listed),
+        formatPct1(estimateContextTokens(atEnd), 1_000_000),
+      );
+    });
+  }
+
+  it("a same-model reply below another model's reply still counts", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const other = { ...replyWithRealContext("other", real), model: "x" };
+    f.sm.appendMessage(other as never);
+    await fireTurnEndAll(f.pi, f.ctx, other);
+    const next = replyWithRealContext("continuing", real + 50);
+    f.sm.appendMessage(next as never);
+    await fireTurnEndAll(f.pi, f.ctx, next);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const replyEntry = entryOf(f, next);
+    assert.ok(replyEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      replyEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const expected = real + 50 - tailOf(atReplyParent, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  it("among several replies below the anchor, the smallest gap wins", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    const real = kept.baseline + Math.round(kept.tail * 1.85);
+    const doneLeaf = f.sm.getLeafId();
+    assert.ok(doneLeaf);
+    // Path 1: a large message, then a reply that reads far too high.
+    f.sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "u".repeat(8_000) }],
+    } as never);
+    const far = replyWithRealContext("far", real + 400_000);
+    f.sm.appendMessage(far as never);
+    // Path 2: the reply right after the landing.
+    f.sm.branch(doneLeaf);
+    const near = replyWithRealContext("near", real);
+    f.sm.appendMessage(near as never);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const entries = f.sm.getEntries();
+    const nearEntry = entryOf(f, near);
+    assert.ok(nearEntry.parentId);
+    const atReplyParent = buildSessionContext(
+      entries,
+      nearEntry.parentId,
+    ).messages;
+    const atEnd = buildSessionContext(entries, summaryId).messages;
+    const expected = real - tailOf(atReplyParent, atEnd.length);
+    assert.equal(endPct(listed), formatPct1(expected, 1_000_000));
+  });
+
+  it("a reply deeper than the search bound is not found", async () => {
+    const f = setup();
+    const summaryId = await landRewind(f);
+    const kept = splitContextEstimate(f.sm.buildSessionContext().messages);
+    for (let i = 0; i < 30; i++) {
+      f.sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "u" }],
+      } as never);
+    }
+    const deep = replyWithRealContext("deep", kept.baseline + 10);
+    f.sm.appendMessage(deep as never);
+    f.sm.branch(summaryId);
+    appendTurn(f.sm, "u-side", "a-side", 100);
+    const listed = await listText(f);
+    const atEnd = buildSessionContext(f.sm.getEntries(), summaryId).messages;
+    assert.equal(
+      endPct(listed),
+      formatPct1(estimateContextTokens(atEnd), 1_000_000),
+    );
+  });
+
   it("a reply from another model id is ignored — tokenizers differ", async () => {
     const f = setup();
     const summaryId = await landRewind(f);

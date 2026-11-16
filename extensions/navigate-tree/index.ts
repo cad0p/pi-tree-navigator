@@ -832,8 +832,14 @@ export function createAnchorEstimateIndex(
  * across models; providers alias the same one, so provider is ignored),
  * ended normally, and recorded the request's input-side tokens
  * (`requestContextTokens`). Bounded at `MEASURED_REPLY_MAX_DEPTH`
- * entries per path.
+ * entries per path. A path ends at a `compaction` or `context_edit`: past
+ * one, the reply's context is not the ancestor's plus the gap.
  */
+function rewritesContext(entry: SessionEntry): boolean {
+  const type = (entry as { type?: string }).type;
+  return type === "compaction" || type === "context_edit";
+}
+
 function measuredRepliesBelow(
   index: AnchorEstimateIndex,
   byId: Map<string, SessionEntry>,
@@ -850,7 +856,7 @@ function measuredRepliesBelow(
   while (stack.length > 0) {
     const { id, depth } = stack.pop() as { id: string; depth: number };
     const entry = byId.get(id);
-    if (!entry) continue;
+    if (!entry || rewritesContext(entry)) continue;
     if (
       entry.type === "message" &&
       (entry.message as { role?: string }).role === "assistant"
@@ -871,8 +877,10 @@ function measuredRepliesBelow(
         ) {
           found.push({ entry, realTokens });
         }
+        continue;
       }
-      continue;
+      // Another model's reply measures nothing here: a same-model reply
+      // further down still can, with this one counted in its gap.
     }
     if (depth >= MEASURED_REPLY_MAX_DEPTH) continue;
     for (const child of index.children.get(id) ?? []) {
@@ -958,6 +966,7 @@ export function estimateAtEntry(
     const aboveGap = (countA: number): number =>
       estimatedTail(messages, countA);
     let best: { value: number; uncertainty: number } | undefined;
+    const visited = new Set<string>();
     let ancestor: SessionEntry | undefined = byId.get(entryId);
     while (ancestor) {
       const countA = contextAt(ancestor.id).length;
@@ -978,9 +987,16 @@ export function estimateAtEntry(
         }
       }
       if (ancestor.id === baselineId) break;
+      // Above a compaction or context edit, the target's context is no
+      // longer the ancestor's plus what follows: the gap math needs that.
+      if (rewritesContext(ancestor)) break;
+      visited.add(ancestor.id);
       ancestor = ancestor.parentId ? byId.get(ancestor.parentId) : undefined;
+      if (ancestor && visited.has(ancestor.id)) break;
     }
-    if (best && best.uncertainty < split.tail) {
+    // The gate compares like with like: the classic tail without the
+    // system entries the gaps leave out.
+    if (best && best.uncertainty < estimatedTail(messages, baselineIndex + 1)) {
       return Math.max(0, best.value);
     }
   } catch {
@@ -1008,7 +1024,8 @@ function formatActiveAnchors(
 ): { names: string[]; text: string } {
   const names: string[] = [];
   const rows: AnchorTableRow[] = [];
-  const estIndex = createAnchorEstimateIndex(allEntries);
+  const estIndex =
+    modelId === undefined ? undefined : createAnchorEstimateIndex(allEntries);
   for (const e of sm.getBranch()) {
     const lbl = sm.getLabel(e.id);
     if (!lbl?.startsWith(LABEL_PREFIX)) continue;
@@ -4348,7 +4365,10 @@ Operations (set \`action\`):
         for (const e of allEntries) byId.set(e.id, e);
         const cw = ctx.model?.contextWindow ?? 0;
         const modelId = ctxModelId(ctx);
-        const estIndex = createAnchorEstimateIndex(allEntries);
+        const estIndex =
+          modelId === undefined
+            ? undefined
+            : createAnchorEstimateIndex(allEntries);
         const leafId = sm.getLeafId();
         const totalTokens = leafId
           ? estimateAtEntry(allEntries, leafId, byId, modelId, estIndex)
