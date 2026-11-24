@@ -77,6 +77,7 @@ import {
 import { Type } from "typebox";
 import {
   loadTreeNavigatorConfig,
+  MAX_ANCHORS_DEFAULT,
   resolveRewindHintReserve,
   START_ANCHOR_DEFAULT_TURNS,
   TREE_NAVIGATOR_CONFIG_FILENAME,
@@ -186,6 +187,13 @@ export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // rewind burns a summary turn, forks a junk branch_summary, consumes
 // a milestone label, and GROWS live context.
 export const MIN_REWIND_SAVINGS_TOKENS = 4000;
+
+/**
+ * Which anchor to rewind to, said once (#141): the rewind-hygiene
+ * `promptGuidelines` bullet and the anchor-cap refusal quote it verbatim.
+ */
+export const PREFER_OLDEST_ANCHOR =
+  "prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive";
 // Summary attempts a pending rewind gets in total (#80, #90 S5). An attempt
 // fails when it calls a tool (blocked while the rewind is pending), carries
 // no `## Goal` summary, or is cut off; a failed attempt is hidden from the
@@ -772,6 +780,51 @@ function findLabeledEntry(
   return null;
 }
 
+/**
+ * Every anchor on the active branch, root → leaf (#141). An anchor is an
+ * `anchor:` label whose name `rewindTo` accepts: `start` and valid manual
+ * `/tree` labels included. A manual label with an invalid name can never be
+ * a rewind target, so the cap, the refusals and the tables all ignore it.
+ */
+function activeAnchors(
+  sm: Pick<SessionManager, "getBranch" | "getLabel">,
+): Array<{ id: string; name: string }> {
+  const anchors: Array<{ id: string; name: string }> = [];
+  for (const e of sm.getBranch()) {
+    const lbl = sm.getLabel(e.id);
+    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
+    const name = lbl.slice(LABEL_PREFIX.length);
+    if (isValidName(name)) anchors.push({ id: e.id, name });
+  }
+  return anchors;
+}
+
+/**
+ * Refusal copy for the anchor cap (#141), shared by `anchor` and `rewind`.
+ * No anchor is named (naming the newest allowed one pulls the model to it,
+ * against {@link PREFER_OLDEST_ANCHOR}); the table lists only the anchors a
+ * rewind can target — the first maxAnchors − 1, whose rewind's `newLabel`
+ * takes the last slot.
+ */
+function buildMaxAnchorsRefusal(
+  sm: SessionManager,
+  maxAnchors: number,
+  cw: number,
+  allEntries: SessionEntry[],
+  byId: Map<string, SessionEntry>,
+  modelId?: string,
+): string {
+  const table = formatActiveAnchors(
+    sm,
+    cw,
+    allEntries,
+    byId,
+    maxAnchors - 1,
+    modelId,
+  ).text;
+  return `The maximum number of anchors (${maxAnchors}) has been reached on the active branch. To make space, rewind further back than the last anchor: ${PREFER_OLDEST_ANCHOR}.\n${table}`;
+}
+
 function estimateActiveBranchTokens(sm: SessionManager): number {
   return estimateContextTokens(sm.buildSessionContext().messages);
 }
@@ -1011,33 +1064,43 @@ export function estimateAtEntry(
  * table (#101, D19). Shared by the min-savings rejection, the rewind hint
  * and the forced-rewind message so all name the same targets the same way. A manual
  * `/tree` label `anchor:x` CAN put the same name on two entries —
- * duplicates print twice, exactly as `list` prints them. Names `rewindTo`
- * would reject (e.g. an empty `anchor:` label) are skipped: both callers
- * point the model at rewind targets.
+ * duplicates print twice. Labels whose name `rewindTo` would reject
+ * (e.g. an empty `anchor:` label) are not anchors (see activeAnchors).
+ *
+ * `limit` (#141) is `maxAnchors − 1`, applied like an SQL LIMIT, root
+ * first: a rewind to the anchor at position N keeps N anchors and adds its
+ * `newLabel`, so exactly the first `maxAnchors − 1` are rewind targets.
+ * Every anchor viewer (`list`, the hint, the forced-rewind message, the
+ * min-savings and anchor-cap refusals) shows only those.
+ *
+ * `afterMaxLength` adds `list`'s `(after: “…”)` preview column.
  */
 function formatActiveAnchors(
-  sm: Pick<SessionManager, "getBranch" | "getLabel">,
+  sm: Pick<SessionManager, "getBranch" | "getLabel" | "getEntry">,
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
+  limit: number,
   modelId?: string,
+  opts: { afterMaxLength?: number } = {},
 ): { names: string[]; text: string } {
   const names: string[] = [];
   const rows: AnchorTableRow[] = [];
   const estIndex =
     modelId === undefined ? undefined : createAnchorEstimateIndex(allEntries);
-  for (const e of sm.getBranch()) {
-    const lbl = sm.getLabel(e.id);
-    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
-    const name = lbl.slice(LABEL_PREFIX.length);
-    if (!isValidName(name)) continue;
+  for (const { id, name } of activeAnchors(sm).slice(0, limit)) {
     names.push(name);
+    const after =
+      opts.afterMaxLength === undefined
+        ? null
+        : findLabelHint(sm, id, opts.afterMaxLength);
     rows.push({
       pct: formatPct1(
-        estimateAtEntry(allEntries, e.id, byId, modelId, estIndex),
+        estimateAtEntry(allEntries, id, byId, modelId, estIndex),
         cw,
       ),
       name,
+      ...(after ? { after } : {}),
     });
   }
   // cw=0 → percents fall back to formatPct1's k-format and the header
@@ -1062,9 +1125,10 @@ function buildMinSavingsRejection(
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
+  limit: number,
   modelId?: string,
 ): string {
-  const anchors = formatActiveAnchors(sm, cw, allEntries, byId, modelId);
+  const anchors = formatActiveAnchors(sm, cw, allEntries, byId, limit, modelId);
   const guidance =
     anchors.names[0] === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
@@ -1079,7 +1143,7 @@ function buildMinSavingsRejection(
  * shown as-is.
  */
 function findLabelHint(
-  sm: SessionManager,
+  sm: Pick<SessionManager, "getEntry">,
   fromId: string,
   maxLen: number,
 ): string | null {
@@ -2507,6 +2571,7 @@ export function createNavigateTreeExtension(
       at.contextWindow,
       allEntries,
       byId,
+      maxAnchorsFor(sm) - 1,
       modelId,
     );
     // D14: nothing to rewind to.
@@ -3741,6 +3806,15 @@ export function createNavigateTreeExtension(
   // sharing each other's config value, tool-active gate, or settle marker.
   const anchorStartSettled = new Set<string>();
   const anchorStartTurnsBySession = new Map<string, number>();
+  // Anchor cap (#141), per session like the start-anchor bound.
+  const maxAnchorsBySession = new Map<string, number>();
+  function maxAnchorsFor(sm: Pick<SessionManager, "getSessionId">): number {
+    try {
+      return maxAnchorsBySession.get(sm.getSessionId()) ?? MAX_ANCHORS_DEFAULT;
+    } catch {
+      return MAX_ANCHORS_DEFAULT;
+    }
+  }
   const toolActiveBySession = new Map<string, boolean>();
 
   // Auto start anchor (#55): silent `anchor:start` write, shared by the
@@ -3850,6 +3924,7 @@ export function createNavigateTreeExtension(
     let reserve: number | null = null;
     let byModel: ReadonlyMap<string, number | null> = new Map();
     let startTurns = START_ANCHOR_DEFAULT_TURNS;
+    let maxAnchors = MAX_ANCHORS_DEFAULT;
     let warnings: string[] = [];
     try {
       const loaded = await loadTreeNavigatorConfig({
@@ -3860,6 +3935,7 @@ export function createNavigateTreeExtension(
       reserve = loaded.config.rewindHintReserveTokens;
       byModel = loaded.config.rewindHintModelReserveTokens;
       startTurns = loaded.config.anchorStartAfterTurns;
+      maxAnchors = loaded.config.maxAnchors;
       warnings = loaded.warnings;
     } catch {
       // The loader is fail-closed and should never throw; this guard exists
@@ -3869,11 +3945,13 @@ export function createNavigateTreeExtension(
       reserve = null;
       byModel = new Map();
       startTurns = START_ANCHOR_DEFAULT_TURNS;
+      maxAnchors = MAX_ANCHORS_DEFAULT;
       warnings = [];
     }
     rewindHintReserveTokens = reserve;
     hintByModel = byModel;
     anchorStartTurnsBySession.set(sessionId, startTurns);
+    maxAnchorsBySession.set(sessionId, maxAnchors);
     // Fresh leg: the per-session gate re-arms on the next
     // `before_agent_start`; absent = fail-open in the meantime.
     toolActiveBySession.delete(sessionId);
@@ -4174,6 +4252,7 @@ export function createNavigateTreeExtension(
         usage.contextWindow,
         allEntries,
         byId,
+        maxAnchorsFor(sm) - 1,
         typeof replied?.model === "string" ? replied.model : undefined,
       );
     } catch {
@@ -4302,7 +4381,7 @@ export function createNavigateTreeExtension(
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
     promptGuidelines: [
-      `${TOOL_NAME}: when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive; persist durable findings to files first.`,
+      `${TOOL_NAME}: when rewinding, ${PREFER_OLDEST_ANCHOR}; persist durable findings to files first.`,
       `${TOOL_NAME}: don't rewind while a user decision or unresolved question is pending — ask the user instead.`,
     ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
@@ -4363,7 +4442,6 @@ Operations (set \`action\`):
 
       // --- list ---
       if (p.action === "list") {
-        const path = sm.getBranch();
         const allEntries = sm.getEntries();
         const byId = new Map<string, SessionEntry>();
         for (const e of allEntries) byId.set(e.id, e);
@@ -4379,38 +4457,27 @@ Operations (set \`action\`):
           : estimateActiveBranchTokens(sm);
         const reflectionOk = !!findOwningSession(sm);
 
-        const rows: AnchorTableRow[] = [];
-        for (const e of path) {
-          const lbl = sm.getLabel(e.id);
-          if (lbl?.startsWith(LABEL_PREFIX)) {
-            const name = lbl.slice(LABEL_PREFIX.length);
-            const tokensAt = estimateAtEntry(
-              allEntries,
-              e.id,
-              byId,
-              modelId,
-              estIndex,
-            );
-            const hint = findLabelHint(sm, e.id, LIST_HINT_MAX_LENGTH);
-            rows.push({
-              pct: formatPct1(tokensAt, cw),
-              name,
-              ...(hint ? { after: hint } : {}),
-            });
-          }
-        }
+        // The shared anchor viewer (#141): rewind targets only.
+        const anchors = formatActiveAnchors(
+          sm,
+          cw,
+          allEntries,
+          byId,
+          maxAnchorsFor(sm) - 1,
+          modelId,
+          { afterMaxLength: LIST_HINT_MAX_LENGTH },
+        );
+        const count = anchors.names.length;
 
         const reflectionWarning = reflectionOk
           ? ""
           : ` · ${REFLECTION_BOOTSTRAP_WARNING_LIST}`;
-        const header = `[list] · ${rows.length} label${rows.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
-        const body = rows.length
-          ? formatAnchorTable(rows, cw)
-          : "No labels on the active branch.";
+        const header = `[list] · ${count} label${count === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
+        const body = count ? anchors.text : "No labels on the active branch.";
         return {
           content: [{ type: "text", text: `${header}\n\n${body}` }],
           details: {
-            count: rows.length,
+            count,
             contextTokens: totalTokens,
             contextWindow: cw,
             reflectionOk,
@@ -4437,6 +4504,27 @@ Operations (set \`action\`):
         if (findLabeledEntry(sm, fullLabel)) {
           return toolError(
             `A label '${p.name}' already exists on the active branch — labels are unique and immutable once written. Use action='list' to review the active labels, then pick a fresh name.`,
+          );
+        }
+        // Anchor cap (#141): a full branch only makes room through a
+        // rewind to an earlier anchor, which folds the newer ones (and the
+        // summaries they label) into one summary.
+        const maxAnchors = maxAnchorsFor(sm);
+        const anchorCount = activeAnchors(sm).length;
+        if (anchorCount >= maxAnchors) {
+          const allEntries = sm.getEntries();
+          const byId = new Map<string, SessionEntry>();
+          for (const e of allEntries) byId.set(e.id, e);
+          return toolError(
+            buildMaxAnchorsRefusal(
+              sm,
+              maxAnchors,
+              ctx.model?.contextWindow ?? 0,
+              allEntries,
+              byId,
+              ctxModelId(ctx),
+            ),
+            { rejected: "max-anchors", maxAnchors, anchorCount },
           );
         }
         // Atomic anchor: compute the estimate BEFORE writing the label. A
@@ -4541,6 +4629,35 @@ Operations (set \`action\`):
         return toolError(`Already at '${p.rewindTo}' — nothing to summarize.`);
       }
 
+      // Anchor cap (#141): the branch a rewind leaves keeps the anchors up
+      // to and including `rewindTo`, plus the `newLabel` it writes. At the
+      // cap, a rewind to the newest anchor would stack one more summary on
+      // the kept prefix — the growing floor this cap exists to stop.
+      const maxAnchors = maxAnchorsFor(sm);
+      const branchAnchors = activeAnchors(sm);
+      const keptAnchors =
+        branchAnchors.findIndex((anchor) => anchor.id === target) + 1;
+      if (keptAnchors + 1 > maxAnchors) {
+        const capEntries = sm.getEntries();
+        const capById = new Map<string, SessionEntry>();
+        for (const e of capEntries) capById.set(e.id, e);
+        return toolError(
+          buildMaxAnchorsRefusal(
+            sm,
+            maxAnchors,
+            ctx.model?.contextWindow ?? 0,
+            capEntries,
+            capById,
+            ctxModelId(ctx),
+          ),
+          {
+            rejected: "max-anchors",
+            maxAnchors,
+            anchorCount: branchAnchors.length,
+          },
+        );
+      }
+
       // Token math (#21): pure SessionManager reads, so the min-savings
       // floor below can reject before a pending rewind is recorded.
       // `allEntries`/`byId` are hoisted out of the parented-assistant branch
@@ -4595,6 +4712,7 @@ Operations (set \`action\`):
             contextWindow,
             allEntries,
             byId,
+            maxAnchorsFor(sm) - 1,
             modelId,
           ),
           { rejected: "min-savings", apparentSavings },

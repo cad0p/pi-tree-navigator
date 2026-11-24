@@ -65,7 +65,7 @@ Labels are unique on the active branch: `anchor` refuses a `name` and `rewind` r
 
 ## Configuration (`tree-navigator.json`)
 
-Both the rewind hint and the automatic start anchor read one two-layer config file:
+The rewind hint, the automatic start anchor and the anchor cap read one two-layer config file:
 
 | Layer | Path |
 |---|---|
@@ -73,10 +73,31 @@ Both the rewind hint and the automatic start anchor read one two-layer config fi
 | Project | `join(cwd, CONFIG_DIR_NAME, "tree-navigator.json")` (`.pi/` by default; read only when the project is trusted — untrusted projects are ignored silently) |
 
 ```json
-{ "rewindHintReserveTokens": 50000, "anchorStartAfterTurns": 0 }
+{ "rewindHintReserveTokens": 50000, "anchorStartAfterTurns": 0, "maxAnchors": 10 }
 ```
 
 A project key, when present, wins (including the hint's disable sentinels); absent → global; absent everywhere → the field's default. File-level problems (non-ENOENT read error, invalid JSON, non-object root) warn and make that layer contribute nothing for *every* field, so the other layer still applies; a missing file is silent. Each field-level invalid value emits its own field-scoped warning when the session has a UI (headless sessions stay silent, like every `ui.notify`).
+
+## Anchor cap (`maxAnchors`)
+
+The active branch holds at most `maxAnchors` anchors (default **10**). Without a cap, a model that always rewinds to the newest anchor (usually the previous rewind's own `newLabel`) stacks one more `branch_summary` on the kept prefix with every rewind, until a rewind frees almost nothing (#141).
+
+- `anchor` is refused when the active branch already holds `maxAnchors` anchors.
+- `rewind` is refused when the branch it leaves would hold more than `maxAnchors`: the anchors up to and including `rewindTo`, plus the `newLabel` it writes. At the cap, a rewind to the last anchor is refused; a rewind to the one before it is accepted and folds the newer summaries into one.
+- The refusal names no anchor (naming the newest allowed one would pull the model to it). It quotes the rewind-hygiene guideline (the same constant), and its table lists only the anchors a rewind can target: the first `maxAnchors − 1` on the branch.
+
+```text
+The maximum number of anchors (10) has been reached on the active branch. To make space, rewind further back than the last anchor: prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive.
+Active anchors (root → leaf, % of 1.0M):
+   4.1%  start
+  …
+```
+
+Every anchor table shows only rewind targets: `list`, the hint, the forced-rewind message and the min-savings and anchor-cap refusals list the first `maxAnchors − 1` anchors, root first (a rewind to the anchor at position N keeps N anchors and adds its `newLabel`). Below the cap that is every anchor; on a branch already over it, the hint no longer prints one line per summary in the pile. A hidden label still exists: its name stays taken.
+
+An anchor is an `anchor:` label on the active branch whose name `rewindTo` accepts: `start` and valid manual `/tree` labels included. A manual label with an invalid name (e.g. `anchor:My Thing`) can never be a rewind target, so it is a plain label: the cap ignores it and no table shows it. `branch:` labels are not anchors either. The automatic `start` write is never refused. A branch already over the cap can only rewind to one of its first `maxAnchors − 1` anchors. During a forced rewind, a cap refusal is a validation refusal: it stays visible and does not count as an attempt.
+
+Value: integer **2–1000**, as a number or a digits-only string. An invalid value warns and falls back to the other layer's valid value, else the default (the same rule as `anchorStartAfterTurns`). There is no disable sentinel; set a large value to effectively turn the cap off.
 
 ## Rewind hint (optional)
 

@@ -13,6 +13,7 @@
  *     session with NO cross-layer fallback.
  *   - `anchorStartAfterTurns`: field-level invalid warns and falls through
  *     to the other layer's valid value, else the default 2.
+ *   - `maxAnchors` (#141): the same fall-through as `anchorStartAfterTurns`.
  *
  * The removed `rewindHintAtPercent` key (0.3.0) only warns: it never
  * enables, disables, or invalidates the hint.
@@ -22,7 +23,11 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   type HintField,
+  type IntField,
   loadTreeNavigatorConfig,
+  MAX_ANCHORS_DEFAULT,
+  MAX_ANCHORS_MAX,
+  MAX_ANCHORS_MIN,
   mergeTreeNavigatorConfig,
   type ParsedLayer,
   parseTreeNavigatorConfig,
@@ -53,6 +58,8 @@ const warnLegacyPercent = (layerName: string, path: string) =>
   `navigate_tree: rewindHintAtPercent in ${layerName} config at ${path} was removed in 0.3.0 and is ignored — use rewindHintReserveTokens (tokens left in the window when the hint fires, e.g. 50000).`;
 const WARN_INVALID_HINT_PROJECT = `navigate_tree: invalid rewindHintReserveTokens in project config at ${PROJECT_PATH} — expected integer ${REWIND_HINT_MIN_RESERVE}-${REWIND_HINT_MAX_RESERVE} or a disable sentinel (null, false, "off", "disabled"); rewind hint disabled for this session.`;
 const WARN_INVALID_START_GLOBAL = `navigate_tree: invalid anchorStartAfterTurns in global config at ${GLOBAL_PATH} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`;
+const warnInvalidMaxAnchors = (layerName: string, path: string) =>
+  `navigate_tree: invalid maxAnchors in ${layerName} config at ${path} — expected integer ${MAX_ANCHORS_MIN}-${MAX_ANCHORS_MAX}; falling back to the other layer's valid value, else the default ${MAX_ANCHORS_DEFAULT}.`;
 const WARN_INVALID_START_PROJECT = `navigate_tree: invalid anchorStartAfterTurns in project config at ${PROJECT_PATH} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`;
 
 /** In-memory `readFile` double: returns `files[path]` or throws ENOENT. */
@@ -98,11 +105,13 @@ function configJsonStart(anchorStartAfterTurns: unknown): string {
 function layer(partial: {
   hint?: HintField;
   startAnchor?: StartAnchorField;
+  maxAnchors?: IntField;
   modelHints?: Array<[string, HintField]>;
 }): ParsedLayer {
   return {
     hint: partial.hint ?? { kind: "absent" },
     startAnchor: partial.startAnchor ?? { kind: "absent" },
+    maxAnchors: partial.maxAnchors ?? { kind: "absent" },
     modelHints: new Map(partial.modelHints ?? []),
     modelOverridesProblems: {
       notObject: false,
@@ -116,11 +125,13 @@ function cfg(
   hint: number | null,
   start = START_ANCHOR_DEFAULT_TURNS,
   byModel: Array<[string, number | null]> = [],
+  maxAnchors = MAX_ANCHORS_DEFAULT,
 ) {
   return {
     rewindHintReserveTokens: hint,
     rewindHintModelReserveTokens: new Map(byModel),
     anchorStartAfterTurns: start,
+    maxAnchors,
   };
 }
 
@@ -276,6 +287,46 @@ describe("parseTreeNavigatorConfig", () => {
           parsedLayer({ anchorStartAfterTurns: raw }).startAnchor,
           { kind: "invalid" },
         );
+      });
+    }
+  });
+
+  describe("maxAnchors: accepts integer caps (number and string forms)", () => {
+    const accepted: Array<[string, unknown, number]> = [
+      ["default value", 10, 10],
+      ["numeric string", "10", 10],
+      ["trimmed numeric string", " 12 ", 12],
+      ["min edge number", MAX_ANCHORS_MIN, MAX_ANCHORS_MIN],
+      ["max edge number", MAX_ANCHORS_MAX, MAX_ANCHORS_MAX],
+      ["max edge string", `${MAX_ANCHORS_MAX}`, MAX_ANCHORS_MAX],
+    ];
+    for (const [label, raw, want] of accepted) {
+      it(label, () => {
+        assert.deepEqual(parsedLayer({ maxAnchors: raw }).maxAnchors, {
+          kind: "ok",
+          value: want,
+        });
+      });
+    }
+  });
+
+  describe("maxAnchors: rejects unusable field values as invalid", () => {
+    const invalid: Array<[string, unknown]> = [
+      ["one below min", MAX_ANCHORS_MIN - 1],
+      ["zero", 0],
+      ["one above max", MAX_ANCHORS_MAX + 1],
+      ["decimal", 9.5],
+      ["non-numeric string", "ten"],
+      ["null (no disable sentinel)", null],
+      ["off string (no disable sentinel)", "off"],
+      ["boolean false", false],
+      ["object", {}],
+    ];
+    for (const [label, raw] of invalid) {
+      it(label, () => {
+        assert.deepEqual(parsedLayer({ maxAnchors: raw }).maxAnchors, {
+          kind: "invalid",
+        });
       });
     }
   });
@@ -768,6 +819,70 @@ describe("loadTreeNavigatorConfig", () => {
     assert.deepEqual(out, {
       config: cfg(null, START_ANCHOR_DEFAULT_TURNS),
       warnings: [WARN_INVALID_START_GLOBAL],
+    });
+  });
+
+  it("maxAnchors: absent everywhere → the default", async () => {
+    const out = await loadTreeNavigatorConfig({
+      agentDir: AGENT_DIR,
+      projectPath: PROJECT_PATH,
+      projectTrusted: true,
+      readFile: readerFor({}).readFile,
+    });
+    assert.equal(out.config.maxAnchors, MAX_ANCHORS_DEFAULT);
+  });
+
+  it("maxAnchors: a trusted project value wins over global", async () => {
+    const reader = readerFor({
+      [GLOBAL_PATH]: JSON.stringify({ maxAnchors: 20 }),
+      [PROJECT_PATH]: JSON.stringify({ maxAnchors: "5" }),
+    });
+    const out = await loadTreeNavigatorConfig({
+      agentDir: AGENT_DIR,
+      projectPath: PROJECT_PATH,
+      projectTrusted: true,
+      readFile: reader.readFile,
+    });
+    assert.deepEqual(out, {
+      config: cfg(null, START_ANCHOR_DEFAULT_TURNS, [], 5),
+      warnings: [],
+    });
+  });
+
+  it("maxAnchors: an invalid project value warns and falls back to global", async () => {
+    const reader = readerFor({
+      [GLOBAL_PATH]: JSON.stringify({ maxAnchors: 20 }),
+      [PROJECT_PATH]: JSON.stringify({ maxAnchors: 1 }),
+    });
+    const out = await loadTreeNavigatorConfig({
+      agentDir: AGENT_DIR,
+      projectPath: PROJECT_PATH,
+      projectTrusted: true,
+      readFile: reader.readFile,
+    });
+    assert.deepEqual(out, {
+      config: cfg(null, START_ANCHOR_DEFAULT_TURNS, [], 20),
+      warnings: [warnInvalidMaxAnchors("project", PROJECT_PATH)],
+    });
+  });
+
+  it("maxAnchors: invalid everywhere warns per layer and uses the default", async () => {
+    const reader = readerFor({
+      [GLOBAL_PATH]: JSON.stringify({ maxAnchors: "lots" }),
+      [PROJECT_PATH]: JSON.stringify({ maxAnchors: null }),
+    });
+    const out = await loadTreeNavigatorConfig({
+      agentDir: AGENT_DIR,
+      projectPath: PROJECT_PATH,
+      projectTrusted: true,
+      readFile: reader.readFile,
+    });
+    assert.deepEqual(out, {
+      config: cfg(null),
+      warnings: [
+        warnInvalidMaxAnchors("global", GLOBAL_PATH),
+        warnInvalidMaxAnchors("project", PROJECT_PATH),
+      ],
     });
   });
 

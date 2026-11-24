@@ -44,6 +44,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
+  MAX_ANCHORS_DEFAULT,
   START_ANCHOR_DEFAULT_TURNS,
   START_ANCHOR_MAX_TURNS,
   START_ANCHOR_MIN_TURNS,
@@ -74,6 +75,7 @@ import navigateTreeDefault, {
   MIN_REWIND_SAVINGS_TOKENS,
   MIN_SUMMARY_FOCUS_LENGTH,
   NESTED_REWIND_REFUSAL,
+  PREFER_OLDEST_ANCHOR,
   REWIND_ABORTED_TEXT,
   REWIND_CUSTOM_TYPE,
   REWIND_OUTCOME_CUSTOM_TYPE,
@@ -5272,6 +5274,234 @@ describe("dispatch: rewind newLabel uniqueness", () => {
       result.content[0].text,
       "A label 'taken' already exists on the active branch — labels are unique and immutable once written, so rewind requires a fresh `newLabel`. The existing 'taken' label stays addressable via `rewindTo`. Use action='list' to review the active labels, then pick a fresh newLabel.",
     );
+  });
+});
+
+// =============================================================================
+// Anchor cap (#141)
+// =============================================================================
+
+describe("dispatch: anchor cap (#141)", () => {
+  /** `n` anchored turns `a1`…`an` with growing usage, then one big turn. */
+  function anchoredTurns(sm: SessionManager, pi: FakePi, n: number): void {
+    for (let i = 1; i <= n; i++) {
+      const t = appendTurn(sm, `u${i}`, `a${i}`, i * 5_000);
+      pi.pi.setLabel(t.assistantId, `anchor:a${i}`);
+    }
+    appendTurn(sm, "u-last", "a-last", n * 5_000 + 60_000);
+  }
+
+  async function exec(
+    tool: CapturedTool,
+    ctx: FakeCtx,
+    params: Record<string, unknown>,
+  ) {
+    return tool.execute("tc-cap", params, undefined, undefined, ctx);
+  }
+
+  const rewind = (rewindTo: string, newLabel = "fresh") => ({
+    action: "rewind",
+    rewindTo,
+    newLabel,
+    summaryFocus: "Preserve the user's instruction and continue the work.",
+  });
+
+  // Byte-exact copy, written out (not interpolated from the constant).
+  const REFUSAL_HEAD = (max: number) =>
+    `The maximum number of anchors (${max}) has been reached on the active branch. To make space, rewind further back than the last anchor: prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive.\nActive anchors (root → leaf, % of 1.0M):\n`;
+
+  /** The anchor names in the refusal's table, root → leaf. */
+  const tableNames = (text: string): string[] =>
+    text
+      .split("\n")
+      .slice(2)
+      .map((row) => row.trim().split(/\s+/).at(-1) ?? "");
+
+  const names = (from: number, to: number): string[] =>
+    Array.from({ length: to - from + 1 }, (_, i) => `a${from + i}`);
+
+  it("the default cap is 10", () => {
+    assert.equal(MAX_ANCHORS_DEFAULT, 10);
+  });
+
+  it("the refusal and the rewind-hygiene guideline share one phrase", () => {
+    assert.equal(
+      PREFER_OLDEST_ANCHOR,
+      "prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive",
+    );
+    const { tool } = setup();
+    const guidelines = tool.promptGuidelines as string[] | undefined;
+    assert.ok(
+      guidelines?.some((line) =>
+        line.includes(`when rewinding, ${PREFER_OLDEST_ANCHOR};`),
+      ),
+    );
+  });
+
+  it("anchor is refused at the cap; the table lists only rewind targets and names none", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const labelsBefore = pi.setLabelCalls.length;
+    const result = await exec(tool, ctx, { action: "anchor", name: "eleven" });
+    assert.equal(result.isError, true);
+    const text = result.content[0].text;
+    assert.ok(text.startsWith(REFUSAL_HEAD(10)), text);
+    assert.doesNotMatch(text, /rewindTo/);
+    // LIMIT maxAnchors − 1: the last anchor (a refused target) is cut.
+    assert.deepEqual(tableNames(text), names(1, 9));
+    assert.deepEqual(
+      { ...result.details, refusal: undefined },
+      {
+        rejected: "max-anchors",
+        maxAnchors: 10,
+        anchorCount: 10,
+        refusal: undefined,
+      },
+    );
+    assert.equal(pi.setLabelCalls.length, labelsBefore, "no label written");
+  });
+
+  it("anchor below the cap still lands", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 9);
+    const leaf = sm.getLeafId();
+    const result = await exec(tool, ctx, { action: "anchor", name: "ten" });
+    assert.equal(result.isError, undefined);
+    assert.equal(__testHooks.findLabeledEntry(sm, "anchor:ten"), leaf);
+  });
+
+  it("rewind to the last anchor at the cap is refused before any mutation", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const entriesBefore = sm.getEntries().length;
+    const leafBefore = sm.getLeafId();
+    const result = await exec(tool, ctx, rewind("a10"));
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.startsWith(REFUSAL_HEAD(10)));
+    assert.deepEqual(tableNames(result.content[0].text), names(1, 9));
+    assert.equal(result.details.rejected, "max-anchors");
+    assert.equal(sm.getEntries().length, entriesBefore);
+    assert.equal(sm.getLeafId(), leafBefore);
+    assert.equal(pi.sendMessageCalls.length, 0);
+  });
+
+  it("rewind further back than the last anchor is accepted at the cap", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const result = await exec(tool, ctx, rewind("a9"));
+    assert.notEqual(result.isError, true, result.content[0].text);
+    assert.equal(result.details.rejected, undefined);
+  });
+
+  it("a branch already over the cap can only rewind to one of the first maxAnchors − 1", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 15);
+    const refused = await exec(tool, ctx, rewind("a12"));
+    assert.equal(refused.isError, true);
+    assert.ok(refused.content[0].text.startsWith(REFUSAL_HEAD(10)));
+    assert.deepEqual(tableNames(refused.content[0].text), names(1, 9));
+    assert.equal(refused.details.anchorCount, 15);
+    const accepted = await exec(tool, ctx, rewind("a9"));
+    assert.notEqual(accepted.isError, true, accepted.content[0].text);
+  });
+
+  it("a label rewindTo would reject is not an anchor: it holds no slot", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 11);
+    // A manual `/tree` label with an invalid name is a plain label.
+    const a5 = __testHooks.findLabeledEntry(sm, "anchor:a5");
+    assert.ok(a5);
+    pi.pi.setLabel(a5, "anchor:Not Valid");
+    // 10 anchors left: the table skips the invalid label and the limit
+    // still yields 9 targets.
+    const refused = await exec(tool, ctx, { action: "anchor", name: "x" });
+    assert.equal(refused.details.anchorCount, 10);
+    assert.deepEqual(tableNames(refused.content[0].text), [
+      ...names(1, 4),
+      ...names(6, 10),
+    ]);
+    // a10 is the 9th anchor, so a rewind to it fits.
+    const accepted = await exec(tool, ctx, rewind("a10"));
+    assert.notEqual(accepted.isError, true, accepted.content[0].text);
+  });
+
+  it("an anchor lands when only an invalid label filled the last slot", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const a3 = __testHooks.findLabeledEntry(sm, "anchor:a3");
+    assert.ok(a3);
+    pi.pi.setLabel(a3, "anchor:Not Valid");
+    const result = await exec(tool, ctx, { action: "anchor", name: "x" });
+    assert.equal(result.isError, undefined, result.content[0].text);
+  });
+
+  it("list shows only rewind targets: LIMIT maxAnchors − 1", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 12);
+    const result = await exec(tool, ctx, { action: "list" });
+    const text = result.content[0].text;
+    assert.match(text, /^\[list\] · 9 labels · /);
+    assert.equal(result.details.count, 9);
+    const listed = [...text.matchAll(/^\s+[\d.]+%\s+(\S+)/gm)].map((m) => m[1]);
+    assert.deepEqual(listed, names(1, 9));
+  });
+
+  it("list hides a label rewindTo would reject", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 3);
+    const a2 = __testHooks.findLabeledEntry(sm, "anchor:a2");
+    assert.ok(a2);
+    pi.pi.setLabel(a2, "anchor:Not Valid");
+    const result = await exec(tool, ctx, { action: "list" });
+    assert.match(result.content[0].text, /^\[list\] · 2 labels · /);
+    assert.doesNotMatch(result.content[0].text, /Not Valid/);
+  });
+
+  it("list below the cap shows every anchor", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 9);
+    const result = await exec(tool, ctx, { action: "list" });
+    assert.equal(result.details.count, 9);
+  });
+
+  it("the rewind hint's table shows only rewind targets", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000, maxAnchors: 3 }),
+      );
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      anchoredTurns(sm, pi, 4);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      const { content } = pi.sendMessageCalls[0][0] as { content: string };
+      assert.deepEqual(tableNames(content), names(1, 2));
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
+  });
+
+  it("maxAnchors comes from tree-navigator.json", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ maxAnchors: 3 }));
+      const { sm, pi, tool, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      anchoredTurns(sm, pi, 3);
+      const anchor = await exec(tool, ctx, { action: "anchor", name: "four" });
+      assert.equal(anchor.isError, true);
+      assert.ok(anchor.content[0].text.startsWith(REFUSAL_HEAD(3)));
+      assert.deepEqual(tableNames(anchor.content[0].text), names(1, 2));
+      const refused = await exec(tool, ctx, rewind("a3"));
+      assert.equal(refused.details.rejected, "max-anchors");
+      const accepted = await exec(tool, ctx, rewind("a2"));
+      assert.notEqual(accepted.isError, true, accepted.content[0].text);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
   });
 });
 

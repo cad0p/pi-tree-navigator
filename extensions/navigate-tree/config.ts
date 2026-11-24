@@ -21,6 +21,9 @@
  *     automatic `anchor:start` write. Non-optional — an absent key still
  *     fires. `0` (the default since #116) anchors the first user prompt,
  *     before the first assistant reply.
+ *   - `maxAnchors` (issue #141): cap on the `anchor:` labels on the active
+ *     branch. `anchor` and a `rewind` that would exceed it are refused, so
+ *     the stack of branch summaries a rewind keeps stays bounded. Default 10.
  *   - `modelOverrides` (issue #86): per-model `rewindHintReserveTokens`,
  *     keyed by exact `provider/modelId`, mirroring pi's
  *     `compaction.modelOverrides`. Layers merge per key (project entry over
@@ -43,6 +46,9 @@
  *     the default: a touched-but-invalid value must not disable a
  *     non-optional feature, and any unintended turn index only places a
  *     benign label.
+ *   - MAX-ANCHORS field-level problems (`maxAnchors` present but unusable)
+ *     fall through like the start anchor: the cap is non-optional, and a
+ *     fallback value only changes when the model is told to rewind earlier.
  *   - `modelOverrides` problems (#86) are scoped to the entry: an invalid
  *     entry value disables the hint for that model only (no fallback to the
  *     base, same reasoning as the base field); shape problems warn and drop
@@ -72,6 +78,14 @@ export const START_ANCHOR_MAX_TURNS = 50;
  * message) — the turns after it are what small-window sessions need room for.
  */
 export const START_ANCHOR_DEFAULT_TURNS = 0;
+/**
+ * `maxAnchors` bounds (#141). The floor is 2: the automatic `start` takes
+ * one slot, and a rewind to it needs a second for its `newLabel`.
+ */
+export const MAX_ANCHORS_MIN = 2;
+export const MAX_ANCHORS_MAX = 1_000;
+/** Effective cap when `maxAnchors` is absent (or invalid) everywhere. */
+export const MAX_ANCHORS_DEFAULT = 10;
 
 /**
  * Per-field parse outcome for `rewindHintReserveTokens`.
@@ -97,7 +111,14 @@ export type HintField =
  *   - `invalid`:  key present, value unusable — falls through to the other
  *                 layer's valid value, else the default (see merge/resolve).
  */
-export type StartAnchorField =
+export type StartAnchorField = IntField;
+
+/**
+ * Per-field parse outcome for a non-optional integer field
+ * (`anchorStartAfterTurns`, `maxAnchors`): `invalid` falls through to the
+ * other layer's valid value, else the default.
+ */
+export type IntField =
   | { kind: "absent" }
   | { kind: "ok"; value: number }
   | { kind: "invalid" };
@@ -106,6 +127,8 @@ export type StartAnchorField =
 export interface ParsedLayer {
   hint: HintField;
   startAnchor: StartAnchorField;
+  /** `maxAnchors` (#141), merged like `startAnchor`. */
+  maxAnchors: IntField;
   /**
    * Per-model hint fields (#86), keyed by exact `provider/modelId`. Only
    * entries that set `rewindHintReserveTokens` (any non-absent outcome)
@@ -135,10 +158,8 @@ function parseHintReserve(n: number): HintField {
     : { kind: "invalid" };
 }
 
-function parseStartTurns(n: number): StartAnchorField {
-  return Number.isInteger(n) &&
-    n >= START_ANCHOR_MIN_TURNS &&
-    n <= START_ANCHOR_MAX_TURNS
+function parseIntInRange(n: number, min: number, max: number): IntField {
+  return Number.isInteger(n) && n >= min && n <= max
     ? { kind: "ok", value: n }
     : { kind: "invalid" };
 }
@@ -199,21 +220,24 @@ function parseHintField(record: Record<string, unknown>): HintField {
   return { kind: "invalid" };
 }
 
-function parseStartAnchorField(
+function parseIntField(
   record: Record<string, unknown>,
-): StartAnchorField {
-  if (!("anchorStartAfterTurns" in record)) return { kind: "absent" };
-  const value = record.anchorStartAfterTurns;
+  key: string,
+  min: number,
+  max: number,
+): IntField {
+  if (!(key in record)) return { kind: "absent" };
+  const value = record[key];
   if (typeof value === "string") {
     const trimmed = value.trim();
     // Digits only, mirroring the hint's string tolerance. There are no
-    // disable sentinels for this field (non-optional), so null/false fall
+    // disable sentinels for these fields (non-optional), so null/false fall
     // through to `invalid` below.
     return /^\d+$/.test(trimmed)
-      ? parseStartTurns(Number(trimmed))
+      ? parseIntInRange(Number(trimmed), min, max)
       : { kind: "invalid" };
   }
-  if (typeof value === "number") return parseStartTurns(value);
+  if (typeof value === "number") return parseIntInRange(value, min, max);
   return { kind: "invalid" };
 }
 
@@ -232,7 +256,18 @@ export function parseTreeNavigatorConfig(raw: unknown): ParsedRoot {
     kind: "fields",
     layer: {
       hint: parseHintField(record),
-      startAnchor: parseStartAnchorField(record),
+      startAnchor: parseIntField(
+        record,
+        "anchorStartAfterTurns",
+        START_ANCHOR_MIN_TURNS,
+        START_ANCHOR_MAX_TURNS,
+      ),
+      maxAnchors: parseIntField(
+        record,
+        "maxAnchors",
+        MAX_ANCHORS_MIN,
+        MAX_ANCHORS_MAX,
+      ),
       ...parseModelOverrides(record),
     },
   };
@@ -253,14 +288,15 @@ function mergeHintField(
 }
 
 /**
- * Merge the start-anchor field. `absent` falls through; `invalid` falls
- * through only to a VALID other layer (warning + fall through per issue
- * #55) — otherwise it stays invalid and the resolver applies the default.
+ * Merge a non-optional integer field (start anchor, max anchors). `absent`
+ * falls through; `invalid` falls through only to a VALID other layer
+ * (warning + fall through per issue #55) — otherwise it stays invalid and
+ * the resolver applies the default.
  */
-function mergeStartAnchorField(
-  globalField: StartAnchorField,
-  projectField: StartAnchorField,
-): StartAnchorField {
+function mergeIntField(
+  globalField: IntField,
+  projectField: IntField,
+): IntField {
   if (projectField.kind === "ok") return projectField;
   if (projectField.kind === "invalid") {
     return globalField.kind === "ok" ? globalField : projectField;
@@ -279,10 +315,11 @@ export function mergeTreeNavigatorConfig(
 ): ParsedLayer {
   return {
     hint: mergeHintField(globalLayer.hint, projectLayer.hint),
-    startAnchor: mergeStartAnchorField(
+    startAnchor: mergeIntField(
       globalLayer.startAnchor,
       projectLayer.startAnchor,
     ),
+    maxAnchors: mergeIntField(globalLayer.maxAnchors, projectLayer.maxAnchors),
     // Per key, like the base hint field: a project entry wins.
     modelHints: new Map([
       ...globalLayer.modelHints,
@@ -323,6 +360,7 @@ function absentLayer(): ParsedLayer {
   return {
     hint: { kind: "absent" },
     startAnchor: { kind: "absent" },
+    maxAnchors: { kind: "absent" },
     modelHints: new Map(),
     modelOverridesProblems: noModelOverridesProblems(),
   };
@@ -409,6 +447,11 @@ async function loadLayer(
       `navigate_tree: invalid anchorStartAfterTurns in ${layer} config at ${path} — expected integer ${START_ANCHOR_MIN_TURNS}-${START_ANCHOR_MAX_TURNS}; falling back to the other layer's valid value, else the default ${START_ANCHOR_DEFAULT_TURNS}.`,
     );
   }
+  if (parsed.layer.maxAnchors.kind === "invalid") {
+    warnings.push(
+      `navigate_tree: invalid maxAnchors in ${layer} config at ${path} — expected integer ${MAX_ANCHORS_MIN}-${MAX_ANCHORS_MAX}; falling back to the other layer's valid value, else the default ${MAX_ANCHORS_DEFAULT}.`,
+    );
+  }
   return { layer: parsed.layer, warnings };
 }
 
@@ -431,6 +474,7 @@ export async function loadTreeNavigatorConfig(opts: {
     rewindHintReserveTokens: number | null;
     rewindHintModelReserveTokens: Map<string, number | null>;
     anchorStartAfterTurns: number;
+    maxAnchors: number;
   };
   warnings: string[];
 }> {
@@ -470,6 +514,10 @@ export async function loadTreeNavigatorConfig(opts: {
         effective.startAnchor.kind === "ok"
           ? effective.startAnchor.value
           : START_ANCHOR_DEFAULT_TURNS,
+      maxAnchors:
+        effective.maxAnchors.kind === "ok"
+          ? effective.maxAnchors.value
+          : MAX_ANCHORS_DEFAULT,
     },
     warnings,
   };
