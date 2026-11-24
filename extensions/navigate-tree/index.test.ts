@@ -5405,18 +5405,34 @@ describe("dispatch: anchor cap (#141)", () => {
     assert.notEqual(accepted.isError, true, accepted.content[0].text);
   });
 
-  it("the limit counts a label rewindTo would reject, then hides it", async () => {
+  it("a label rewindTo would reject is not an anchor: it holds no slot", async () => {
     const { sm, pi, tool, ctx } = setup();
-    anchoredTurns(sm, pi, 10);
-    // A manual `/tree` label with an invalid name still holds a slot.
+    anchoredTurns(sm, pi, 11);
+    // A manual `/tree` label with an invalid name is a plain label.
     const a5 = __testHooks.findLabeledEntry(sm, "anchor:a5");
     assert.ok(a5);
     pi.pi.setLabel(a5, "anchor:Not Valid");
-    const result = await exec(tool, ctx, { action: "anchor", name: "x" });
-    assert.deepEqual(tableNames(result.content[0].text), [
+    // 10 anchors left: the table skips the invalid label and the limit
+    // still yields 9 targets.
+    const refused = await exec(tool, ctx, { action: "anchor", name: "x" });
+    assert.equal(refused.details.anchorCount, 10);
+    assert.deepEqual(tableNames(refused.content[0].text), [
       ...names(1, 4),
-      ...names(6, 9),
+      ...names(6, 10),
     ]);
+    // a10 is the 9th anchor, so a rewind to it fits.
+    const accepted = await exec(tool, ctx, rewind("a10"));
+    assert.notEqual(accepted.isError, true, accepted.content[0].text);
+  });
+
+  it("an anchor lands when only an invalid label filled the last slot", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const a3 = __testHooks.findLabeledEntry(sm, "anchor:a3");
+    assert.ok(a3);
+    pi.pi.setLabel(a3, "anchor:Not Valid");
+    const result = await exec(tool, ctx, { action: "anchor", name: "x" });
+    assert.equal(result.isError, undefined, result.content[0].text);
   });
 
   it("list shows only rewind targets: LIMIT maxAnchors − 1", async () => {
@@ -5430,7 +5446,7 @@ describe("dispatch: anchor cap (#141)", () => {
     assert.deepEqual(listed, names(1, 9));
   });
 
-  it("list hides a label rewindTo would reject (it still holds a slot)", async () => {
+  it("list hides a label rewindTo would reject", async () => {
     const { sm, pi, tool, ctx } = setup();
     anchoredTurns(sm, pi, 3);
     const a2 = __testHooks.findLabeledEntry(sm, "anchor:a2");

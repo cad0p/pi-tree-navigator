@@ -781,8 +781,10 @@ function findLabeledEntry(
 }
 
 /**
- * Every `anchor:` label on the active branch, root → leaf, counted the way
- * `list` counts them (#141): `start` and manual `/tree` labels included.
+ * Every anchor on the active branch, root → leaf (#141). An anchor is an
+ * `anchor:` label whose name `rewindTo` accepts: `start` and valid manual
+ * `/tree` labels included. A manual label with an invalid name can never be
+ * a rewind target, so the cap, the refusals and the tables all ignore it.
  */
 function activeAnchors(
   sm: Pick<SessionManager, "getBranch" | "getLabel">,
@@ -790,9 +792,9 @@ function activeAnchors(
   const anchors: Array<{ id: string; name: string }> = [];
   for (const e of sm.getBranch()) {
     const lbl = sm.getLabel(e.id);
-    if (lbl?.startsWith(LABEL_PREFIX)) {
-      anchors.push({ id: e.id, name: lbl.slice(LABEL_PREFIX.length) });
-    }
+    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
+    const name = lbl.slice(LABEL_PREFIX.length);
+    if (isValidName(name)) anchors.push({ id: e.id, name });
   }
   return anchors;
 }
@@ -1062,9 +1064,8 @@ export function estimateAtEntry(
  * table (#101, D19). Shared by the min-savings rejection, the rewind hint
  * and the forced-rewind message so all name the same targets the same way. A manual
  * `/tree` label `anchor:x` CAN put the same name on two entries —
- * duplicates print twice, exactly as `list` prints them. Names `rewindTo`
- * would reject (e.g. an empty `anchor:` label) are skipped: both callers
- * point the model at rewind targets.
+ * duplicates print twice. Labels whose name `rewindTo` would reject
+ * (e.g. an empty `anchor:` label) are not anchors (see activeAnchors).
  *
  * `limit` (#141) is `maxAnchors − 1`, applied like an SQL LIMIT, root
  * first: a rewind to the anchor at position N keeps N anchors and adds its
@@ -1087,23 +1088,15 @@ function formatActiveAnchors(
   const rows: AnchorTableRow[] = [];
   const estIndex =
     modelId === undefined ? undefined : createAnchorEstimateIndex(allEntries);
-  let seen = 0;
-  for (const e of sm.getBranch()) {
-    const lbl = sm.getLabel(e.id);
-    if (!lbl?.startsWith(LABEL_PREFIX)) continue;
-    // `limit` (#141) caps the anchors read, root first, before the name
-    // filter: every `anchor:` label holds a slot of the cap.
-    if (++seen > limit) break;
-    const name = lbl.slice(LABEL_PREFIX.length);
-    if (!isValidName(name)) continue;
+  for (const { id, name } of activeAnchors(sm).slice(0, limit)) {
     names.push(name);
     const after =
       opts.afterMaxLength === undefined
         ? null
-        : findLabelHint(sm, e.id, opts.afterMaxLength);
+        : findLabelHint(sm, id, opts.afterMaxLength);
     rows.push({
       pct: formatPct1(
-        estimateAtEntry(allEntries, e.id, byId, modelId, estIndex),
+        estimateAtEntry(allEntries, id, byId, modelId, estIndex),
         cw,
       ),
       name,
