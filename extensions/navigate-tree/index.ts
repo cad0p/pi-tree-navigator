@@ -187,6 +187,13 @@ export const MIN_SUMMARY_FOCUS_LENGTH = 20;
 // rewind burns a summary turn, forks a junk branch_summary, consumes
 // a milestone label, and GROWS live context.
 export const MIN_REWIND_SAVINGS_TOKENS = 4000;
+
+/**
+ * Which anchor to rewind to, said once (#141): the rewind-hygiene
+ * `promptGuidelines` bullet and the anchor-cap refusal quote it verbatim.
+ */
+export const PREFER_OLDEST_ANCHOR =
+  "prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive";
 // Summary attempts a pending rewind gets in total (#80, #90 S5). An attempt
 // fails when it calls a tool (blocked while the rewind is pending), carries
 // no `## Goal` summary, or is cut off; a failed attempt is hidden from the
@@ -792,9 +799,10 @@ function activeAnchors(
 
 /**
  * Refusal copy for the anchor cap (#141), shared by `anchor` and `rewind`.
- * It names the newest anchor a rewind can still target: the
- * (maxAnchors − 1)-th, whose rewind's `newLabel` takes the last slot. A
- * name `rewindTo` would reject (a manual `/tree` label) is skipped.
+ * No anchor is named (naming the newest allowed one pulls the model to it,
+ * against {@link PREFER_OLDEST_ANCHOR}); the table lists only the anchors a
+ * rewind can target — the first maxAnchors − 1, whose rewind's `newLabel`
+ * takes the last slot.
  */
 function buildMaxAnchorsRefusal(
   sm: SessionManager,
@@ -804,18 +812,15 @@ function buildMaxAnchorsRefusal(
   byId: Map<string, SessionEntry>,
   modelId?: string,
 ): string {
-  const anchors = activeAnchors(sm);
-  let fit: string | undefined;
-  for (let i = Math.min(maxAnchors - 2, anchors.length - 1); i >= 0; i--) {
-    if (isValidName(anchors[i].name)) {
-      fit = anchors[i].name;
-      break;
-    }
-  }
-  const target =
-    fit === undefined ? "" : `: rewindTo='${fit}' or an earlier anchor`;
-  const table = formatActiveAnchors(sm, cw, allEntries, byId, modelId).text;
-  return `The maximum number of anchors (${maxAnchors}) has been reached on the active branch. Rewind further back than the last anchor to make space${target}.\n${table}`;
+  const table = formatActiveAnchors(
+    sm,
+    cw,
+    allEntries,
+    byId,
+    maxAnchors - 1,
+    modelId,
+  ).text;
+  return `The maximum number of anchors (${maxAnchors}) has been reached on the active branch. To make space, rewind further back than the last anchor: ${PREFER_OLDEST_ANCHOR}.\n${table}`;
 }
 
 function estimateActiveBranchTokens(sm: SessionManager): number {
@@ -1060,21 +1065,32 @@ export function estimateAtEntry(
  * duplicates print twice, exactly as `list` prints them. Names `rewindTo`
  * would reject (e.g. an empty `anchor:` label) are skipped: both callers
  * point the model at rewind targets.
+ *
+ * `limit` (#141) is `maxAnchors − 1`, applied like an SQL LIMIT, root
+ * first: a rewind to the anchor at position N keeps N anchors and adds its
+ * `newLabel`, so exactly the first `maxAnchors − 1` are rewind targets.
+ * Every anchor viewer (`list`, the hint, the forced-rewind message, the
+ * min-savings and anchor-cap refusals) shows only those.
  */
 function formatActiveAnchors(
   sm: Pick<SessionManager, "getBranch" | "getLabel">,
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
+  limit: number,
   modelId?: string,
 ): { names: string[]; text: string } {
   const names: string[] = [];
   const rows: AnchorTableRow[] = [];
   const estIndex =
     modelId === undefined ? undefined : createAnchorEstimateIndex(allEntries);
+  let seen = 0;
   for (const e of sm.getBranch()) {
     const lbl = sm.getLabel(e.id);
     if (!lbl?.startsWith(LABEL_PREFIX)) continue;
+    // `limit` (#141) caps the anchors read, root first, before the name
+    // filter: every `anchor:` label holds a slot of the cap.
+    if (++seen > limit) break;
     const name = lbl.slice(LABEL_PREFIX.length);
     if (!isValidName(name)) continue;
     names.push(name);
@@ -1108,9 +1124,10 @@ function buildMinSavingsRejection(
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
+  limit: number,
   modelId?: string,
 ): string {
-  const anchors = formatActiveAnchors(sm, cw, allEntries, byId, modelId);
+  const anchors = formatActiveAnchors(sm, cw, allEntries, byId, limit, modelId);
   const guidance =
     anchors.names[0] === rewindTo
       ? "No earlier anchors — keep working and rewind later once more has accumulated above it."
@@ -2553,6 +2570,7 @@ export function createNavigateTreeExtension(
       at.contextWindow,
       allEntries,
       byId,
+      maxAnchorsFor(sm) - 1,
       modelId,
     );
     // D14: nothing to rewind to.
@@ -3789,7 +3807,7 @@ export function createNavigateTreeExtension(
   const anchorStartTurnsBySession = new Map<string, number>();
   // Anchor cap (#141), per session like the start-anchor bound.
   const maxAnchorsBySession = new Map<string, number>();
-  function maxAnchorsFor(sm: SessionManager): number {
+  function maxAnchorsFor(sm: Pick<SessionManager, "getSessionId">): number {
     try {
       return maxAnchorsBySession.get(sm.getSessionId()) ?? MAX_ANCHORS_DEFAULT;
     } catch {
@@ -4233,6 +4251,7 @@ export function createNavigateTreeExtension(
         usage.contextWindow,
         allEntries,
         byId,
+        maxAnchorsFor(sm) - 1,
         typeof replied?.model === "string" ? replied.model : undefined,
       );
     } catch {
@@ -4361,7 +4380,7 @@ export function createNavigateTreeExtension(
     // race on `leafId` / `labelsById` and produce an undefined tree.
     executionMode: "sequential",
     promptGuidelines: [
-      `${TOOL_NAME}: when rewinding, prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive; persist durable findings to files first.`,
+      `${TOOL_NAME}: when rewinding, ${PREFER_OLDEST_ANCHOR}; persist durable findings to files first.`,
       `${TOOL_NAME}: don't rewind while a user decision or unresolved question is pending — ask the user instead.`,
     ],
     description: `Long-session context management via the pi session tree. Anchor named milestones, then collapse work between them into a model-generated summary to free context.
@@ -4439,9 +4458,13 @@ Operations (set \`action\`):
         const reflectionOk = !!findOwningSession(sm);
 
         const rows: AnchorTableRow[] = [];
+        // Rewind targets only (#141): LIMIT maxAnchors − 1, as every
+        // anchor viewer (see formatActiveAnchors).
+        const limit = maxAnchorsFor(sm) - 1;
         for (const e of path) {
           const lbl = sm.getLabel(e.id);
           if (lbl?.startsWith(LABEL_PREFIX)) {
+            if (rows.length >= limit) break;
             const name = lbl.slice(LABEL_PREFIX.length);
             const tokensAt = estimateAtEntry(
               allEntries,
@@ -4704,6 +4727,7 @@ Operations (set \`action\`):
             contextWindow,
             allEntries,
             byId,
+            maxAnchorsFor(sm) - 1,
             modelId,
           ),
           { rejected: "min-savings", apparentSavings },

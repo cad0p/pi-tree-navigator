@@ -75,6 +75,7 @@ import navigateTreeDefault, {
   MIN_REWIND_SAVINGS_TOKENS,
   MIN_SUMMARY_FOCUS_LENGTH,
   NESTED_REWIND_REFUSAL,
+  PREFER_OLDEST_ANCHOR,
   REWIND_ABORTED_TEXT,
   REWIND_CUSTOM_TYPE,
   REWIND_OUTCOME_CUSTOM_TYPE,
@@ -5305,24 +5306,49 @@ describe("dispatch: anchor cap (#141)", () => {
     summaryFocus: "Preserve the user's instruction and continue the work.",
   });
 
-  const REFUSAL_HEAD = (max: number, fit: string) =>
-    `The maximum number of anchors (${max}) has been reached on the active branch. Rewind further back than the last anchor to make space: rewindTo='${fit}' or an earlier anchor.\n`;
+  // Byte-exact copy, written out (not interpolated from the constant).
+  const REFUSAL_HEAD = (max: number) =>
+    `The maximum number of anchors (${max}) has been reached on the active branch. To make space, rewind further back than the last anchor: prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive.\nActive anchors (root → leaf, % of 1.0M):\n`;
+
+  /** The anchor names in the refusal's table, root → leaf. */
+  const tableNames = (text: string): string[] =>
+    text
+      .split("\n")
+      .slice(2)
+      .map((row) => row.trim().split(/\s+/).at(-1) ?? "");
+
+  const names = (from: number, to: number): string[] =>
+    Array.from({ length: to - from + 1 }, (_, i) => `a${from + i}`);
 
   it("the default cap is 10", () => {
     assert.equal(MAX_ANCHORS_DEFAULT, 10);
   });
 
-  it("anchor is refused at the cap, naming the newest anchor a rewind can target", async () => {
+  it("the refusal and the rewind-hygiene guideline share one phrase", () => {
+    assert.equal(
+      PREFER_OLDEST_ANCHOR,
+      "prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive",
+    );
+    const { tool } = setup();
+    const guidelines = tool.promptGuidelines as string[] | undefined;
+    assert.ok(
+      guidelines?.some((line) =>
+        line.includes(`when rewinding, ${PREFER_OLDEST_ANCHOR};`),
+      ),
+    );
+  });
+
+  it("anchor is refused at the cap; the table lists only rewind targets and names none", async () => {
     const { sm, pi, tool, ctx } = setup();
     anchoredTurns(sm, pi, 10);
     const labelsBefore = pi.setLabelCalls.length;
     const result = await exec(tool, ctx, { action: "anchor", name: "eleven" });
     assert.equal(result.isError, true);
     const text = result.content[0].text;
-    assert.ok(text.startsWith(REFUSAL_HEAD(10, "a9")), text);
-    // The anchor table follows, so the model can pick by context %.
-    assert.match(text, /Active anchors \(root → leaf/);
-    assert.match(text, / a10$/m);
+    assert.ok(text.startsWith(REFUSAL_HEAD(10)), text);
+    assert.doesNotMatch(text, /rewindTo/);
+    // LIMIT maxAnchors − 1: the last anchor (a refused target) is cut.
+    assert.deepEqual(tableNames(text), names(1, 9));
     assert.deepEqual(
       { ...result.details, refusal: undefined },
       {
@@ -5351,7 +5377,8 @@ describe("dispatch: anchor cap (#141)", () => {
     const leafBefore = sm.getLeafId();
     const result = await exec(tool, ctx, rewind("a10"));
     assert.equal(result.isError, true);
-    assert.ok(result.content[0].text.startsWith(REFUSAL_HEAD(10, "a9")));
+    assert.ok(result.content[0].text.startsWith(REFUSAL_HEAD(10)));
+    assert.deepEqual(tableNames(result.content[0].text), names(1, 9));
     assert.equal(result.details.rejected, "max-anchors");
     assert.equal(sm.getEntries().length, entriesBefore);
     assert.equal(sm.getLeafId(), leafBefore);
@@ -5371,21 +5398,63 @@ describe("dispatch: anchor cap (#141)", () => {
     anchoredTurns(sm, pi, 15);
     const refused = await exec(tool, ctx, rewind("a12"));
     assert.equal(refused.isError, true);
-    assert.ok(refused.content[0].text.startsWith(REFUSAL_HEAD(10, "a9")));
+    assert.ok(refused.content[0].text.startsWith(REFUSAL_HEAD(10)));
+    assert.deepEqual(tableNames(refused.content[0].text), names(1, 9));
     assert.equal(refused.details.anchorCount, 15);
     const accepted = await exec(tool, ctx, rewind("a9"));
     assert.notEqual(accepted.isError, true, accepted.content[0].text);
   });
 
-  it("the named target skips a label rewindTo would reject", async () => {
+  it("the limit counts a label rewindTo would reject, then hides it", async () => {
     const { sm, pi, tool, ctx } = setup();
     anchoredTurns(sm, pi, 10);
-    // A manual `/tree` label with an invalid name still counts as an anchor.
-    const a9 = __testHooks.findLabeledEntry(sm, "anchor:a9");
-    assert.ok(a9);
-    pi.pi.setLabel(a9, "anchor:Not Valid");
+    // A manual `/tree` label with an invalid name still holds a slot.
+    const a5 = __testHooks.findLabeledEntry(sm, "anchor:a5");
+    assert.ok(a5);
+    pi.pi.setLabel(a5, "anchor:Not Valid");
     const result = await exec(tool, ctx, { action: "anchor", name: "x" });
-    assert.ok(result.content[0].text.startsWith(REFUSAL_HEAD(10, "a8")));
+    assert.deepEqual(tableNames(result.content[0].text), [
+      ...names(1, 4),
+      ...names(6, 9),
+    ]);
+  });
+
+  it("list shows only rewind targets: LIMIT maxAnchors − 1", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 12);
+    const result = await exec(tool, ctx, { action: "list" });
+    const text = result.content[0].text;
+    assert.match(text, /^\[list\] · 9 labels · /);
+    assert.equal(result.details.count, 9);
+    const listed = [...text.matchAll(/^\s+[\d.]+%\s+(\S+)/gm)].map((m) => m[1]);
+    assert.deepEqual(listed, names(1, 9));
+  });
+
+  it("list below the cap shows every anchor", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 9);
+    const result = await exec(tool, ctx, { action: "list" });
+    assert.equal(result.details.count, 9);
+  });
+
+  it("the rewind hint's table shows only rewind targets", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(
+        fixture,
+        JSON.stringify({ rewindHintReserveTokens: 100_000, maxAnchors: 3 }),
+      );
+      const { sm, pi, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      anchoredTurns(sm, pi, 4);
+      ctx.setContextUsage(usageAt(95));
+      fireTurnEnd(pi, ctx);
+      assert.equal(pi.sendMessageCalls.length, 1);
+      const { content } = pi.sendMessageCalls[0][0] as { content: string };
+      assert.deepEqual(tableNames(content), names(1, 2));
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
   });
 
   it("maxAnchors comes from tree-navigator.json", async () => {
@@ -5397,7 +5466,8 @@ describe("dispatch: anchor cap (#141)", () => {
       anchoredTurns(sm, pi, 3);
       const anchor = await exec(tool, ctx, { action: "anchor", name: "four" });
       assert.equal(anchor.isError, true);
-      assert.ok(anchor.content[0].text.startsWith(REFUSAL_HEAD(3, "a2")));
+      assert.ok(anchor.content[0].text.startsWith(REFUSAL_HEAD(3)));
+      assert.deepEqual(tableNames(anchor.content[0].text), names(1, 2));
       const refused = await exec(tool, ctx, rewind("a3"));
       assert.equal(refused.details.rejected, "max-anchors");
       const accepted = await exec(tool, ctx, rewind("a2"));

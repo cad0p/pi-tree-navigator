@@ -84,14 +84,16 @@ The active branch holds at most `maxAnchors` anchors (default **10**). Without a
 
 - `anchor` is refused when the active branch already holds `maxAnchors` anchors.
 - `rewind` is refused when the branch it leaves would hold more than `maxAnchors`: the anchors up to and including `rewindTo`, plus the `newLabel` it writes. At the cap, a rewind to the last anchor is refused; a rewind to the one before it is accepted and folds the newer summaries into one.
-- The refusal names the newest anchor that still fits and ends with the anchor table:
+- The refusal names no anchor (naming the newest allowed one would pull the model to it). It quotes the rewind-hygiene guideline (the same constant), and its table lists only the anchors a rewind can target: the first `maxAnchors − 1` on the branch.
 
 ```text
-The maximum number of anchors (10) has been reached on the active branch. Rewind further back than the last anchor to make space: rewindTo='phase-8-done' or an earlier anchor.
+The maximum number of anchors (10) has been reached on the active branch. To make space, rewind further back than the last anchor: prefer the oldest anchor that keeps what you'd otherwise re-read or re-derive.
 Active anchors (root → leaf, % of 1.0M):
    4.1%  start
   …
 ```
+
+Every anchor table shows only rewind targets: `list`, the hint, the forced-rewind message and the min-savings and anchor-cap refusals list the first `maxAnchors − 1` anchors, root first (a rewind to the anchor at position N keeps N anchors and adds its `newLabel`). Below the cap that is every anchor; on a branch already over it, the hint no longer prints one line per summary in the pile. A hidden label still exists: its name stays taken.
 
 Anchors are counted the way `list` counts them: every `anchor:` label on the active branch, `start` and manual `/tree` labels included (`branch:` labels are not anchors). The automatic `start` write is never refused. A branch already over the cap can only rewind to one of its first `maxAnchors − 1` anchors. During a forced rewind, a cap refusal is a validation refusal: it stays visible and does not count as an attempt.
 
