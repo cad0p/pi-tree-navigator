@@ -1071,14 +1071,17 @@ export function estimateAtEntry(
  * `newLabel`, so exactly the first `maxAnchors − 1` are rewind targets.
  * Every anchor viewer (`list`, the hint, the forced-rewind message, the
  * min-savings and anchor-cap refusals) shows only those.
+ *
+ * `afterMaxLength` adds `list`'s `(after: “…”)` preview column.
  */
 function formatActiveAnchors(
-  sm: Pick<SessionManager, "getBranch" | "getLabel">,
+  sm: Pick<SessionManager, "getBranch" | "getLabel" | "getEntry">,
   cw: number,
   allEntries: SessionEntry[],
   byId: Map<string, SessionEntry>,
   limit: number,
   modelId?: string,
+  opts: { afterMaxLength?: number } = {},
 ): { names: string[]; text: string } {
   const names: string[] = [];
   const rows: AnchorTableRow[] = [];
@@ -1094,12 +1097,17 @@ function formatActiveAnchors(
     const name = lbl.slice(LABEL_PREFIX.length);
     if (!isValidName(name)) continue;
     names.push(name);
+    const after =
+      opts.afterMaxLength === undefined
+        ? null
+        : findLabelHint(sm, e.id, opts.afterMaxLength);
     rows.push({
       pct: formatPct1(
         estimateAtEntry(allEntries, e.id, byId, modelId, estIndex),
         cw,
       ),
       name,
+      ...(after ? { after } : {}),
     });
   }
   // cw=0 → percents fall back to formatPct1's k-format and the header
@@ -1142,7 +1150,7 @@ function buildMinSavingsRejection(
  * shown as-is.
  */
 function findLabelHint(
-  sm: SessionManager,
+  sm: Pick<SessionManager, "getEntry">,
   fromId: string,
   maxLen: number,
 ): string | null {
@@ -4441,7 +4449,6 @@ Operations (set \`action\`):
 
       // --- list ---
       if (p.action === "list") {
-        const path = sm.getBranch();
         const allEntries = sm.getEntries();
         const byId = new Map<string, SessionEntry>();
         for (const e of allEntries) byId.set(e.id, e);
@@ -4457,42 +4464,27 @@ Operations (set \`action\`):
           : estimateActiveBranchTokens(sm);
         const reflectionOk = !!findOwningSession(sm);
 
-        const rows: AnchorTableRow[] = [];
-        // Rewind targets only (#141): LIMIT maxAnchors − 1, as every
-        // anchor viewer (see formatActiveAnchors).
-        const limit = maxAnchorsFor(sm) - 1;
-        for (const e of path) {
-          const lbl = sm.getLabel(e.id);
-          if (lbl?.startsWith(LABEL_PREFIX)) {
-            if (rows.length >= limit) break;
-            const name = lbl.slice(LABEL_PREFIX.length);
-            const tokensAt = estimateAtEntry(
-              allEntries,
-              e.id,
-              byId,
-              modelId,
-              estIndex,
-            );
-            const hint = findLabelHint(sm, e.id, LIST_HINT_MAX_LENGTH);
-            rows.push({
-              pct: formatPct1(tokensAt, cw),
-              name,
-              ...(hint ? { after: hint } : {}),
-            });
-          }
-        }
+        // The shared anchor viewer (#141): rewind targets only.
+        const anchors = formatActiveAnchors(
+          sm,
+          cw,
+          allEntries,
+          byId,
+          maxAnchorsFor(sm) - 1,
+          modelId,
+          { afterMaxLength: LIST_HINT_MAX_LENGTH },
+        );
+        const count = anchors.names.length;
 
         const reflectionWarning = reflectionOk
           ? ""
           : ` · ${REFLECTION_BOOTSTRAP_WARNING_LIST}`;
-        const header = `[list] · ${rows.length} label${rows.length === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
-        const body = rows.length
-          ? formatAnchorTable(rows, cw)
-          : "No labels on the active branch.";
+        const header = `[list] · ${count} label${count === 1 ? "" : "s"} · ctx ${formatPct1(totalTokens, cw)}${cw > 0 ? ` of ${formatWindow(cw)}` : ""}${reflectionWarning}`;
+        const body = count ? anchors.text : "No labels on the active branch.";
         return {
           content: [{ type: "text", text: `${header}\n\n${body}` }],
           details: {
-            count: rows.length,
+            count,
             contextTokens: totalTokens,
             contextWindow: cw,
             reflectionOk,

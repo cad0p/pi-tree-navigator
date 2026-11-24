@@ -5430,6 +5430,17 @@ describe("dispatch: anchor cap (#141)", () => {
     assert.deepEqual(listed, names(1, 9));
   });
 
+  it("list hides a label rewindTo would reject (it still holds a slot)", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 3);
+    const a2 = __testHooks.findLabeledEntry(sm, "anchor:a2");
+    assert.ok(a2);
+    pi.pi.setLabel(a2, "anchor:Not Valid");
+    const result = await exec(tool, ctx, { action: "list" });
+    assert.match(result.content[0].text, /^\[list\] · 2 labels · /);
+    assert.doesNotMatch(result.content[0].text, /Not Valid/);
+  });
+
   it("list below the cap shows every anchor", async () => {
     const { sm, pi, tool, ctx } = setup();
     anchoredTurns(sm, pi, 9);
