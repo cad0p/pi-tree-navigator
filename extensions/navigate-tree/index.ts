@@ -780,6 +780,61 @@ function findLabeledEntry(
   return null;
 }
 
+/** Entries that may sit between a turn's tool results (no LLM message). */
+const TURN_GAP_ENTRY_TYPES: ReadonlySet<string> = new Set([
+  "label",
+  "custom",
+  "context_edit",
+  "session_info",
+  "model_change",
+  "thinking_level_change",
+]);
+
+/**
+ * The entry a rewind to the anchor at `labeledId` parents its summary on
+ * (#97): the end of the anchor's turn. An anchor labels the assistant
+ * message that made the call, so parenting on it would strand that
+ * message's tool results — the anchor's own included — on the abandoned
+ * branch, and pi-ai would fill each with a synthetic "No result provided".
+ * When the labeled entry is an assistant message with tool calls and the
+ * `branch` holds a result for each of them, the last result is returned:
+ * the whole turn is kept, whatever else it ran (a codemode script's output
+ * cannot be split at the anchor). Otherwise — a user message, a summary, a
+ * turn with no results yet — the labeled entry itself.
+ *
+ * Results are matched by position (one per call, consecutive after the
+ * assistant), never by `toolCallId`: OpenAI-compatible servers can send ""
+ * or reuse ids.
+ */
+export function anchorBranchPoint(
+  branch: readonly SessionEntry[],
+  labeledId: string,
+): string {
+  const start = branch.findIndex((e) => e.id === labeledId);
+  const labeled = branch[start];
+  if (
+    labeled?.type !== "message" ||
+    labeled.message.role !== "assistant" ||
+    !Array.isArray(labeled.message.content)
+  ) {
+    return labeledId;
+  }
+  const calls = (labeled.message.content as Array<{ type?: unknown }>).filter(
+    (block) => block?.type === "toolCall",
+  ).length;
+  if (calls === 0) return labeledId;
+  let found = 0;
+  for (let i = start + 1; i < branch.length; i++) {
+    const e = branch[i];
+    if (e.type === "message" && e.message.role === "toolResult") {
+      if (++found === calls) return e.id;
+      continue;
+    }
+    if (!TURN_GAP_ENTRY_TYPES.has(e.type)) break;
+  }
+  return labeledId;
+}
+
 /**
  * Every anchor on the active branch, root → leaf (#141). An anchor is an
  * `anchor:` label whose name `rewindTo` accepts: `start` and valid manual
@@ -1088,6 +1143,8 @@ function formatActiveAnchors(
   const rows: AnchorTableRow[] = [];
   const estIndex =
     modelId === undefined ? undefined : createAnchorEstimateIndex(allEntries);
+  // Measured where a rewind cuts (#97): the end of the anchor's turn.
+  const branch = sm.getBranch();
   for (const { id, name } of activeAnchors(sm).slice(0, limit)) {
     names.push(name);
     const after =
@@ -1096,7 +1153,13 @@ function formatActiveAnchors(
         : findLabelHint(sm, id, opts.afterMaxLength);
     rows.push({
       pct: formatPct1(
-        estimateAtEntry(allEntries, id, byId, modelId, estIndex),
+        estimateAtEntry(
+          allEntries,
+          anchorBranchPoint(branch, id),
+          byId,
+          modelId,
+          estIndex,
+        ),
         cw,
       ),
       name,
@@ -1513,7 +1576,13 @@ interface PendingRewind {
   toolCallId: string;
   /** The assistant entry that issued the rewind (leaf at phase 1). */
   rewindEntryId: string;
+  /** The labeled anchor entry. */
   target: string;
+  /**
+   * Where the summary is parented (#97): the end of the anchor's turn
+   * ({@link anchorBranchPoint}). Absent on records built before it existed.
+   */
+  branchPoint?: string;
   rewindTo: string;
   newLabel: string;
   beforeTokens: number;
@@ -2959,6 +3028,8 @@ export function createNavigateTreeExtension(
     // re-appended onto the new branch below, in order, ahead of the
     // continuation (which flags it as unanswered).
     const lateEntries = collectLateEntries(sm, pending.rewindEntryId);
+    // The summary keeps the anchor's whole turn (#97).
+    const branchPoint = pending.branchPoint ?? pending.target;
     // Completion marker (#90, O8): `branch:<newLabel>` on the summary turn,
     // the abandoned branch's last real entry, written before the branch so
     // the restart check never reads this rewind as died mid-flight.
@@ -2977,7 +3048,7 @@ export function createNavigateTreeExtension(
       ({ entries } = collectEntriesForBranchSummary(
         sm,
         oldLeafId,
-        pending.target,
+        branchPoint,
       ));
       // Hidden attempts' tool calls never ran (blocked): keep them out of
       // the file lists (#90, O3-B).
@@ -2992,7 +3063,7 @@ export function createNavigateTreeExtension(
       // extension-provided summary.
       leafBeforeBranch = sm.getLeafId();
       summaryId = sm.branchWithSummary(
-        pending.target,
+        branchPoint,
         buildStoredSummary(summaryText, readFiles, modifiedFiles),
         { readFiles, modifiedFiles },
         true,
@@ -3022,7 +3093,7 @@ export function createNavigateTreeExtension(
     try {
       doneFacts = collectRewindDoneFacts(
         entries,
-        sm.getBranch(pending.target),
+        sm.getBranch(branchPoint),
         pending.rewindEntryId,
         summaryText,
       );
@@ -4625,7 +4696,10 @@ Operations (set \`action\`):
       }
 
       const oldLeaf = sm.getLeafId();
-      if (!oldLeaf || oldLeaf === target) {
+      // The summary parents on the end of the anchor's turn (#97), so the
+      // anchor call keeps its result.
+      const branchPoint = anchorBranchPoint(sm.getBranch(), target);
+      if (!oldLeaf || oldLeaf === target || oldLeaf === branchPoint) {
         return toolError(`Already at '${p.rewindTo}' — nothing to summarize.`);
       }
 
@@ -4688,10 +4762,19 @@ Operations (set \`action\`):
       } else {
         beforeTokens = estimateActiveBranchTokens(sm);
       }
-      const tokensAtTarget = estimateAtEntry(allEntries, target, byId, modelId);
+      const tokensAtTarget = estimateAtEntry(
+        allEntries,
+        branchPoint,
+        byId,
+        modelId,
+      );
       const contextWindow = ctx.model?.contextWindow ?? 0;
 
-      const { entries } = collectEntriesForBranchSummary(sm, oldLeaf, target);
+      const { entries } = collectEntriesForBranchSummary(
+        sm,
+        oldLeaf,
+        branchPoint,
+      );
       if (entries.length === 0) {
         return toolError(
           `No entries between leaf and '${p.rewindTo}' — nothing to summarize.`,
@@ -4728,8 +4811,8 @@ Operations (set \`action\`):
       let first = 1;
       try {
         const projection = buildSessionProjection(allEntries, oldLeaf, byId);
-        if (projection.entries.some((e) => e.sourceEntry.id === target)) {
-          first = countBackgroundMessages(projection.entries, target) + 1;
+        if (projection.entries.some((e) => e.sourceEntry.id === branchPoint)) {
+          first = countBackgroundMessages(projection.entries, branchPoint) + 1;
         }
       } catch {
         first = 1;
@@ -4754,6 +4837,7 @@ Operations (set \`action\`):
         toolCallId: callerId,
         rewindEntryId: oldLeaf,
         target,
+        branchPoint,
         rewindTo: p.rewindTo,
         newLabel: p.newLabel,
         beforeTokens,

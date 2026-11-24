@@ -58,6 +58,7 @@ import { formatPct1, MAX_NAME_LENGTH, TOOL_NAME } from "./helpers.ts";
 import navigateTreeDefault, {
   __testHooks,
   ANCHOR_MANDATE,
+  anchorBranchPoint,
   buildLateEntriesNote,
   buildRewindAcceptedText,
   buildRewindDoneText,
@@ -67,6 +68,7 @@ import navigateTreeDefault, {
   buildSummaryRequestRow,
   collectRewindDoneFacts,
   createNavigateTreeExtension,
+  estimateAtEntry,
   extractSummaryText,
   firstNextStep,
   MAX_HINT_WALK_DEPTH,
@@ -11486,5 +11488,248 @@ describe("anchor estimates from a measured reply below the anchor (#138)", () =>
       endPct(listed),
       formatPct1(estimateContextTokens(atEnd), 1_000_000),
     );
+  });
+});
+
+// =============================================================================
+// #97 — a rewind to an anchor keeps the anchor's whole turn
+// =============================================================================
+
+describe("rewind keeps the anchor's whole turn (#97)", () => {
+  type Fixture = ReturnType<typeof setup>;
+  type Call = { id: string; name: string; arguments?: Record<string, unknown> };
+
+  /**
+   * One assistant turn whose `anchorCallId` sets anchor 'mark' (a direct
+   * call, a batched one, or a nested codemode call), then a result per call
+   * in order, as pi appends them after the batch ran.
+   */
+  async function anchorTurn(
+    f: Fixture,
+    calls: Call[],
+    anchorCallId: string,
+    resultText: (call: Call, anchorText: string) => string,
+  ): Promise<{ assistantId: string; resultIds: string[] }> {
+    const { id: assistantId } = appendToolCallAssistant(f.sm, calls, 6_000);
+    const anchored = await f.tool.execute(
+      anchorCallId,
+      { action: "anchor", name: "mark" },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    assert.equal(anchored.isError, undefined);
+    assert.equal(f.sm.getLabel(assistantId), "anchor:mark");
+    const anchorText = anchored.content[0].text as string;
+    const resultIds = calls.map((call) =>
+      appendToolResult(f.sm, call.id, call.name, resultText(call, anchorText)),
+    );
+    return { assistantId, resultIds };
+  }
+
+  /** Every tool call the model would see has its result: no synthetic fill. */
+  function assertNoOrphanedCalls(sm: SessionManager): void {
+    const calls: string[] = [];
+    const results = new Set<string>();
+    for (const m of sm.buildSessionContext().messages as Array<{
+      role: string;
+      content?: unknown;
+      toolCallId?: string;
+    }>) {
+      if (m.role === "toolResult" && m.toolCallId) results.add(m.toolCallId);
+      if (m.role === "assistant" && Array.isArray(m.content)) {
+        for (const b of m.content as Array<{ type?: string; id?: string }>) {
+          if (b.type === "toolCall" && b.id) calls.push(b.id);
+        }
+      }
+    }
+    for (const id of calls)
+      assert.ok(results.has(id), `call ${id} has a result`);
+  }
+
+  async function rewindToMark(f: Fixture) {
+    for (const [i, tokens] of [30_000, 60_000, 90_000].entries()) {
+      appendTurn(f.sm, `u${i + 2}`, `a${i + 2}`, tokens);
+    }
+    const { result } = await requestRewind(f, {
+      ...REWIND_ARGS,
+      rewindTo: "mark",
+    });
+    assert.equal(result.isError, undefined, result.content[0].text);
+    await summaryTurn(f);
+    const done = rewindMessages(f.pi).at(-1);
+    assert.equal(done?.message.details.status, "done");
+    const summary = f.sm.getEntry(done?.message.details.summaryId as string);
+    assert.ok(summary && summary.type === "branch_summary");
+    return { result, summary };
+  }
+
+  it("a solo anchor: the summary parents on the anchor's result, which stays on the branch", async () => {
+    const f = setup();
+    const t = await anchorTurn(
+      f,
+      [
+        {
+          id: "tc-anchor",
+          name: TOOL_NAME,
+          arguments: { action: "anchor", name: "mark" },
+        },
+      ],
+      "tc-anchor",
+      (_c, anchorText) => anchorText,
+    );
+    const { result, summary } = await rewindToMark(f);
+    assert.equal(summary.parentId, t.resultIds[0]);
+    assert.equal(
+      result.details.targetId,
+      t.assistantId,
+      "targetId stays the labeled entry",
+    );
+    const branchIds = f.sm.getBranch().map((e) => e.id);
+    assert.ok(branchIds.includes(t.assistantId));
+    assert.ok(branchIds.includes(t.resultIds[0]));
+    assertNoOrphanedCalls(f.sm);
+  });
+
+  it("an anchor batched with other calls: the whole message's results are kept, before and after it", async () => {
+    const f = setup();
+    const t = await anchorTurn(
+      f,
+      [
+        {
+          id: "tc-before",
+          name: "bash",
+          arguments: { command: "echo before" },
+        },
+        {
+          id: "tc-anchor",
+          name: TOOL_NAME,
+          arguments: { action: "anchor", name: "mark" },
+        },
+        { id: "tc-after", name: "bash", arguments: { command: "echo after" } },
+      ],
+      "tc-anchor",
+      (c, anchorText) => (c.id === "tc-anchor" ? anchorText : c.id),
+    );
+    // A label written between two results does not end the turn.
+    f.pi.pi.setLabel(t.resultIds[0], "note");
+    const { summary } = await rewindToMark(f);
+    assert.equal(summary.parentId, t.resultIds[2]);
+    const branchIds = f.sm.getBranch().map((e) => e.id);
+    for (const id of t.resultIds) assert.ok(branchIds.includes(id));
+    assertNoOrphanedCalls(f.sm);
+  });
+
+  it("an anchor nested in a codemode script: the whole script result is kept", async () => {
+    const f = setup();
+    const t = await anchorTurn(
+      f,
+      [
+        {
+          id: "tc-cm",
+          name: "codemode",
+          arguments: { code: "anchor; echo something else" },
+        },
+      ],
+      "tc-cm/1",
+      () => "Script completed\nsomething else",
+    );
+    const { summary } = await rewindToMark(f);
+    assert.equal(summary.parentId, t.resultIds[0]);
+    assertNoOrphanedCalls(f.sm);
+  });
+
+  it("{first} numbers the first collapsed message after the anchor's turn", async () => {
+    const f = setup();
+    await anchorTurn(
+      f,
+      [
+        {
+          id: "tc-anchor",
+          name: TOOL_NAME,
+          arguments: { action: "anchor", name: "mark" },
+        },
+      ],
+      "tc-anchor",
+      (_c, anchorText) => anchorText,
+    );
+    for (const [i, tokens] of [30_000, 60_000, 90_000].entries()) {
+      appendTurn(f.sm, `u${i + 2}`, `a${i + 2}`, tokens);
+    }
+    const { result } = await requestRewind(f, {
+      ...REWIND_ARGS,
+      rewindTo: "mark",
+    });
+    // assistant (anchor call) = 1, its result = 2: the collapsed segment
+    // starts at the user message after them.
+    assert.equal(result.details.first, 3);
+  });
+
+  it("anchorBranchPoint falls back to the labeled entry", () => {
+    const f = setup();
+    const t1 = appendTurn(f.sm, "u1", "a1", 100);
+    // A text-only assistant and a user message are their own turn end.
+    assert.equal(
+      anchorBranchPoint(f.sm.getBranch(), t1.assistantId),
+      t1.assistantId,
+    );
+    assert.equal(anchorBranchPoint(f.sm.getBranch(), t1.userId), t1.userId);
+    // A turn whose results are not all there yet (a script that anchors and
+    // rewinds in one call) keeps today's cut.
+    const { id } = appendToolCallAssistant(f.sm, [
+      { id: "tc-a", name: "bash" },
+      { id: "tc-b", name: "bash" },
+    ]);
+    appendToolResult(f.sm, "tc-a", "bash", "a");
+    assert.equal(anchorBranchPoint(f.sm.getBranch(), id), id);
+    // ...also when a later message follows the partial results.
+    appendTurn(f.sm, "u2", "a2", 100);
+    assert.equal(anchorBranchPoint(f.sm.getBranch(), id), id);
+    // An id off the branch is returned as is.
+    assert.equal(anchorBranchPoint(f.sm.getBranch(), "missing"), "missing");
+  });
+
+  it("anchor tables measure the context at the end of the anchor's turn", async () => {
+    const f = setup({ contextWindow: 100_000 });
+    const big = "x".repeat(160_000);
+    const t = await anchorTurn(
+      f,
+      [
+        {
+          id: "tc-anchor",
+          name: TOOL_NAME,
+          arguments: { action: "anchor", name: "mark" },
+        },
+        { id: "tc-big", name: "bash", arguments: { command: "cat big" } },
+      ],
+      "tc-anchor",
+      (c, anchorText) => (c.id === "tc-big" ? big : anchorText),
+    );
+    appendTurn(f.sm, "u2", "a2", 60_000);
+    const listed = await f.tool.execute(
+      "tc-list",
+      { action: "list" },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    const entries = f.sm.getEntries();
+    const byId = new Map(entries.map((e) => [e.id, e]));
+    const at = (id: string) =>
+      formatPct1(
+        estimateAtEntry(entries, id, byId, "claude-sonnet-4-5"),
+        100_000,
+      );
+    const atTurnEnd = at(t.resultIds[1]);
+    assert.notEqual(
+      atTurnEnd,
+      at(t.assistantId),
+      "the big result moves the estimate",
+    );
+    const row = String(listed.content[0].text)
+      .split("\n")
+      .find((line) => /\bmark\b/.test(line));
+    assert.ok(row, "list shows mark");
+    assert.ok(row.includes(atTurnEnd), `row ${row} shows ${atTurnEnd}`);
   });
 });
