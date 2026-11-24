@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* Summary instruction as a custom message, failed attempts re-sent (closes #90, closes #82)
 - *(rewind)* Rewind-driven compaction — force a rewind on context overflow (closes #101)
 - *(anchor)* Automatic start anchor at the first user prompt by default (closes #116, closes #104)
+- *(anchor)* Cap the active branch at maxAnchors (default 10) (closes #141)
 
 ### 🐛 Bug Fixes
 
