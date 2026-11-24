@@ -44,6 +44,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
+  MAX_ANCHORS_DEFAULT,
   START_ANCHOR_DEFAULT_TURNS,
   START_ANCHOR_MAX_TURNS,
   START_ANCHOR_MIN_TURNS,
@@ -5272,6 +5273,138 @@ describe("dispatch: rewind newLabel uniqueness", () => {
       result.content[0].text,
       "A label 'taken' already exists on the active branch — labels are unique and immutable once written, so rewind requires a fresh `newLabel`. The existing 'taken' label stays addressable via `rewindTo`. Use action='list' to review the active labels, then pick a fresh newLabel.",
     );
+  });
+});
+
+// =============================================================================
+// Anchor cap (#141)
+// =============================================================================
+
+describe("dispatch: anchor cap (#141)", () => {
+  /** `n` anchored turns `a1`…`an` with growing usage, then one big turn. */
+  function anchoredTurns(sm: SessionManager, pi: FakePi, n: number): void {
+    for (let i = 1; i <= n; i++) {
+      const t = appendTurn(sm, `u${i}`, `a${i}`, i * 5_000);
+      pi.pi.setLabel(t.assistantId, `anchor:a${i}`);
+    }
+    appendTurn(sm, "u-last", "a-last", n * 5_000 + 60_000);
+  }
+
+  async function exec(
+    tool: CapturedTool,
+    ctx: FakeCtx,
+    params: Record<string, unknown>,
+  ) {
+    return tool.execute("tc-cap", params, undefined, undefined, ctx);
+  }
+
+  const rewind = (rewindTo: string, newLabel = "fresh") => ({
+    action: "rewind",
+    rewindTo,
+    newLabel,
+    summaryFocus: "Preserve the user's instruction and continue the work.",
+  });
+
+  const REFUSAL_HEAD = (max: number, fit: string) =>
+    `The maximum number of anchors (${max}) has been reached on the active branch. Rewind further back than the last anchor to make space: rewindTo='${fit}' or an earlier anchor.\n`;
+
+  it("the default cap is 10", () => {
+    assert.equal(MAX_ANCHORS_DEFAULT, 10);
+  });
+
+  it("anchor is refused at the cap, naming the newest anchor a rewind can target", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const labelsBefore = pi.setLabelCalls.length;
+    const result = await exec(tool, ctx, { action: "anchor", name: "eleven" });
+    assert.equal(result.isError, true);
+    const text = result.content[0].text;
+    assert.ok(text.startsWith(REFUSAL_HEAD(10, "a9")), text);
+    // The anchor table follows, so the model can pick by context %.
+    assert.match(text, /Active anchors \(root → leaf/);
+    assert.match(text, / a10$/m);
+    assert.deepEqual(
+      { ...result.details, refusal: undefined },
+      {
+        rejected: "max-anchors",
+        maxAnchors: 10,
+        anchorCount: 10,
+        refusal: undefined,
+      },
+    );
+    assert.equal(pi.setLabelCalls.length, labelsBefore, "no label written");
+  });
+
+  it("anchor below the cap still lands", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 9);
+    const leaf = sm.getLeafId();
+    const result = await exec(tool, ctx, { action: "anchor", name: "ten" });
+    assert.equal(result.isError, undefined);
+    assert.equal(__testHooks.findLabeledEntry(sm, "anchor:ten"), leaf);
+  });
+
+  it("rewind to the last anchor at the cap is refused before any mutation", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const entriesBefore = sm.getEntries().length;
+    const leafBefore = sm.getLeafId();
+    const result = await exec(tool, ctx, rewind("a10"));
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.startsWith(REFUSAL_HEAD(10, "a9")));
+    assert.equal(result.details.rejected, "max-anchors");
+    assert.equal(sm.getEntries().length, entriesBefore);
+    assert.equal(sm.getLeafId(), leafBefore);
+    assert.equal(pi.sendMessageCalls.length, 0);
+  });
+
+  it("rewind further back than the last anchor is accepted at the cap", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    const result = await exec(tool, ctx, rewind("a9"));
+    assert.notEqual(result.isError, true, result.content[0].text);
+    assert.equal(result.details.rejected, undefined);
+  });
+
+  it("a branch already over the cap can only rewind to one of the first maxAnchors − 1", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 15);
+    const refused = await exec(tool, ctx, rewind("a12"));
+    assert.equal(refused.isError, true);
+    assert.ok(refused.content[0].text.startsWith(REFUSAL_HEAD(10, "a9")));
+    assert.equal(refused.details.anchorCount, 15);
+    const accepted = await exec(tool, ctx, rewind("a9"));
+    assert.notEqual(accepted.isError, true, accepted.content[0].text);
+  });
+
+  it("the named target skips a label rewindTo would reject", async () => {
+    const { sm, pi, tool, ctx } = setup();
+    anchoredTurns(sm, pi, 10);
+    // A manual `/tree` label with an invalid name still counts as an anchor.
+    const a9 = __testHooks.findLabeledEntry(sm, "anchor:a9");
+    assert.ok(a9);
+    pi.pi.setLabel(a9, "anchor:Not Valid");
+    const result = await exec(tool, ctx, { action: "anchor", name: "x" });
+    assert.ok(result.content[0].text.startsWith(REFUSAL_HEAD(10, "a8")));
+  });
+
+  it("maxAnchors comes from tree-navigator.json", async () => {
+    const fixture = makeConfigFixture();
+    try {
+      writeGlobalConfig(fixture, JSON.stringify({ maxAnchors: 3 }));
+      const { sm, pi, tool, ctx } = setup();
+      await runSessionStart(pi, ctx, fixture);
+      anchoredTurns(sm, pi, 3);
+      const anchor = await exec(tool, ctx, { action: "anchor", name: "four" });
+      assert.equal(anchor.isError, true);
+      assert.ok(anchor.content[0].text.startsWith(REFUSAL_HEAD(3, "a2")));
+      const refused = await exec(tool, ctx, rewind("a3"));
+      assert.equal(refused.details.rejected, "max-anchors");
+      const accepted = await exec(tool, ctx, rewind("a2"));
+      assert.notEqual(accepted.isError, true, accepted.content[0].text);
+    } finally {
+      cleanupConfigFixture(fixture);
+    }
   });
 });
 
