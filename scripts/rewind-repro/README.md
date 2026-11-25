@@ -48,8 +48,8 @@ directory, never in the repo.
 | `find_rewinds.py` | scan `~/.pi/agent/sessions` for landed rewinds; prints session, file line, `rewindTo`, `contextBefore/After`, and the first assistant turn after it |
 | `build_fixture.py` | `cut`: cut a session at a chosen line. `rewrite` (continuation-only diagnostics): replace the continuation prose, the branch-summary preamble, or append a summary section |
 | `dump_tail.py` | print the last landed rewind of a session: its numbers, the continuation entry, and the next assistant turn(s) with provider/model — the thing you score. Check the label it prints: if the run died before rewinding, the "last rewind" is an old one from the fixture |
-| `recorder.ts` | extension: logs every `tool_call` to `$PI_REPRO_LOG` and blocks everything but reads and `navigate_tree`, so a replay of a real session cannot touch the machine |
-| `run_e2e.sh` | the end-to-end runner: pinned provider, recorder, extension under test, rewind prompt |
+| `recorder.ts` | extension: logs every `tool_call` to `$PI_REPRO_LOG` and blocks everything but reads and `navigate_tree` (plus top-level `codemode` with `PI_REPRO_CODEMODE=1`), so a replay of a real session cannot touch the machine |
+| `run_e2e.sh` | the end-to-end runner: pinned provider, recorder, extension under test, codemode mode (`--codemode only` by default), rewind prompt |
 
 ## Procedure
 
@@ -75,9 +75,58 @@ scripts/rewind-repro/run_e2e.sh \
 python3 scripts/rewind-repro/dump_tail.py /tmp/repro/session-e2e-b.jsonl
 ```
 
+`--codemode only` is the default; add `--codemode off` to replay the way runs worked before #144 (see below).
+
 Score the **first assistant turn after the continuation**: does it resume the summary's `## Next Steps`,
 or does it answer/re-run something from before the collapse? Record the provider/model of that turn — a
 fallback extension can cycle to another model mid-run and invalidate the data point (pin `--models`).
+
+## Codemode
+
+The owner runs pi with `codemode.mode: "only"`: the model sees one tool, `codemode`, and every other call,
+`navigate_tree` included, is a nested call of a script. That is the primary mode for live checks, so
+`run_e2e.sh --codemode` defaults to `only`:
+
+| `--codemode` | what the run gets |
+|---|---|
+| `only` (default) | `codemode` is the only declared tool; the others are listed in its description and reached from scripts |
+| `on` | `codemode` next to the direct tools |
+| `off` | no `codemode` (the runs recorded above) |
+
+How the runner sets it up:
+
+- `--no-extensions` also drops the built-in codemode extension, so `on` and `only` load it back with
+  `-e builtin:codemode` and declare it with `--tools +codemode`.
+- `codemode.mode` has no CLI flag. The runner writes `{"codemode": {"mode": "<mode>"}}` to
+  `<root>/work/.pi/settings.json`, the run's project settings, with the mode spelled out so a user-level
+  `codemode.mode` cannot leak into an `on` run, and passes `--approve`, which trusts that file for the
+  process whatever `defaultProjectTrust` says. `off` deletes the file.
+- The recorder lets the top-level `codemode` call run (`PI_REPRO_CODEMODE=1`). A script's tool calls reach
+  the same `tool_call` gate as nested calls, so the allowlist still decides what runs: a blocked nested
+  call rejects inside the script with the recorder's reason, and the script goes on.
+- The gate does not see `models.*` (classifiers, image generation): those are not tool calls, so a script
+  can run them. They cannot touch the machine, but they cost money.
+
+Reading a run:
+
+- The log has one line per call. A nested call has the id `<script call id>/<n>` and `parent` set to the
+  script's call id:
+
+  ```
+  {"tool":"codemode","id":"toolu_01E5…","input":{"code":"return await tools.navigate_tree({ action: \"rewind\", … });"}}
+  {"tool":"navigate_tree","id":"toolu_01E5…/1","parent":"toolu_01E5…","input":{"action":"rewind",…}}
+  ```
+- The session JSONL has no nested calls: one `codemode` toolCall in the assistant entry and one toolResult
+  holding the script's whole output. An anchor set from a script labels the assistant entry; a rewind to it
+  keeps that whole script result (#97), so the `branch_summary` is parented on the toolResult.
+
+### First codemode-only check (2026-11-25, #144)
+
+Haiku 5.5 (high), `--codemode only`. Fixture built by a run with the same flags: one script reads
+`f1.txt`, anchors `two`, reads `f2.txt`; a second script reads a 36 KB file, so the rewind clears the
+4,000-token floor. Then `run_e2e.sh --anchor two`: the model rewound from a script, the `branch_summary` is
+parented on the first script's toolResult (anchor, `f1` and `f2` results all kept), and the session has no
+"No result provided".
 
 ## Cost
 
