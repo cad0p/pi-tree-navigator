@@ -29,6 +29,7 @@ All notable changes to this project will be documented in this file.
 - *(rewind)* The done message quotes the latest collapsed user messages and the next step (closes #135)
 - *(rewind-hint)* A landed rewind re-arms the crossing (closes #137)
 - *(estimate)* Anchor estimates use the real count of a reply below the anchor (closes #138)
+- *(rewind)* Keep the anchor's whole turn so its calls keep their results (closes #97)
 
 ### ⚙️ Miscellaneous Tasks
 
