@@ -34,6 +34,7 @@ All notable changes to this project will be documented in this file.
 ### ⚙️ Miscellaneous Tasks
 
 - *(scripts)* Rewind-repro harness — replay a real rewind end-to-end (closes #129)
+- *(rewind-repro)* Run live checks in codemode-only mode (closes #144)
 
 
 ## [0.3.0] - 2026-10-15
